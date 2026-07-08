@@ -220,7 +220,12 @@ function hasLettersAndDigits(values: string[]): boolean {
 
 function ftsTermExpression(term: QueryTerm): string {
   if (!term.identifier) {
-    return ftsPrefixTerm(term.subterms[0]);
+    // A standalone single-character non-identifier term is emitted as an exact
+    // token, not a prefix: `"a"*` would scan the entire term dictionary. Length
+    // is counted in code points so an astral character stays "length 1" and
+    // matches the Python side (SPEC.md → "Query execution", prefix gating).
+    const subterm = term.subterms[0];
+    return [...subterm].length === 1 ? ftsExactTerm(subterm) : ftsPrefixTerm(subterm);
   }
 
   const expressions = [ftsPrefixTerm(term.subterms.join(""))];
@@ -247,8 +252,12 @@ function ftsPhrase(subterms: string[]): string {
   return subterms.map(ftsPrefixTerm).join(" + ");
 }
 
+function ftsExactTerm(token: string): string {
+  return `"${token.replace(/"/g, '""')}"`;
+}
+
 function ftsPrefixTerm(token: string): string {
-  return `"${token.replace(/"/g, '""')}"*`;
+  return `${ftsExactTerm(token)}*`;
 }
 
 interface WhereClause {

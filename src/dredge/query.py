@@ -130,7 +130,14 @@ def _has_letters_and_digits(subterms: tuple[str, ...] | list[str]) -> bool:
 
 def _fts_term_expression(term: _QueryTerm) -> str:
     if not term.identifier:
-        return _fts_prefix_term(term.subterms[0])
+        # A standalone single-character non-identifier term is emitted as an
+        # exact token, not a prefix: '"a"*' would scan the entire term
+        # dictionary. Identical to buildMatchExpression in the runtime; pinned
+        # by the shared vectors (SPEC.md -> "Query execution", prefix gating).
+        subterm = term.subterms[0]
+        if len(subterm) == 1:
+            return _fts_exact_term(subterm)
+        return _fts_prefix_term(subterm)
 
     expressions = [_fts_prefix_term("".join(term.subterms))]
     if len(term.subterms) > 1:
@@ -156,5 +163,9 @@ def _fts_phrase(subterms: tuple[str, ...]) -> str:
     return " + ".join(_fts_prefix_term(subterm) for subterm in subterms)
 
 
+def _fts_exact_term(token: str) -> str:
+    return f'"{token.replace(chr(34), chr(34) + chr(34))}"'
+
+
 def _fts_prefix_term(token: str) -> str:
-    return f'"{token.replace(chr(34), chr(34) + chr(34))}"*'
+    return f"{_fts_exact_term(token)}*"
