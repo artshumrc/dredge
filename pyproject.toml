@@ -2,7 +2,7 @@
 name = "dredge"
 version = "0.1.0"
 description = "Static-site SQLite search compiler"
-readme = "plan.md"
+readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
     "selectolax>=0.4.3",
