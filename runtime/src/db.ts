@@ -237,7 +237,16 @@ async function decompress(compressed: Uint8Array, expectedBytes: number): Promis
   }
   let decompressed: Uint8Array;
   try {
-    const brotli = await (await import("brotli-wasm")).default;
+    // Decode-only brotli build (~200 KB vs brotli-wasm's ~1.1 MB encoder+decoder).
+    // The worker only ever decompresses; this lazy import is reached solely when
+    // the host did NOT transparently decode Content-Encoding: br. We import the
+    // `/web` (wasm-pack) entry and its named `decompress` rather than awaiting the
+    // package's default promise-to-namespace: awaiting a module namespace breaks
+    // under Node test runners that expose namespaces as thenables. `default()`
+    // instantiates the wasm (fetched relative to the bundled asset in the
+    // browser) and is idempotent, so repeated decodes reuse the one instance.
+    const brotli = await import("brotli-dec-wasm/web");
+    await brotli.default();
     decompressed = brotli.decompress(compressed);
   } catch (error) {
     throw new WorkerError({

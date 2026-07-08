@@ -15,7 +15,7 @@
   },
   "dependencies": {
     "@sqlite.org/sqlite-wasm": "^3.50.1-build1",
-    "brotli-wasm": "^3.0.1"
+    "brotli-dec-wasm": "^2.3.2"
   },
   "devDependencies": {
     "@types/node": "^26.1.1",
@@ -24,6 +24,8 @@
     "vitest": "^4.1.10"
   },
   "pnpm": {
-    "onlyBuiltDependencies": ["esbuild"]
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
   }
 }

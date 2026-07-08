@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { brotliCompressSync } from "node:zlib";
 
 import { beforeEach, describe, expect, it } from "vitest";
 
@@ -477,5 +478,61 @@ describe("hot/full tier boot lifecycle (BootEnv seam)", () => {
 
     expect(pool.unlinked).toContain(stalePath);
     expect(pool.getFileNames()).toEqual([FULL_PATH]);
+  });
+
+  it("decodes brotli-compressed downloads through the decode-only decoder", async () => {
+    // Ticket 14: unlike every test above (which serves already-decoded bytes so
+    // decompress() takes the host-decoded fast path), this serves genuinely
+    // brotli-compressed bytes for both tiers, forcing the in-worker decode. The
+    // decoder must reconstruct the exact raw bytes — verified by the sha256
+    // integrity check passing and by the deserialize length / imported bytes.
+    const hotRaw = new Uint8Array(768).map((_, i) => (i * 7) % 251);
+    const fullRaw = new Uint8Array(1536).map((_, i) => (i * 13) % 249);
+    const hotCompressed = new Uint8Array(brotliCompressSync(Buffer.from(hotRaw)));
+    const fullCompressed = new Uint8Array(brotliCompressSync(Buffer.from(fullRaw)));
+    // Compression must actually shrink these fixtures, otherwise decompress()
+    // would see matching lengths and skip the decoder we mean to exercise.
+    expect(hotCompressed.byteLength).toBeLessThan(hotRaw.byteLength);
+    expect(fullCompressed.byteLength).toBeLessThan(fullRaw.byteLength);
+
+    const hotSha = createHash("sha256").update(hotRaw).digest("hex");
+    const fullSha = createHash("sha256").update(fullRaw).digest("hex");
+    const fullPath = `/dredge/${fullSha}.db`;
+
+    const manifest = makeManifest({
+      db_sha256: fullSha,
+      db_bytes: fullRaw.byteLength,
+      db_compressed_bytes: fullCompressed.byteLength,
+      hot_db_sha256: hotSha,
+      hot_db_bytes: hotRaw.byteLength,
+      hot_db_compressed_bytes: hotCompressed.byteLength,
+    });
+
+    const calls: string[] = [];
+    const fetchImpl = async (input: RequestInfo | URL): Promise<Response> => {
+      const url = String(input);
+      calls.push(url);
+      if (url.endsWith("manifest.json")) {
+        return { ok: true, status: 200, json: async () => manifest } as Response;
+      }
+      const bytes = url.endsWith("hot.db") ? hotCompressed : fullCompressed;
+      return { ok: true, status: 200, arrayBuffer: async () => bytes.slice().buffer } as Response;
+    };
+
+    const pool = new FakePool();
+    const { env, sqlite } = makeEnv({ fetch: fetchImpl as BootEnv["fetch"], pool });
+    const { status, seen } = recorder();
+
+    const session = await boot(MANIFEST_URL, false, status, env);
+    await session.fullTier;
+
+    expect(calls).toEqual([MANIFEST_URL, HOT_URL, FULL_URL]);
+    // Hot tier decoded to its raw length and deserialized into memory; the full
+    // tier decoded to its raw bytes and was imported to OPFS verbatim. Both
+    // paths cleared the sha256 integrity check, which only passes on exact bytes.
+    expect(sqlite.deserializeCalls).toEqual([{ length: hotRaw.byteLength }]);
+    expect(pool.imported).toEqual([{ path: fullPath, bytes: fullRaw }]);
+    expect(getTier()).toBe("full");
+    expect(statuses(seen)).toContain("ready");
   });
 });

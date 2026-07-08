@@ -11,9 +11,9 @@ importers:
       '@sqlite.org/sqlite-wasm':
         specifier: ^3.50.1-build1
         version: 3.50.1-build1
-      brotli-wasm:
-        specifier: ^3.0.1
-        version: 3.0.1
+      brotli-dec-wasm:
+        specifier: ^2.3.2
+        version: 2.3.2
     devDependencies:
       '@types/node':
         specifier: ^26.1.1
@@ -379,9 +379,8 @@ packages:
     resolution: {integrity: sha512-Izi8RQcffqCeNVgFigKli1ssklIbpHnCYc6AknXGYoB6grJqyeby7jv12JUQgmTAnIDnbck1uxksT4dzN3PWBA==}
     engines: {node: '>=12'}
 
-  brotli-wasm@3.0.1:
-    resolution: {integrity: sha512-U3K72/JAi3jITpdhZBqzSUq+DUY697tLxOuFXB+FpAE/Ug+5C3VZrv4uA674EUZHxNAuQ9wETXNqQkxZD6oL4A==}
-    engines: {node: '>=v18.0.0'}
+  brotli-dec-wasm@2.3.2:
+    resolution: {integrity: sha512-5H+k8eVLIJY6B4olN2HP9QzJAxcplf0jV7mWnkpxvOSeUE9Npg3dQ2pgLn30a9MUFHNro1iSmtdu6VNdlb+TIw==}
 
   chai@6.2.2:
     resolution: {integrity: sha512-NUPRluOfOiTKBKvWPtSD4PhFvWCqOi0BGStNWs57X9js7XGTprSmFoz5F0tWhR4WPjNeR9jXqdC7/UpSJTnlRg==}
@@ -789,7 +788,7 @@ snapshots:
 
   assertion-error@2.0.1: {}
 
-  brotli-wasm@3.0.1: {}
+  brotli-dec-wasm@2.3.2: {}
 
   chai@6.2.2: {}
 
