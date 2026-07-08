@@ -164,6 +164,23 @@ describe("runtime search fixture", () => {
     }
   });
 
+  it("tags each response with the tier that served it", () => {
+    const db = new DatabaseSync(fixtureDbPath());
+    try {
+      const exec = makeNodeSqliteExec(db);
+      const schema = introspectSchema(exec);
+
+      // Keyword (single-pass) and browse both stamp the tier they were told.
+      expect(search(exec, schema, { query: "temple", limit: 2 }, "hot").tier).toBe("hot");
+      expect(search(exec, schema, { limit: 2 }, "hot").tier).toBe("hot");
+      expect(search(exec, schema, { query: "temple", limit: 2 }, "full").tier).toBe("full");
+      // The default (no tier argument) is the steady-state full tier.
+      expect(search(exec, schema, { limit: 2 }).tier).toBe("full");
+    } finally {
+      db.close();
+    }
+  });
+
   it("rejects store fields and unknown fields in query validation", () => {
     const db = new DatabaseSync(fixtureDbPath());
     try {

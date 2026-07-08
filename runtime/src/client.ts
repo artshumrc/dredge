@@ -35,8 +35,11 @@ export type DredgeStatus =
   | "decompressing_db"
   | "writing_opfs"
   | "opening_db"
+  | "ready_hot"
   | "ready"
   | "failed";
+
+export type DredgeTier = "hot" | "full";
 
 export interface DredgeError {
   code: string;
@@ -46,7 +49,7 @@ export interface DredgeError {
 
 type WorkerResponse =
   | { type: "status"; status: DredgeStatus; detail?: string }
-  | { type: "ready"; id: number }
+  | { type: "ready"; id: number; tier: DredgeTier }
   | { type: "searchResult"; id: number; response: DredgeSearchResponse }
   | { type: "error"; id?: number; error: DredgeError };
 
@@ -124,7 +127,7 @@ export class DredgeSearchClient {
 
   /** Boot the worker and open the database. Safe to call repeatedly. */
   init(): Promise<void> {
-    if (this.statusValue === "ready") {
+    if (this.statusValue === "ready" || this.statusValue === "ready_hot") {
       return Promise.resolve();
     }
     if (this.initPromise) {
@@ -192,7 +195,9 @@ export class DredgeSearchClient {
       return;
     }
     if (message.type === "ready") {
-      this.setStatus("ready");
+      // A cold boot resolves init on the Hot Tier ("ready_hot"); the Full Tier
+      // swap later arrives as a plain `status: "ready"` message.
+      this.setStatus(message.tier === "hot" ? "ready_hot" : "ready");
       const pending = this.pending.get(message.id);
       if (pending?.kind === "init") {
         this.pending.delete(message.id);

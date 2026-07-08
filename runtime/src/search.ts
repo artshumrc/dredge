@@ -1,4 +1,4 @@
-import type { Exec } from "./db";
+import type { Exec, Tier } from "./db";
 
 export interface DredgeRange<T> {
   min?: T;
@@ -48,6 +48,9 @@ export interface DredgeSearchResponse {
   hits: DredgeHit[];
   facets?: Record<string, DredgeFacetBucket[]>;
   elapsedMs: number;
+  // Which database tier served this response. Provisional ("hot") results may be
+  // superseded once the Full Tier swaps in and subsequent responses read "full".
+  tier: Tier;
 }
 
 export class DredgeQueryError extends Error {
@@ -416,6 +419,7 @@ export function search(
   exec: Exec,
   schema: SchemaInfo,
   request: DredgeSearchRequest,
+  tier: Tier = "full",
 ): DredgeSearchResponse {
   const started = performance.now();
   const query = (request.query ?? "").trim();
@@ -424,7 +428,7 @@ export function search(
   if (matchExpr === null) {
     // Browse: no text query, so no FTS evaluation and no temp table — read
     // directly from the documents table as before.
-    return runSearch(exec, schema, request, false, started);
+    return runSearch(exec, schema, request, false, started, tier);
   }
 
   // Single-pass: evaluate the FTS match exactly once into a temp table, then
@@ -437,7 +441,7 @@ export function search(
     [matchExpr],
   );
   try {
-    return runSearch(exec, schema, request, true, started);
+    return runSearch(exec, schema, request, true, started, tier);
   } finally {
     exec(`DROP TABLE IF EXISTS temp.${MATCH_TABLE}`);
   }
@@ -452,6 +456,7 @@ function runSearch(
   request: DredgeSearchRequest,
   usesFts: boolean,
   started: number,
+  tier: Tier,
 ): DredgeSearchResponse {
   const filters = request.filters ?? {};
   const limit = Math.max(0, request.limit ?? 20);
@@ -524,5 +529,5 @@ function runSearch(
     }
   }
 
-  return { total, hits, facets, elapsedMs: performance.now() - started };
+  return { total, hits, facets, elapsedMs: performance.now() - started, tier };
 }

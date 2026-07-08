@@ -51,11 +51,16 @@ export interface DredgeSearchRequest {
   includeFacets?: boolean | Array<keyof DredgeFilters>;
 }
 
+export type DredgeTier = "hot" | "full";
+
 export interface DredgeSearchResponse {
   total: number;
   hits: DredgeResult[];
   facets?: Partial<Record<keyof DredgeFilters, DredgeFacetBucket[]>>;
   elapsedMs: number;
+  // Which database tier served this response. Provisional ("hot") results may be
+  // superseded once the full tier swaps in and later responses read "full".
+  tier: DredgeTier;
 }
 
 export type DredgeStatus =
@@ -67,6 +72,9 @@ export type DredgeStatus =
   | "decompressing_db"
   | "writing_opfs"
   | "opening_db"
+  // Cold visit only: the hot tier is serving searches while the full tier
+  // downloads in the background. Searches are accepted here and in "ready".
+  | "ready_hot"
   | "ready"
   | "failed";
 
@@ -104,7 +112,7 @@ export type DredgeWorkerRequest =
 
 export type DredgeWorkerResponse =
   | { type: "status"; id?: number; status: DredgeStatus }
-  | { type: "ready"; id: number }
+  | { type: "ready"; id: number; tier: DredgeTier }
   | { type: "searchResult"; id: number; response: DredgeSearchResponse }
   | { type: "error"; id?: number; error: DredgeError };
 
@@ -169,7 +177,7 @@ export class DredgeSearchClient {
   }
 
   async init(): Promise<void> {
-    if (this.status === "ready") {
+    if (this.status === "ready" || this.status === "ready_hot") {
       return;
     }
     if (this.status === "failed") {
@@ -197,7 +205,9 @@ export class DredgeSearchClient {
 
   async search(request: DredgeSearchRequest = {}): Promise<DredgeSearchResponse> {
     await this.init();
-    if (this.status !== "ready") {
+    // Searches are accepted on the hot tier ("ready_hot") as well as "ready";
+    // each response is tagged with the tier that served it.
+    if (this.status !== "ready" && this.status !== "ready_hot") {
       throw new DredgeClientError({ code: "CLIENT_NOT_READY", message: "Dredge worker is not ready." });
     }
 
@@ -254,7 +264,9 @@ export class DredgeSearchClient {
     }
 
     if (message.type === "ready") {
-      this.setStatus("ready");
+      // A cold boot resolves init on the hot tier ("ready_hot"); the full tier
+      // swap later arrives as a plain `status: "ready"` message.
+      this.setStatus(message.tier === "hot" ? "ready_hot" : "ready");
       const pending = this.pending.get(message.id);
       if (pending?.kind === "init") {
         this.pending.delete(message.id);

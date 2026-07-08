@@ -2,18 +2,20 @@ import { createHash } from "node:crypto";
 
 import { beforeEach, describe, expect, it } from "vitest";
 
-import { boot, resetBootStateForTests, toDredgeError } from "../src/db";
-import type { BootEnv, PoolLike } from "../src/db";
+import { boot, getTier, resetBootStateForTests, toDredgeError } from "../src/db";
+import type { BootEnv, PoolLike, StorageEstimateLike } from "../src/db";
 import type { DredgeManifest, DredgeStatus } from "../src/protocol";
 
-// These tests pin CURRENT boot behavior through the injected BootEnv seam so
-// later tier work (ticket 13) can change boot logic against a green baseline.
-// Nothing here exercises the browser: fetch, the sqlite module, and the OPFS
-// pool are all fakes, and boot runs in Node.
+// Ticket 13 (Hot Tier runtime lifecycle) exercised through the injected BootEnv
+// seam: cold boot serves the Hot Tier, the Full Tier swaps in behind it, warm
+// boot skips the Hot Tier entirely, a failed Full Tier download stays on hot,
+// integrity failures fail the boot, and a quota-short device keeps the Full Tier
+// in memory. Nothing here touches the browser — fetch, the sqlite module, the
+// OPFS pool and the storage estimate are all fakes, and boot runs in Node.
 
 // A FakeDb stands in for both a pool-backed OpfsSAHPoolDb and an in-memory
-// oo1.DB. Every instance records itself so a test can inspect how it was opened
-// and which pragmas were applied.
+// oo1.DB. Every instance records how it was opened so a test can inspect which
+// tier it belongs to and whether the swap closed it.
 const dbInstances: FakeDb[] = [];
 
 class FakeDb {
@@ -104,22 +106,30 @@ class FakePool implements PoolLike {
 }
 
 const MANIFEST_URL = "https://dredge.test/dredge/manifest.json";
-const DB_URL = "https://dredge.test/dredge/app.db";
-const DB_BYTES = new Uint8Array([0xff, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]);
-const DB_SHA256 = createHash("sha256").update(DB_BYTES).digest("hex");
-const DB_PATH = `/dredge/${DB_SHA256}.db`;
+const HOT_URL = "https://dredge.test/dredge/hot.db";
+const FULL_URL = "https://dredge.test/dredge/full.db";
+
+const HOT_BYTES = new Uint8Array([0x01, 0x02, 0x03, 0x04, 0x05]);
+const FULL_BYTES = new Uint8Array([0xff, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]);
+const HOT_SHA = createHash("sha256").update(HOT_BYTES).digest("hex");
+const FULL_SHA = createHash("sha256").update(FULL_BYTES).digest("hex");
+const FULL_PATH = `/dredge/${FULL_SHA}.db`;
 
 function makeManifest(overrides: Partial<DredgeManifest> = {}): DredgeManifest {
   return {
     manifest_version: 1,
     db_schema_version: 2,
-    db_file: "app.db",
-    db_sha256: DB_SHA256,
-    // db_bytes equals the served length so decompress takes the host-decoded
-    // path and never invokes brotli.
-    db_bytes: DB_BYTES.byteLength,
-    db_compressed_bytes: DB_BYTES.byteLength,
+    db_file: "full.db",
+    db_sha256: FULL_SHA,
+    // Served length equals db_bytes so decompress takes the host-decoded path
+    // and never invokes brotli.
+    db_bytes: FULL_BYTES.byteLength,
+    db_compressed_bytes: FULL_BYTES.byteLength,
     db_compression: "br",
+    hot_db_file: "hot.db",
+    hot_db_sha256: HOT_SHA,
+    hot_db_bytes: HOT_BYTES.byteLength,
+    hot_db_compressed_bytes: HOT_BYTES.byteLength,
     sqlite_page_size: 4096,
     page_count: 1,
     config_hash: "cfg",
@@ -130,9 +140,11 @@ function makeManifest(overrides: Partial<DredgeManifest> = {}): DredgeManifest {
 
 interface FetchOptions {
   manifestStatus?: number;
-  manifestThrows?: boolean;
   manifestBody?: unknown;
-  dbBytes?: Uint8Array;
+  hotBytes?: Uint8Array;
+  fullBytes?: Uint8Array;
+  fullThrows?: boolean;
+  fullStatus?: number;
 }
 
 function makeFetch(options: FetchOptions = {}): { fetch: BootEnv["fetch"]; calls: string[] } {
@@ -141,9 +153,6 @@ function makeFetch(options: FetchOptions = {}): { fetch: BootEnv["fetch"]; calls
     const url = String(input);
     calls.push(url);
     if (url.endsWith("manifest.json")) {
-      if (options.manifestThrows) {
-        throw new TypeError("network unreachable");
-      }
       const status = options.manifestStatus ?? 200;
       const body = options.manifestBody ?? makeManifest();
       return {
@@ -153,11 +162,19 @@ function makeFetch(options: FetchOptions = {}): { fetch: BootEnv["fetch"]; calls
         arrayBuffer: async () => new ArrayBuffer(0),
       } as Response;
     }
-    const bytes = options.dbBytes ?? DB_BYTES;
+    if (url.endsWith("hot.db")) {
+      const bytes = options.hotBytes ?? HOT_BYTES;
+      return { ok: true, status: 200, arrayBuffer: async () => bytes.slice().buffer } as Response;
+    }
+    // full.db
+    if (options.fullThrows) {
+      throw new TypeError("connection reset");
+    }
+    const status = options.fullStatus ?? 200;
+    const bytes = options.fullBytes ?? FULL_BYTES;
     return {
-      ok: true,
-      status: 200,
-      json: async () => ({}),
+      ok: status >= 200 && status < 300,
+      status,
       arrayBuffer: async () => bytes.slice().buffer,
     } as Response;
   };
@@ -168,9 +185,12 @@ interface EnvOptions {
   fetch?: BootEnv["fetch"];
   pool?: PoolLike;
   installPoolThrows?: boolean;
+  estimate?: StorageEstimateLike | undefined;
+  estimateThrows?: boolean;
+  omitEstimate?: boolean;
 }
 
-function makeEnv(options: EnvOptions = {}): { env: BootEnv; sqlite: FakeSqlite; pool?: PoolLike } {
+function makeEnv(options: EnvOptions = {}): { env: BootEnv; sqlite: FakeSqlite } {
   const sqlite = makeFakeSqlite();
   const fetch = options.fetch ?? makeFetch().fetch;
   const env: BootEnv = {
@@ -183,12 +203,29 @@ function makeEnv(options: EnvOptions = {}): { env: BootEnv; sqlite: FakeSqlite; 
       return options.pool;
     },
   };
-  return { env, sqlite, pool: options.pool };
+  if (!options.omitEstimate) {
+    env.estimateStorage = async () => {
+      if (options.estimateThrows) {
+        throw new Error("estimate blew up");
+      }
+      return options.estimate;
+    };
+  }
+  return { env, sqlite };
 }
 
-function recorder(): { status: (s: DredgeStatus, detail?: string) => void; seen: DredgeStatus[] } {
-  const seen: DredgeStatus[] = [];
-  return { status: (s) => seen.push(s), seen };
+interface StatusEvent {
+  status: DredgeStatus;
+  detail?: string;
+}
+
+function recorder(): { status: (s: DredgeStatus, detail?: string) => void; seen: StatusEvent[] } {
+  const seen: StatusEvent[] = [];
+  return { status: (status, detail) => seen.push({ status, detail }), seen };
+}
+
+function statuses(seen: StatusEvent[]): DredgeStatus[] {
+  return seen.map((event) => event.status);
 }
 
 beforeEach(() => {
@@ -196,117 +233,223 @@ beforeEach(() => {
   dbInstances.length = 0;
 });
 
-describe("boot orchestration (BootEnv seam)", () => {
-  it("cold OPFS boot downloads, decompresses, imports, and opens", async () => {
+describe("hot/full tier boot lifecycle (BootEnv seam)", () => {
+  it("cold OPFS boot serves the hot tier, then swaps the full tier in atomically", async () => {
     const { fetch, calls } = makeFetch();
+    const pool = new FakePool();
+    const { env, sqlite } = makeEnv({ fetch, pool });
+    const { status, seen } = recorder();
+
+    const session = await boot(MANIFEST_URL, false, status, env);
+
+    // boot() resolves on the hot tier: the full tier has not swapped in yet
+    // (its download awaits after boot returns), so only the hot db is live.
+    expect(session.tier).toBe("hot");
+    expect(getTier()).toBe("hot");
+    expect(sqlite.deserializeCalls).toEqual([{ length: HOT_BYTES.byteLength }]);
+    expect(pool.imported).toHaveLength(0);
+    // The hot boot ran to ready_hot before any full-tier work.
+    expect(statuses(seen).slice(0, 6)).toEqual([
+      "checking_support",
+      "fetching_manifest",
+      "downloading_db",
+      "decompressing_db",
+      "opening_db",
+      "ready_hot",
+    ]);
+
+    // The background full-tier upgrade completes and swaps in.
+    expect(session.fullTier).toBeDefined();
+    await session.fullTier;
+
+    expect(getTier()).toBe("full");
+    expect(calls).toEqual([MANIFEST_URL, HOT_URL, FULL_URL]);
+    // The full tier was imported to OPFS under the content-hash path and opened
+    // from exactly that pool file.
+    expect(pool.imported).toEqual([{ path: FULL_PATH, bytes: FULL_BYTES }]);
+    const hotDb = dbInstances[0];
+    const fullDb = dbInstances[1];
+    expect(hotDb.openedFrom).toBeUndefined();
+    expect(fullDb.openedFrom).toBe(FULL_PATH);
+    // Swap order: the full handle stays open; the old hot handle is closed
+    // (freeing its memory) only after the full handle is installed.
+    expect(fullDb.closed).toBe(false);
+    expect(hotDb.closed).toBe(true);
+    expect(statuses(seen)).toContain("ready");
+  });
+
+  it("warm OPFS boot opens the full tier directly and never fetches the hot tier", async () => {
+    const { fetch, calls } = makeFetch();
+    const pool = new FakePool({ [FULL_PATH]: FULL_BYTES });
+    const { env } = makeEnv({ fetch, pool });
+    const { status, seen } = recorder();
+
+    const session = await boot(MANIFEST_URL, false, status, env);
+
+    expect(session.tier).toBe("full");
+    expect(getTier()).toBe("full");
+    expect(session.fullTier).toBeUndefined();
+    expect(session.timings.fromCache).toBe(true);
+    // Only the manifest was fetched: no hot tier, no full download.
+    expect(calls).toEqual([MANIFEST_URL]);
+    expect(pool.imported).toHaveLength(0);
+    expect(dbInstances).toHaveLength(1);
+    expect(dbInstances[0].openedFrom).toBe(FULL_PATH);
+    expect(statuses(seen)).not.toContain("ready_hot");
+    expect(statuses(seen)).not.toContain("downloading_db");
+    expect(statuses(seen)).toContain("ready");
+  });
+
+  it("reset forces a cold boot even when the full tier is already cached", async () => {
+    const { fetch, calls } = makeFetch();
+    const pool = new FakePool({ [FULL_PATH]: FULL_BYTES });
+    const { env } = makeEnv({ fetch, pool });
+    const { status } = recorder();
+
+    const session = await boot(MANIFEST_URL, true, status, env);
+    await session.fullTier;
+
+    // The cached full tier was unlinked and the hot-then-full lifecycle ran.
+    expect(pool.unlinked).toContain(FULL_PATH);
+    expect(calls).toEqual([MANIFEST_URL, HOT_URL, FULL_URL]);
+    expect(getTier()).toBe("full");
+  });
+
+  it("keeps the session on the hot tier when the full-tier download fails", async () => {
+    const { fetch, calls } = makeFetch({ fullThrows: true });
     const pool = new FakePool();
     const { env } = makeEnv({ fetch, pool });
     const { status, seen } = recorder();
 
-    const timings = await boot(MANIFEST_URL, false, status, env);
+    const session = await boot(MANIFEST_URL, false, status, env);
+    // The upgrade promise settles (never rejects) even though the download died.
+    await session.fullTier;
 
-    expect(timings.fromCache).toBe(false);
-    // Both the manifest and the database were fetched.
-    expect(calls).toEqual([MANIFEST_URL, DB_URL]);
-    // The decompressed bytes were imported under the content-hash path...
-    expect(pool.imported).toHaveLength(1);
-    expect(pool.imported[0].path).toBe(DB_PATH);
-    expect([...pool.imported[0].bytes]).toEqual([...DB_BYTES]);
-    // ...and a database was opened from exactly that pool file.
-    expect(dbInstances).toHaveLength(1);
-    expect(dbInstances[0].openedFrom).toBe(DB_PATH);
-    expect(dbInstances[0].execCalls).toContain("PRAGMA temp_store = MEMORY");
-    expect(seen).toEqual([
-      "checking_support",
-      "fetching_manifest",
-      "checking_storage",
-      "downloading_db",
-      "decompressing_db",
-      "writing_opfs",
-      "opening_db",
-      "ready",
-    ]);
+    expect(getTier()).toBe("hot");
+    // We attempted the full download but stayed on hot; the swap never happened.
+    expect(calls).toEqual([MANIFEST_URL, HOT_URL, FULL_URL]);
+    expect(pool.imported).toHaveLength(0);
+    // Never transitioned to "failed"; the last status is ready_hot with a detail.
+    expect(statuses(seen)).not.toContain("failed");
+    const lastReadyHot = [...seen].reverse().find((event) => event.status === "ready_hot");
+    expect(lastReadyHot?.detail).toMatch(/full tier unavailable/i);
   });
 
-  it("warm OPFS boot skips the download and opens the cached file", async () => {
-    const { fetch, calls } = makeFetch();
-    const pool = new FakePool({ [DB_PATH]: DB_BYTES });
+  it("fails the boot when the hot tier fails its integrity check", async () => {
+    // Serve hot bytes that do not hash to manifest.hot_db_sha256.
+    const { fetch } = makeFetch({ hotBytes: new Uint8Array([9, 9, 9, 9, 9]) });
+    const pool = new FakePool();
     const { env } = makeEnv({ fetch, pool });
+    const { status } = recorder();
+
+    await expect(
+      boot(MANIFEST_URL, false, status, env).catch((error) => {
+        throw new Error(toDredgeError(error).code);
+      }),
+    ).rejects.toThrow("DB_STORAGE_CORRUPT");
+  });
+
+  it("opens the full tier in memory when the storage quota is too low", async () => {
+    const { fetch, calls } = makeFetch();
+    const pool = new FakePool();
+    // Headroom (quota - usage) below db_bytes * 1.1 → skip OPFS persistence.
+    const { env, sqlite } = makeEnv({
+      fetch,
+      pool,
+      estimate: { quota: FULL_BYTES.byteLength, usage: 0 },
+    });
     const { status, seen } = recorder();
 
-    const timings = await boot(MANIFEST_URL, false, status, env);
+    const session = await boot(MANIFEST_URL, false, status, env);
+    await session.fullTier;
 
-    expect(timings.fromCache).toBe(true);
-    // Only the manifest was fetched; the database file was never requested.
-    expect(calls).toEqual([MANIFEST_URL]);
+    expect(getTier()).toBe("full");
+    expect(calls).toEqual([MANIFEST_URL, HOT_URL, FULL_URL]);
+    // The full tier was NOT persisted; it was deserialized into memory instead.
     expect(pool.imported).toHaveLength(0);
-    expect(dbInstances).toHaveLength(1);
-    expect(dbInstances[0].openedFrom).toBe(DB_PATH);
-    expect(seen).not.toContain("downloading_db");
-    expect(seen).toContain("ready");
+    expect(sqlite.deserializeCalls).toEqual([
+      { length: HOT_BYTES.byteLength },
+      { length: FULL_BYTES.byteLength },
+    ]);
+    const quotaDetail = seen.find(
+      (event) => event.status === "ready_hot" && /quota/i.test(event.detail ?? ""),
+    );
+    expect(quotaDetail).toBeDefined();
+    expect(statuses(seen)).toContain("ready");
   });
 
-  it("falls back to the in-memory backend when the pool is unavailable", async () => {
+  it("persists the full tier when the quota preflight reports ample headroom", async () => {
+    const { fetch } = makeFetch();
+    const pool = new FakePool();
+    const { env } = makeEnv({
+      fetch,
+      pool,
+      estimate: { quota: FULL_BYTES.byteLength * 100, usage: 0 },
+    });
+    const { status } = recorder();
+
+    const session = await boot(MANIFEST_URL, false, status, env);
+    await session.fullTier;
+
+    expect(getTier()).toBe("full");
+    expect(pool.imported).toEqual([{ path: FULL_PATH, bytes: FULL_BYTES }]);
+  });
+
+  it("boots both tiers in memory when OPFS is unavailable", async () => {
     const { fetch, calls } = makeFetch();
-    // installPool resolves to undefined => memory backend.
+    // installPool resolves to undefined => memory backend, no pool at all.
     const { env, sqlite } = makeEnv({ fetch, pool: undefined });
     const { status, seen } = recorder();
 
-    const timings = await boot(MANIFEST_URL, false, status, env);
+    const session = await boot(MANIFEST_URL, false, status, env);
+    expect(session.tier).toBe("hot");
+    expect(getTier()).toBe("hot");
+    await session.fullTier;
 
-    expect(timings.fromCache).toBe(false);
-    // Memory mode always downloads and deserializes into WASM memory.
-    expect(calls).toEqual([MANIFEST_URL, DB_URL]);
-    expect(sqlite.allocCalls).toHaveLength(1);
-    expect(sqlite.deserializeCalls).toEqual([{ length: DB_BYTES.byteLength }]);
-    expect(dbInstances).toHaveLength(1);
-    expect(dbInstances[0].openedFrom).toBeUndefined();
-    // Memory path has no storage-check or OPFS-write step.
-    expect(seen).not.toContain("checking_storage");
-    expect(seen).not.toContain("writing_opfs");
-    expect(seen).toEqual([
-      "checking_support",
-      "fetching_manifest",
-      "downloading_db",
-      "decompressing_db",
-      "opening_db",
-      "ready",
+    expect(getTier()).toBe("full");
+    expect(calls).toEqual([MANIFEST_URL, HOT_URL, FULL_URL]);
+    // Both tiers deserialized into WASM memory; nothing imported.
+    expect(sqlite.deserializeCalls).toEqual([
+      { length: HOT_BYTES.byteLength },
+      { length: FULL_BYTES.byteLength },
     ]);
+    // Hot handle closed after the in-memory full handle swapped in.
+    expect(dbInstances).toHaveLength(2);
+    expect(dbInstances[0].closed).toBe(true);
+    expect(dbInstances[1].closed).toBe(false);
+    expect(statuses(seen)).toContain("ready_hot");
+    expect(statuses(seen)).toContain("ready");
   });
 
   it("falls back to memory with a status detail when pool installation fails", async () => {
     const { fetch } = makeFetch();
     const { env, sqlite } = makeEnv({ fetch, installPoolThrows: true });
-    const details: Array<string | undefined> = [];
-    const status = (s: DredgeStatus, detail?: string): void => {
-      if (s === "checking_support") {
-        details.push(detail);
-      }
-    };
+    const { status, seen } = recorder();
 
-    const timings = await boot(MANIFEST_URL, false, status, env);
+    const session = await boot(MANIFEST_URL, false, status, env);
+    await session.fullTier;
 
-    expect(timings.fromCache).toBe(false);
-    expect(sqlite.deserializeCalls).toHaveLength(1);
-    // The install failure surfaced as a checking_support status detail.
-    expect(details.some((d) => typeof d === "string" && d.includes("locked by another tab"))).toBe(
-      true,
+    expect(getTier()).toBe("full");
+    // Both tiers landed in memory; the install failure surfaced as a detail.
+    expect(sqlite.deserializeCalls).toHaveLength(2);
+    const installDetail = seen.find(
+      (event) => event.status === "checking_support" && (event.detail ?? "").includes("locked by another tab"),
     );
+    expect(installDetail).toBeDefined();
   });
 
-  it("reuses already-decoded bytes and never invokes brotli", async () => {
-    // The served bytes are not valid brotli; if decode ran it would throw
-    // DB_DECOMPRESS_FAILED. Because db_bytes equals the served length, boot
-    // must skip the decoder entirely and import the bytes unchanged.
+  it("proceeds to persist when the storage estimate is unavailable", async () => {
     const { fetch } = makeFetch();
     const pool = new FakePool();
-    const { env } = makeEnv({ fetch, pool });
+    // No estimateStorage on the env at all → preflight is skipped.
+    const { env } = makeEnv({ fetch, pool, omitEstimate: true });
     const { status } = recorder();
 
-    await expect(boot(MANIFEST_URL, false, status, env)).resolves.toMatchObject({
-      fromCache: false,
-    });
-    expect([...pool.imported[0].bytes]).toEqual([...DB_BYTES]);
+    const session = await boot(MANIFEST_URL, false, status, env);
+    await session.fullTier;
+
+    expect(getTier()).toBe("full");
+    expect(pool.imported).toEqual([{ path: FULL_PATH, bytes: FULL_BYTES }]);
   });
 
   it("surfaces a manifest HTTP error as MANIFEST_FETCH_FAILED", async () => {
@@ -315,22 +458,24 @@ describe("boot orchestration (BootEnv seam)", () => {
     const { env } = makeEnv({ fetch, pool });
     const { status } = recorder();
 
-    await expect(boot(MANIFEST_URL, false, status, env).catch((e) => {
-      throw new Error(toDredgeError(e).code);
-    })).rejects.toThrow("MANIFEST_FETCH_FAILED");
+    await expect(
+      boot(MANIFEST_URL, false, status, env).catch((error) => {
+        throw new Error(toDredgeError(error).code);
+      }),
+    ).rejects.toThrow("MANIFEST_FETCH_FAILED");
   });
 
-  it("cleans up stale /dredge databases after a cold import", async () => {
+  it("cleans up stale /dredge databases after the full tier is imported", async () => {
     const stalePath = "/dredge/deadbeef.db";
     const { fetch } = makeFetch();
     const pool = new FakePool({ [stalePath]: new Uint8Array([9, 9, 9]) });
     const { env } = makeEnv({ fetch, pool });
     const { status } = recorder();
 
-    await boot(MANIFEST_URL, false, status, env);
+    const session = await boot(MANIFEST_URL, false, status, env);
+    await session.fullTier;
 
-    // The stale file was unlinked and the freshly imported one retained.
     expect(pool.unlinked).toContain(stalePath);
-    expect(pool.getFileNames()).toEqual([DB_PATH]);
+    expect(pool.getFileNames()).toEqual([FULL_PATH]);
   });
 });
