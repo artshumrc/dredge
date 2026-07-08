@@ -550,6 +550,22 @@ def test_compile_writes_generated_types_worker_protocol_and_stale_handling(
     assert 'const DEFAULT_WORKER_URL = "/search/dredge-worker.abc123.js";' in source
 
 
+def test_generated_client_matches_golden(tmp_path: Path) -> None:
+    config_path, _ = _write_fixture_project(
+        tmp_path, client={"out": str(tmp_path / "dredge-client.ts")}
+    )
+    config = load_config(config_path)
+
+    source = generate_client_source(config)
+
+    golden_path = Path(__file__).parent / "fixtures" / "generated-client.golden.ts"
+    expected = golden_path.read_text(encoding="utf-8")
+    assert source == expected, (
+        "generated client drifted from the golden file. If this change is "
+        "intended, regenerate tests/fixtures/generated-client.golden.ts."
+    )
+
+
 def test_pagefind_compatible_attributes_extract_and_ignore_content(
     tmp_path: Path,
 ) -> None:
