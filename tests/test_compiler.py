@@ -855,6 +855,151 @@ def test_generated_client_typechecks_fixture_app_with_pnpm(tmp_path: Path) -> No
     )
 
 
+def _write_multi_page_site(
+    tmp_path: Path,
+    *,
+    page_count: int,
+    missing_description_ids: frozenset[int] = frozenset(),
+    missing_category_ids: frozenset[int] = frozenset(),
+) -> tuple[Path, Path]:
+    """Write a deterministic multi-page site for parallel-extraction tests.
+
+    Pages live under sorted, shard-free paths so document ids track sorted URL
+    order. ``missing_*`` ids omit a field to provoke a warning or build error on
+    a specific (non-first) page.
+    """
+
+    source_dir = tmp_path / "site"
+    output_dir = tmp_path / "search"
+    (source_dir / "pages").mkdir(parents=True)
+    for doc_id in range(page_count):
+        category_attr = (
+            "" if doc_id in missing_category_ids else "data-dredge-category='guide' "
+        )
+        description = (
+            ""
+            if doc_id in missing_description_ids
+            else f'<meta name="description" content="Page {doc_id:04d} summary">'
+        )
+        (source_dir / "pages" / f"page-{doc_id:04d}.html").write_text(
+            f"""
+            <!doctype html>
+            <html>
+              <head>
+                <title>Page {doc_id:04d}</title>
+                {description}
+              </head>
+              <body>
+                <main {category_attr}data-dredge-catalog='cat{doc_id:04d}'>
+                  <h1>Page {doc_id:04d}</h1>
+                  <p>Body text for searchable page number {doc_id}.</p>
+                </main>
+              </body>
+            </html>
+            """,
+            encoding="utf-8",
+        )
+
+    config = {
+        "source_dir": str(source_dir),
+        "output_dir": str(output_dir),
+        "base_url": "/",
+        "include": ["**/*.html"],
+        "exclude": [],
+        "selectors": {
+            "title": "title, h1",
+            "body": "main",
+            "description": "meta[name='description']@content",
+        },
+        "facets": {
+            "category": {
+                "type": "string",
+                "source": "data-dredge-category",
+                "required": True,
+            },
+        },
+        "store_fields": {},
+        "result_fields": ["title", "url", "description", "category"],
+        "composite_indices": [],
+        "search_fields": [{"source": "data-dredge-catalog", "hot": True}],
+    }
+    config_path = tmp_path / "dredge.config.json"
+    config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
+    return config_path, output_dir
+
+
+def _warning_signature(
+    warnings: tuple[compiler.BuildWarning, ...],
+) -> list[tuple[object, ...]]:
+    return [
+        (w.code, w.field, w.selector, w.message, w.count, tuple(w.sample_paths))
+        for w in warnings
+    ]
+
+
+def test_parallel_and_serial_compiles_are_byte_identical(tmp_path: Path) -> None:
+    # One site compiled twice: byte-identical output is the parallelism contract.
+    config_path, _ = _write_multi_page_site(tmp_path, page_count=40)
+
+    serial = compile_site(config_path, jobs=1)
+    parallel = compile_site(config_path, jobs=4)
+
+    assert parallel.page_count == serial.page_count == 40
+    assert parallel.manifest["db_sha256"] == serial.manifest["db_sha256"]
+    assert parallel.manifest["hot_db_sha256"] == serial.manifest["hot_db_sha256"]
+
+
+def test_parallel_extraction_preserves_warning_buckets(tmp_path: Path) -> None:
+    # Several non-first pages miss descriptions: one SELECTOR_MISS bucket whose
+    # count and (capped) sample paths must match between serial and parallel.
+    missing = frozenset({3, 7, 11, 19, 25})
+    config_path, _ = _write_multi_page_site(
+        tmp_path, page_count=30, missing_description_ids=missing
+    )
+
+    serial = compile_site(config_path, jobs=1)
+    parallel = compile_site(config_path, jobs=4)
+
+    description_warnings = [w for w in serial.warnings if w.field == "description"]
+    assert len(description_warnings) == 1
+    assert description_warnings[0].count == len(missing)
+    # Sample paths honor the collector cap and appear in sorted-URL order.
+    assert len(description_warnings[0].sample_paths) == 3
+    assert _warning_signature(parallel.warnings) == _warning_signature(serial.warnings)
+
+
+def test_build_error_propagates_from_extraction_worker(tmp_path: Path) -> None:
+    # The missing-facet page is not the first candidate, so the failure comes
+    # back from a worker process and must keep its code/path/field/selector.
+    config_path, output_dir = _write_multi_page_site(
+        tmp_path, page_count=12, missing_category_ids=frozenset({6})
+    )
+
+    with pytest.raises(BuildError) as error:
+        compile_site(config_path, jobs=4)
+
+    assert error.value.code == "FACET_REQUIRED_MISSING"
+    assert error.value.path is not None
+    assert error.value.path.name == "page-0006.html"
+    assert error.value.field == "category"
+    assert error.value.selector == "data-dredge-category"
+    assert not (output_dir / "search-manifest.json").exists()
+
+
+def test_compile_rejects_jobs_below_one(tmp_path: Path) -> None:
+    config_path, _ = _write_fixture_project(tmp_path)
+
+    with pytest.raises(ValueError, match="jobs must be at least 1"):
+        compile_site(config_path, jobs=0)
+
+
+def test_cli_compile_accepts_jobs_flag(tmp_path: Path) -> None:
+    config_path, output_dir = _write_fixture_project(tmp_path)
+
+    assert main(["compile", "--config", str(config_path), "--jobs", "2"]) == 0
+    assert (output_dir / "search-manifest.json").exists()
+
+
 def _plan_uses_index(
     connection: sqlite3.Connection,
     sql: str,

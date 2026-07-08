@@ -45,6 +45,16 @@ def main(argv: list[str] | None = None) -> int:
                     f"(default: {BROTLI_QUALITY})"
                 ),
             )
+            command_parser.add_argument(
+                "--jobs",
+                type=int,
+                default=None,
+                metavar="N",
+                help=(
+                    "Number of extraction worker processes "
+                    "(default: number of CPU cores; use 1 for serial extraction)"
+                ),
+            )
 
     synth_parser = subparsers.add_parser(
         "synth",
@@ -101,6 +111,7 @@ def main(argv: list[str] | None = None) -> int:
             metrics_json_path=args.metrics_json,
             progress_stream=sys.stderr,
             brotli_quality=args.brotli_quality,
+            jobs=args.jobs,
         )
         for warning in result.warnings:
             print(f"warning[{warning.code}]: {warning.message}", file=sys.stderr)

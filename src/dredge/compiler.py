@@ -3,6 +3,7 @@ from __future__ import annotations
 import fnmatch
 import hashlib
 import json
+import os
 import re
 import shutil
 import sqlite3
@@ -10,7 +11,8 @@ import sys
 import tempfile
 import time
 import unicodedata
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
+from concurrent.futures import ProcessPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field as dataclass_field
 from datetime import date
@@ -93,6 +95,43 @@ class BuildError(Exception):
         self.selector = selector
         self.value = value
 
+    def __reduce__(
+        self,
+    ) -> tuple[Callable[..., "BuildError"], tuple[Any, ...]]:
+        # The keyword-only fields are lost by Exception's default pickling
+        # (which reconstructs from ``self.args``), so a BuildError raised in an
+        # extraction worker would reach the parent stripped of its code/path.
+        # Rebuild through the real constructor to keep them intact.
+        return (
+            _rebuild_build_error,
+            (
+                self.code,
+                str(self),
+                self.path,
+                self.field,
+                self.selector,
+                self.value,
+            ),
+        )
+
+
+def _rebuild_build_error(
+    code: str,
+    message: str,
+    path: Path | None,
+    field: str | None,
+    selector: str | None,
+    value: Any | None,
+) -> "BuildError":
+    return BuildError(
+        code,
+        message,
+        path=path,
+        field=field,
+        selector=selector,
+        value=value,
+    )
+
 
 @dataclass(frozen=True)
 class BuildWarning:
@@ -169,6 +208,39 @@ class _WarningCollector:
                 )
             )
         return tuple(warnings)
+
+
+class _DocumentWarnings:
+    """A per-document warning sink with the same ``add`` signature as
+    :class:`_WarningCollector`.
+
+    Extraction runs in worker processes, so a document's warnings are recorded
+    here and returned to the parent, which replays them into the single
+    :class:`_WarningCollector` in candidate order. Replaying in order reproduces
+    the exact bucket counts and sample-path selection of a serial run.
+    """
+
+    def __init__(self) -> None:
+        self.records: list[dict[str, Any]] = []
+
+    def add(
+        self,
+        *,
+        code: str,
+        message: str,
+        path: Path | None = None,
+        field: str | None = None,
+        selector: str | None = None,
+    ) -> None:
+        self.records.append(
+            {
+                "code": code,
+                "message": message,
+                "path": path,
+                "field": field,
+                "selector": selector,
+            }
+        )
 
 
 @dataclass(frozen=True)
@@ -652,6 +724,7 @@ def compile_site(
     metrics_json_path: Path | None = None,
     progress_stream: TextIO | None = None,
     brotli_quality: int = BROTLI_QUALITY,
+    jobs: int | None = None,
 ) -> CompileResult:
     if not BROTLI_MIN_QUALITY <= brotli_quality <= BROTLI_MAX_QUALITY:
         raise ValueError(
@@ -666,6 +739,7 @@ def compile_site(
             progress_stream=progress_stream,
             ui=ui,
             brotli_quality=brotli_quality,
+            jobs=jobs,
         )
 
 
@@ -676,6 +750,7 @@ def _compile_site(
     progress_stream: TextIO | None,
     ui: CompileProgress,
     brotli_quality: int,
+    jobs: int | None,
 ) -> CompileResult:
     metrics = _MetricsRecorder(config_path)
     with metrics.phase("validation"):
@@ -690,6 +765,7 @@ def _compile_site(
             "DISCOVERY_NO_FILES",
             f"no HTML files matched include/exclude patterns in {config.source_dir}",
         )
+    resolved_jobs = _resolve_jobs(jobs, len(candidates))
 
     config.output_dir.mkdir(parents=True, exist_ok=True)
     temp_dir = Path(tempfile.mkdtemp(prefix=".dredge-build-", dir=config.output_dir))
@@ -733,8 +809,12 @@ def _compile_site(
             ingest_started_at = time.perf_counter()
             with metrics.phase("extraction_ingest"):
                 ui.set_phase("extraction_ingest")
-                for index, candidate in enumerate(candidates, start=1):
-                    document = _extract_document(index, candidate, config, warnings)
+                extractions = _iter_extractions(candidates, config, resolved_jobs)
+                for index, (candidate, document, warning_records) in enumerate(
+                    extractions, start=1
+                ):
+                    for record in warning_records:
+                        warnings.add(**record)
                     if smoke_title_token is None:
                         smoke_title_token = _first_search_token(document.title)
                     if smoke_token is None:
@@ -1354,11 +1434,78 @@ def _flush_insert_batches(
         batches.hot_source.clear()
 
 
+def _resolve_jobs(jobs: int | None, candidate_count: int) -> int:
+    """Resolve the extraction worker count.
+
+    ``None`` means auto: one worker per core. Any resolved value is clamped to
+    the number of candidates, so a small site (or ``--jobs`` larger than the
+    work) never spins up idle workers and falls through to the serial path.
+    """
+
+    if jobs is None:
+        jobs = os.cpu_count() or 1
+    elif jobs < 1:
+        raise ValueError(f"jobs must be at least 1; got {jobs}")
+    return max(1, min(jobs, candidate_count))
+
+
+_EXTRACTION_CONFIG: DredgeConfig | None = None
+
+
+def _init_extraction_worker(config: DredgeConfig) -> None:
+    global _EXTRACTION_CONFIG
+    _EXTRACTION_CONFIG = config
+
+
+def _extract_document_worker(
+    task: tuple[int, FileCandidate],
+) -> tuple[ExtractedDocument, list[dict[str, Any]]]:
+    document_id, candidate = task
+    config = _EXTRACTION_CONFIG
+    assert config is not None, "extraction worker used before initialization"
+    sink = _DocumentWarnings()
+    document = _extract_document(document_id, candidate, config, sink)
+    return document, sink.records
+
+
+def _iter_extractions(
+    candidates: Sequence[FileCandidate],
+    config: DredgeConfig,
+    jobs: int,
+) -> Iterator[tuple[FileCandidate, ExtractedDocument, list[dict[str, Any]]]]:
+    """Yield ``(candidate, document, warning_records)`` in candidate order.
+
+    ``jobs == 1`` is the serial path (no process pool). Otherwise extraction
+    fans out across processes; ``ProcessPoolExecutor.map`` preserves input
+    order, so document ids and insert order match a serial compile exactly.
+    """
+
+    if jobs == 1:
+        for index, candidate in enumerate(candidates, start=1):
+            sink = _DocumentWarnings()
+            document = _extract_document(index, candidate, config, sink)
+            yield candidate, document, sink.records
+        return
+
+    tasks = [
+        (index, candidate) for index, candidate in enumerate(candidates, start=1)
+    ]
+    chunksize = max(1, len(tasks) // (jobs * 4))
+    with ProcessPoolExecutor(
+        max_workers=jobs,
+        initializer=_init_extraction_worker,
+        initargs=(config,),
+    ) as executor:
+        results = executor.map(_extract_document_worker, tasks, chunksize=chunksize)
+        for candidate, (document, records) in zip(candidates, results):
+            yield candidate, document, records
+
+
 def _extract_document(
     document_id: int,
     candidate: FileCandidate,
     config: DredgeConfig,
-    warnings: _WarningCollector,
+    warnings: _WarningCollector | _DocumentWarnings,
 ) -> ExtractedDocument:
     try:
         html_bytes = candidate.path.read_bytes()
