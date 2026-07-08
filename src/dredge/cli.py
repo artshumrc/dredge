@@ -11,6 +11,7 @@ from .compiler import (
     BROTLI_QUALITY,
     BuildError,
     compile_site,
+    format_payload_report,
     validate_config,
 )
 
@@ -111,6 +112,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"metrics: {args.metrics_json}")
         if result.client_path is not None:
             print(f"client: {result.client_path}")
+        print(format_payload_report(result.metrics["payload_report"]))
         return 0
     except BuildError as error:
         print(f"error[{error.code}]: {error}", file=sys.stderr)

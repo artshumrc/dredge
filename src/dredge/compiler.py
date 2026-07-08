@@ -38,6 +38,8 @@ PROGRESS_DOCUMENT_INTERVAL = 5_000
 PROGRESS_TIME_INTERVAL_SECONDS = 10.0
 METRICS_VERSION = 1
 MAX_WARNING_SAMPLES = 3
+PAYLOAD_HIGH_CARDINALITY_THRESHOLD = 1000
+PAYLOAD_DUPLICATE_COLUMN_RATIO = 0.9
 
 IDENTIFIER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 ATTRIBUTE_RE = re.compile(r"^[A-Za-z_:][-A-Za-z0-9_:.]*$")
@@ -310,6 +312,7 @@ class _MetricsRecorder:
         db_sha256: str,
         db_bytes: int,
         db_compressed_bytes: int,
+        payload_report: dict[str, Any],
     ) -> dict[str, Any]:
         ingest_rate = (
             self.ingest_documents / self.ingest_seconds
@@ -351,6 +354,7 @@ class _MetricsRecorder:
                 "db_compressed_bytes": db_compressed_bytes,
                 "db_compression": DB_COMPRESSION,
             },
+            "payload_report": payload_report,
         }
 
 
@@ -787,7 +791,9 @@ def _compile_site(
 
         with metrics.phase("post_build_checks"):
             ui.set_phase("post_build_checks")
-            _run_post_build_checks(db_path, config, smoke_token, smoke_filter)
+            payload_report = _run_post_build_checks(
+                db_path, config, smoke_token, smoke_filter, warnings
+            )
 
         with metrics.phase("compression"):
             ui.set_phase("compression")
@@ -837,6 +843,7 @@ def _compile_site(
             db_sha256=db_sha256,
             db_bytes=manifest["db_bytes"],
             db_compressed_bytes=db_compressed_bytes,
+            payload_report=payload_report,
         )
         if metrics_json_path is not None:
             _write_metrics_json(metrics_json_path, metrics_payload)
@@ -1516,12 +1523,36 @@ def _finalize_database(
         connection.execute(f"VACUUM INTO {_quote_sql_string(str(compact_db_path))}")
 
 
+def format_payload_report(report: dict[str, Any]) -> str:
+    """Render a payload report (from ``result.metrics['payload_report']``) as text."""
+    lines = ["payload report:"]
+    if report["dbstat_available"]:
+        total = report["total_bytes"] or 0
+        lines.append(f"  size by table/index ({_format_bytes(total)} total):")
+        for entry in report["tables"]:
+            lines.append(
+                f"    {entry['name']:<28} {_format_bytes(entry['bytes']):>12} "
+                f"{entry['percent']:>6.2f}%"
+            )
+    else:
+        lines.append("  size by table/index: unavailable (dbstat not compiled in)")
+
+    lines.append(f"  documents columns ({report['row_count']:,} rows):")
+    for column in report["columns"]:
+        lines.append(
+            f"    {column['name']:<28} {_format_bytes(column['total_bytes']):>12} "
+            f"{column['distinct_count']:>10,} distinct"
+        )
+    return "\n".join(lines)
+
+
 def _run_post_build_checks(
     db_path: Path,
     config: DredgeConfig,
     smoke_token: str | None,
     smoke_filter: tuple[str, str, str | int | float] | None,
-) -> None:
+    warnings: _WarningCollector,
+) -> dict[str, Any]:
     connection = sqlite3.connect(f"file:{db_path}?mode=ro&immutable=1", uri=True)
     try:
         integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
@@ -1532,8 +1563,128 @@ def _run_post_build_checks(
             )
         _run_smoke_queries(connection, smoke_token, smoke_filter)
         _verify_query_plans(connection, config)
+        return _build_payload_report(connection, config, warnings)
     finally:
         connection.close()
+
+
+def _build_payload_report(
+    connection: sqlite3.Connection,
+    config: DredgeConfig,
+    warnings: _WarningCollector,
+) -> dict[str, Any]:
+    """Summarize where the shipped database's bytes went and flag config smells.
+
+    Runs on the read-only connection to the finished artifact. Warnings are
+    emitted through ``warnings`` so they surface in ``CompileResult.warnings``
+    alongside other build warnings; the size/column data is returned for the
+    metrics JSON and the human-readable summary.
+    """
+    tables, dbstat_available, total_bytes = _payload_table_breakdown(connection)
+    row_count = int(connection.execute("SELECT COUNT(*) FROM documents").fetchone()[0])
+    columns = _payload_column_stats(connection, row_count)
+    _emit_payload_warnings(connection, config, columns, row_count, warnings)
+    return {
+        "dbstat_available": dbstat_available,
+        "total_bytes": total_bytes,
+        "row_count": row_count,
+        "tables": tables,
+        "columns": columns,
+    }
+
+
+def _payload_table_breakdown(
+    connection: sqlite3.Connection,
+) -> tuple[list[dict[str, Any]], bool, int | None]:
+    try:
+        rows = connection.execute(
+            "SELECT name, SUM(pgsize) FROM dbstat GROUP BY name ORDER BY SUM(pgsize) DESC"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        # dbstat is a compile-time option; degrade to skipping the table
+        # breakdown rather than failing the build.
+        return [], False, None
+    total = sum(int(row[1]) for row in rows)
+    tables = [
+        {
+            "name": row[0],
+            "bytes": int(row[1]),
+            "percent": round(int(row[1]) / total * 100, 2) if total else 0.0,
+        }
+        for row in rows
+    ]
+    return tables, True, total
+
+
+def _payload_column_stats(
+    connection: sqlite3.Connection, row_count: int
+) -> list[dict[str, Any]]:
+    column_names = [row[1] for row in connection.execute("PRAGMA table_info(documents)")]
+    columns: list[dict[str, Any]] = []
+    for name in column_names:
+        quoted = _quote_identifier(name)
+        total_bytes, distinct_count = connection.execute(
+            f"SELECT total(length(cast({quoted} AS BLOB))), count(distinct {quoted}) "
+            "FROM documents"
+        ).fetchone()
+        total_bytes = int(total_bytes)
+        columns.append(
+            {
+                "name": name,
+                "total_bytes": total_bytes,
+                "average_bytes": round(total_bytes / row_count, 2) if row_count else 0.0,
+                "distinct_count": int(distinct_count),
+            }
+        )
+    return columns
+
+
+def _emit_payload_warnings(
+    connection: sqlite3.Connection,
+    config: DredgeConfig,
+    columns: list[dict[str, Any]],
+    row_count: int,
+    warnings: _WarningCollector,
+) -> None:
+    distinct_by_name = {column["name"]: column["distinct_count"] for column in columns}
+    for facet in config.scalar_facets:
+        distinct = distinct_by_name.get(facet.name)
+        if distinct is not None and distinct > PAYLOAD_HIGH_CARDINALITY_THRESHOLD:
+            warnings.add(
+                code="PAYLOAD_HIGH_CARDINALITY_FACET",
+                message=(
+                    f"facet {facet.name!r} has {distinct:,} distinct values "
+                    f"(threshold {PAYLOAD_HIGH_CARDINALITY_THRESHOLD:,}); consider "
+                    "declaring it a store_field if you do not filter or count on it"
+                ),
+                field=facet.name,
+            )
+
+    if row_count == 0:
+        return
+    threshold = PAYLOAD_DUPLICATE_COLUMN_RATIO * row_count
+    names = [column["name"] for column in columns if column["name"] != "id"]
+    for i in range(len(names)):
+        for j in range(i + 1, len(names)):
+            left = _quote_identifier(names[i])
+            right = _quote_identifier(names[j])
+            match_rows, nonnull_equal = connection.execute(
+                f"SELECT SUM(CASE WHEN {left} IS {right} THEN 1 ELSE 0 END), "
+                f"SUM(CASE WHEN {left} = {right} THEN 1 ELSE 0 END) FROM documents"
+            ).fetchone()
+            match_rows = int(match_rows or 0)
+            nonnull_equal = int(nonnull_equal or 0)
+            # Require some non-null overlap so two all-empty columns (equal only
+            # by shared nullness) are not flagged as duplicates.
+            if match_rows >= threshold and nonnull_equal > 0:
+                percent = round(match_rows / row_count * 100, 1)
+                warnings.add(
+                    code="PAYLOAD_DUPLICATE_COLUMNS",
+                    message=(
+                        f"columns {names[i]!r} and {names[j]!r} are equal on "
+                        f"{percent}% of rows; consider dropping one"
+                    ),
+                )
 
 
 def _write_generated_client(config: DredgeConfig) -> Path | None:

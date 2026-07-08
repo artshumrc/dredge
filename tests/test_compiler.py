@@ -9,6 +9,7 @@ from pathlib import Path
 import brotli
 import pytest
 
+from dredge import compiler
 from dredge.codegen import generate_client_source
 from dredge.cli import main
 from dredge.compiler import BuildError, compile_site, load_config
@@ -116,6 +117,19 @@ def test_cli_validate_and_compile(tmp_path: Path) -> None:
     assert main(["validate", "--config", str(config_path)]) == 0
     assert main(["compile", "--config", str(config_path)]) == 0
     assert (output_dir / "search-manifest.json").exists()
+
+
+def test_cli_compile_prints_payload_report(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_path, _ = _write_fixture_project(tmp_path)
+
+    assert main(["compile", "--config", str(config_path)]) == 0
+
+    output = capsys.readouterr().out
+    assert "payload report" in output.lower()
+    assert "documents" in output
+    assert "image" in output
 
 
 def test_cli_compile_accepts_low_brotli_quality(tmp_path: Path) -> None:
@@ -411,6 +425,98 @@ def test_selector_warnings_are_aggregated_with_samples(tmp_path: Path) -> None:
     assert len(warning.sample_paths) == 2
     assert "2 occurrences" in warning.message
     assert "index.html" in warning.message
+
+
+def test_payload_report_structure_present_in_metrics(tmp_path: Path) -> None:
+    config_path, _ = _write_fixture_project(tmp_path)
+
+    result = compile_site(config_path)
+
+    report = result.metrics["payload_report"]
+    assert report["dbstat_available"] is True
+    assert report["row_count"] == 2
+    assert report["total_bytes"] > 0
+
+    # Per-table/per-index breakdown covers documents and its FTS shadow tables,
+    # with percentages that sum to ~100.
+    table_names = {entry["name"] for entry in report["tables"]}
+    assert "documents" in table_names
+    assert all(entry["bytes"] > 0 for entry in report["tables"])
+    assert abs(sum(entry["percent"] for entry in report["tables"]) - 100.0) < 1.0
+
+    # Per-documents-column stats cover every column, including the store field.
+    columns = {entry["name"]: entry for entry in report["columns"]}
+    assert {"id", "url", "title", "description", "category", "image"} <= set(columns)
+    assert columns["url"]["distinct_count"] == 2
+    assert columns["image"]["total_bytes"] > 0
+    assert columns["image"]["average_bytes"] > 0
+
+
+def test_payload_report_warns_on_high_cardinality_facet(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path, _ = _write_fixture_project(tmp_path)
+    monkeypatch.setattr(compiler, "PAYLOAD_HIGH_CARDINALITY_THRESHOLD", 1)
+
+    result = compile_site(config_path)
+
+    high_cardinality = [
+        warning
+        for warning in result.warnings
+        if warning.code == "PAYLOAD_HIGH_CARDINALITY_FACET"
+    ]
+    category_warning = next(
+        warning for warning in high_cardinality if warning.field == "category"
+    )
+    assert "distinct values" in category_warning.message
+    assert "store_field" in category_warning.message
+
+
+def test_payload_report_warns_on_near_duplicate_columns(tmp_path: Path) -> None:
+    source_dir = tmp_path / "site"
+    output_dir = tmp_path / "search"
+    source_dir.mkdir()
+    for index in range(1, 4):
+        (source_dir / f"page-{index}.html").write_text(
+            f"""
+            <!doctype html>
+            <html>
+              <head><title>Page {index}</title></head>
+              <body>
+                <main data-dredge-image="/images/{index}.jpg">
+                  <p>Searchable body text for page {index}.</p>
+                </main>
+              </body>
+            </html>
+            """,
+            encoding="utf-8",
+        )
+    config = {
+        "source_dir": str(source_dir),
+        "output_dir": str(output_dir),
+        "base_url": "/",
+        "selectors": {"title": "title", "body": "main"},
+        "store_fields": {
+            "image": {"type": "string", "source": "data-dredge-image"},
+            "thumbnail": {"type": "string", "source": "data-dredge-image"},
+        },
+        "result_fields": ["title", "url", "image", "thumbnail"],
+    }
+    config_path = tmp_path / "dredge.config.json"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    result = compile_site(config_path)
+
+    duplicate_warnings = [
+        warning
+        for warning in result.warnings
+        if warning.code == "PAYLOAD_DUPLICATE_COLUMNS"
+    ]
+    assert len(duplicate_warnings) == 1
+    message = duplicate_warnings[0].message
+    assert "image" in message
+    assert "thumbnail" in message
+    assert "100.0%" in message
 
 
 def test_query_builder_generates_safe_sql_for_all_facet_types(tmp_path: Path) -> None:
