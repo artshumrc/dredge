@@ -1,16 +1,36 @@
 /// <reference lib="webworker" />
 
-import sqlite3InitModule from "@sqlite.org/sqlite-wasm";
-
 import type { BootTimings, DredgeError, DredgeManifest, DredgeStatus } from "./protocol";
 
-// Name of the OPFS SAH pool VFS. Files imported into the pool live under this
-// namespace inside OPFS.
-const VFS_NAME = "dredge-sahpool";
 const MANIFEST_VERSION = 1;
 const DB_SCHEMA_VERSION = 2;
 
 export type StatusFn = (status: DredgeStatus, detail?: string) => void;
+
+// The SAH pool utility installed into a sqlite3 module. Boot logic uses only
+// this surface, which the fake pool in tests mirrors.
+export interface PoolLike {
+  getFileNames(): string[];
+  importDb(path: string, bytes: Uint8Array): void;
+  unlink(path: string): void;
+  OpfsSAHPoolDb: new (path: string) => unknown;
+}
+
+// The injectable boot environment: everything boot orchestration needs from the
+// outside world (network, sqlite WASM module, OPFS persistence). The worker
+// entry point (`search-worker.ts`) constructs the real implementation; Node
+// tests pass fakes. Boot logic never touches global fetch, the sqlite WASM
+// initializer or the OPFS pool installer directly — it all arrives here.
+export interface BootEnv {
+  fetch: typeof fetch;
+  // Initialize the sqlite3 WASM module.
+  initSqlite(): Promise<any>;
+  // Install the OPFS SAH pool VFS. Resolves to the pool utility when persistent
+  // storage is available, or `undefined` to select the in-memory backend. A
+  // rejection is treated as an install failure (memory fallback, with a status
+  // detail), matching today's behavior.
+  installPool(sqlite3: unknown): Promise<PoolLike | undefined>;
+}
 
 export class WorkerError extends Error {
   readonly code: string;
@@ -59,25 +79,22 @@ let poolUtil: any;
 let opened: OpenDatabase | undefined;
 let backend: StorageBackend = "opfs";
 
-function canUseSyncAccessHandles(): boolean {
-  // The persistent OPFS path requires synchronous access handles inside a
-  // worker. When they are unavailable we transparently fall back to memory.
-  const proto = (globalThis as any).FileSystemFileHandle?.prototype;
-  if (typeof proto?.createSyncAccessHandle !== "function") {
-    return false;
-  }
-  if (typeof navigator === "undefined" || typeof navigator.storage?.getDirectory !== "function") {
-    return false;
-  }
-  return true;
+// Test-only: clear the cached sqlite module, pool, backend and open handle so a
+// fresh boot can be driven with a new injected environment. Production never
+// calls this — a worker boots once (reset re-boots reuse the cached module).
+export function resetBootStateForTests(): void {
+  sqlite3 = undefined;
+  poolUtil = undefined;
+  opened = undefined;
+  backend = "opfs";
 }
 
-async function ensureSqlite(status: StatusFn): Promise<void> {
+async function ensureSqlite(env: BootEnv, status: StatusFn): Promise<void> {
   if (sqlite3) {
     return;
   }
   try {
-    sqlite3 = await sqlite3InitModule();
+    sqlite3 = await env.initSqlite();
   } catch (error) {
     throw new WorkerError({
       code: "SQLITE_OPEN_FAILED",
@@ -85,16 +102,14 @@ async function ensureSqlite(status: StatusFn): Promise<void> {
     });
   }
 
-  // Prefer the persistent OPFS SAH pool VFS. If it cannot be installed — most
-  // commonly because another tab already holds the pool's exclusive access
-  // handles — fall back to an in-memory database instead of failing the boot.
-  if (!canUseSyncAccessHandles() || typeof sqlite3.installOpfsSAHPoolVfs !== "function") {
-    backend = "memory";
-    return;
-  }
+  // Prefer the persistent OPFS SAH pool VFS. `installPool` resolves to
+  // `undefined` when persistence is unsupported (silent memory fallback) and
+  // rejects when installation itself fails — most commonly because another tab
+  // already holds the pool's exclusive access handles — in which case we fall
+  // back to an in-memory database with a status detail instead of failing boot.
   try {
-    poolUtil = await sqlite3.installOpfsSAHPoolVfs({ name: VFS_NAME });
-    backend = "opfs";
+    poolUtil = await env.installPool(sqlite3);
+    backend = poolUtil ? "opfs" : "memory";
   } catch (error) {
     poolUtil = undefined;
     backend = "memory";
@@ -105,10 +120,10 @@ async function ensureSqlite(status: StatusFn): Promise<void> {
   }
 }
 
-async function fetchManifest(manifestUrl: string): Promise<DredgeManifest> {
+async function fetchManifest(env: BootEnv, manifestUrl: string): Promise<DredgeManifest> {
   let response: Response;
   try {
-    response = await fetch(manifestUrl, { cache: "no-cache" });
+    response = await env.fetch(manifestUrl, { cache: "no-cache" });
   } catch (error) {
     throw new WorkerError({
       code: "MANIFEST_FETCH_FAILED",
@@ -161,11 +176,25 @@ function poolHasFile(path: string): boolean {
   }
 }
 
-async function downloadCompressed(manifest: DredgeManifest, baseUrl: string): Promise<Uint8Array> {
+// Base URL that relative `db_file` entries resolve against. In a browser worker
+// this is the worker's own location; in Node (tests) there is no `self`, so the
+// already-absolute manifest URL serves as its own base.
+function resolveManifestBase(manifestUrl: string): string {
+  if (typeof self !== "undefined" && self.location) {
+    return new URL(manifestUrl, self.location.href).toString();
+  }
+  return manifestUrl;
+}
+
+async function downloadCompressed(
+  env: BootEnv,
+  manifest: DredgeManifest,
+  baseUrl: string,
+): Promise<Uint8Array> {
   const url = new URL(manifest.db_file, baseUrl).toString();
   let response: Response;
   try {
-    response = await fetch(url, { cache: "force-cache" });
+    response = await env.fetch(url, { cache: "force-cache" });
   } catch (error) {
     throw new WorkerError({
       code: "DB_DOWNLOAD_FAILED",
@@ -333,6 +362,7 @@ export function getManifest(): DredgeManifest | undefined {
 }
 
 async function bootInMemory(
+  env: BootEnv,
   manifest: DredgeManifest,
   manifestUrl: string,
   status: StatusFn,
@@ -343,8 +373,8 @@ async function bootInMemory(
   // download honours the HTTP cache, so a warm browser cache keeps this cheap.
   status("downloading_db");
   const downloadStart = performance.now();
-  const manifestBase = new URL(manifestUrl, self.location.href).toString();
-  const compressed = await downloadCompressed(manifest, manifestBase);
+  const manifestBase = resolveManifestBase(manifestUrl);
+  const compressed = await downloadCompressed(env, manifest, manifestBase);
   const downloadMs = performance.now() - downloadStart;
   const compressedBytes = compressed.byteLength;
 
@@ -378,18 +408,23 @@ async function bootInMemory(
   };
 }
 
-export async function boot(manifestUrl: string, reset: boolean, status: StatusFn): Promise<BootTimings> {
+export async function boot(
+  manifestUrl: string,
+  reset: boolean,
+  status: StatusFn,
+  env: BootEnv,
+): Promise<BootTimings> {
   status("checking_support");
-  await ensureSqlite(status);
+  await ensureSqlite(env, status);
 
   const t0 = performance.now();
   status("fetching_manifest");
-  const manifest = await fetchManifest(manifestUrl);
+  const manifest = await fetchManifest(env, manifestUrl);
   validateManifest(manifest);
   const manifestDone = performance.now();
 
   if (backend === "memory") {
-    return bootInMemory(manifest, manifestUrl, status, t0, manifestDone);
+    return bootInMemory(env, manifest, manifestUrl, status, t0, manifestDone);
   }
 
   const path = dbPathFor(manifest);
@@ -416,8 +451,8 @@ export async function boot(manifestUrl: string, reset: boolean, status: StatusFn
   if (!cached) {
     status("downloading_db");
     const downloadStart = performance.now();
-    const manifestBase = new URL(manifestUrl, self.location.href).toString();
-    const compressed = await downloadCompressed(manifest, manifestBase);
+    const manifestBase = resolveManifestBase(manifestUrl);
+    const compressed = await downloadCompressed(env, manifest, manifestBase);
     const downloadEnd = performance.now();
     downloadMs = downloadEnd - downloadStart;
     compressedBytes = compressed.byteLength;
