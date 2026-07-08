@@ -490,10 +490,10 @@ def _filtered_cte(fts_query: str | None, conditions: tuple[_Condition, ...]) -> 
 
 def _result_select_expressions(config: DredgeConfig) -> tuple[str, ...]:
     fields = _unique(("id", *config.result_fields))
-    facet_map = config.facet_map
+    field_map = config.field_map
     expressions: list[str] = []
     for field in fields:
-        facet = facet_map.get(field)
+        facet = field_map.get(field)
         if facet is not None and facet.is_array:
             table_name = _quote_identifier(_array_table_name(facet.name))
             expressions.append(
@@ -556,9 +556,9 @@ def _include_facet_names(config: DredgeConfig, include_facets: bool | str | tupl
 
 
 def _normalize_hit(config: DredgeConfig, hit: dict[str, Any]) -> dict[str, Any]:
-    facet_map = config.facet_map
+    field_map = config.field_map
     for field, value in list(hit.items()):
-        facet = facet_map.get(field)
+        facet = field_map.get(field)
         if facet is None:
             continue
         if facet.is_array:

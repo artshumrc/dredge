@@ -17,8 +17,8 @@ export interface DredgeFilters {
 }
 
 export interface DredgeSort {
-  // A selectable `documents` column to order by (e.g. "title"). Unknown
-  // columns are ignored and the default ordering is used instead.
+  // A selectable `documents` column to order by (e.g. "title"). Unknown or
+  // result-only store fields are rejected by the worker.
   field: string;
   direction?: "asc" | "desc";
 }
@@ -50,14 +50,27 @@ export interface DredgeSearchResponse {
   elapsedMs: number;
 }
 
-// Columns of the `documents` table that are not configurable scalar facets.
-const RESERVED_COLUMNS = new Set(["id", "url", "title", "description", "content_hash"]);
+export class DredgeQueryError extends Error {
+  readonly code: string;
+
+  constructor(code: string, message: string) {
+    super(message);
+    this.name = "DredgeQueryError";
+    this.code = code;
+  }
+}
+
+interface FieldInfo {
+  role: "facet" | "store";
+  type: string;
+}
 
 export interface SchemaInfo {
   // Scalar facet columns living directly on the documents table.
   scalarColumns: string[];
   // Array facet name -> join table name (facet_<name>).
   arrayFacets: Map<string, string>;
+  fields: Map<string, FieldInfo>;
   // All selectable document columns (excluding content_hash) in stable order.
   documentColumns: string[];
 }
@@ -70,19 +83,30 @@ export function introspectSchema(exec: Exec): SchemaInfo {
   const tableInfo = exec("PRAGMA table_info(documents)");
   // PRAGMA table_info columns: cid, name, type, notnull, dflt_value, pk
   const allColumns = tableInfo.map((row) => String(row[1]));
-  const scalarColumns = allColumns.filter((name) => !RESERVED_COLUMNS.has(name));
   const documentColumns = allColumns.filter((name) => name !== "content_hash");
 
-  const arrayFacets = new Map<string, string>();
-  const tables = exec(
-    "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'facet_%'",
-  );
-  for (const row of tables) {
-    const table = String(row[0]);
-    arrayFacets.set(table.slice("facet_".length), table);
+  const fields = new Map<string, FieldInfo>();
+  const fieldRows = exec("SELECT name, role, type FROM dredge_fields ORDER BY name");
+  for (const row of fieldRows) {
+    const role = String(row[1]);
+    if (role !== "facet" && role !== "store") {
+      throw new DredgeQueryError(
+        "QUERY_INVALID",
+        `Database field ${String(row[0])} has invalid role ${role}.`,
+      );
+    }
+    fields.set(String(row[0]), { role, type: String(row[2]) });
   }
 
-  return { scalarColumns, arrayFacets, documentColumns };
+  const scalarColumns = documentColumns.filter((name) => fields.get(name)?.role === "facet");
+  const arrayFacets = new Map<string, string>();
+  for (const [name, info] of fields) {
+    if (info.role === "facet" && info.type === "string_array") {
+      arrayFacets.set(name, `facet_${name}`);
+    }
+  }
+
+  return { scalarColumns, arrayFacets, fields, documentColumns };
 }
 
 // Build a forgiving FTS5 MATCH expression from free-text user input. Terms are
@@ -302,10 +326,27 @@ function buildFilterClauses(
       const clause = arrayFilterClause(schema.arrayFacets.get(name)!, value);
       sql.push(...clause.sql);
       bind.push(...clause.bind);
+    } else {
+      throw invalidFieldError("FILTER_INVALID", schema, name, "filter");
     }
-    // Unknown filter keys are ignored.
   }
   return { sql, bind };
+}
+
+function invalidFieldError(
+  code: "FILTER_INVALID" | "QUERY_INVALID",
+  schema: SchemaInfo,
+  name: string,
+  use: string,
+): DredgeQueryError {
+  const field = schema.fields.get(name);
+  if (field) {
+    return new DredgeQueryError(
+      code,
+      `Cannot use ${use} field ${JSON.stringify(name)} because it is a ${field.role} field.`,
+    );
+  }
+  return new DredgeQueryError(code, `Unknown ${use} field ${JSON.stringify(name)}.`);
 }
 
 // Built-in free-text columns ordered case-insensitively so alphabetical sorts
@@ -322,7 +363,11 @@ function buildOrderClause(
   sort: DredgeSort | undefined,
   usesFts: boolean,
 ): string {
-  if (sort && schema.documentColumns.includes(sort.field)) {
+  if (sort) {
+    const field = schema.fields.get(sort.field);
+    if (field?.role === "store" || !schema.documentColumns.includes(sort.field)) {
+      throw invalidFieldError("QUERY_INVALID", schema, sort.field, "sort");
+    }
     const direction = sort.direction === "desc" ? "DESC" : "ASC";
     const collate = NOCASE_SORT_COLUMNS.has(sort.field) ? " COLLATE NOCASE" : "";
     return `ORDER BY d.${quoteIdentifier(sort.field)}${collate} ${direction}, d.id`;
@@ -335,9 +380,12 @@ function facetNamesToCount(schema: SchemaInfo, includeFacets: boolean | string[]
     return [...schema.scalarColumns, ...schema.arrayFacets.keys()];
   }
   if (Array.isArray(includeFacets)) {
-    return includeFacets.filter(
-      (name) => schema.scalarColumns.includes(name) || schema.arrayFacets.has(name),
-    );
+    for (const name of includeFacets) {
+      if (!schema.scalarColumns.includes(name) && !schema.arrayFacets.has(name)) {
+        throw invalidFieldError("QUERY_INVALID", schema, name, "facet count");
+      }
+    }
+    return includeFacets;
   }
   return [];
 }

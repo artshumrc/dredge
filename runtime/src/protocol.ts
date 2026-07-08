@@ -33,6 +33,7 @@ export type DredgeErrorCode =
   | "UNSUPPORTED_SYNC_ACCESS"
   | "MANIFEST_FETCH_FAILED"
   | "RUNTIME_VERSION_MISMATCH"
+  | "SCHEMA_VERSION_MISMATCH"
   | "DB_DOWNLOAD_FAILED"
   | "DB_DECOMPRESS_FAILED"
   | "DB_SIZE_MISMATCH"
@@ -40,7 +41,9 @@ export type DredgeErrorCode =
   | "QUOTA_EXCEEDED"
   | "SQLITE_OPEN_FAILED"
   | "SQLITE_BUSY_LOCKED"
-  | "QUERY_FAILED";
+  | "QUERY_FAILED"
+  | "FILTER_INVALID"
+  | "QUERY_INVALID";
 
 export interface DredgeError {
   code: DredgeErrorCode | string;

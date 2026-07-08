@@ -44,6 +44,7 @@ def test_compile_fixture_site_and_query_results(tmp_path: Path) -> None:
     )
     assert "range_required" not in result.manifest
     assert "range_block_bytes" not in result.manifest
+    assert result.manifest["db_schema_version"] == 2
 
     decompressed = brotli.decompress(result.compressed_db_path.read_bytes())
     assert decompressed == result.db_path.read_bytes()
@@ -78,6 +79,22 @@ def test_compile_fixture_site_and_query_results(tmp_path: Path) -> None:
             "SELECT value FROM facet_tags WHERE document_id = 1 ORDER BY value"
         ).fetchall()
         assert tag_rows == [("ancient",), ("burial",)]
+
+        field_rows = connection.execute(
+            "SELECT name, role, type FROM dredge_fields ORDER BY name"
+        ).fetchall()
+        assert field_rows == [
+            ("category", "facet", "string"),
+            ("featured", "facet", "boolean"),
+            ("image", "store", "string"),
+            ("published", "facet", "date"),
+            ("rating", "facet", "number"),
+            ("tags", "facet", "string_array"),
+            ("year", "facet", "integer"),
+        ]
+        assert connection.execute(
+            "SELECT image FROM documents WHERE id = 1"
+        ).fetchone() == ("/images/alpha.jpg",)
 
         script_rows = connection.execute(
             """
@@ -222,6 +239,7 @@ def test_final_database_schema_indexes_and_query_plans(tmp_path: Path) -> None:
             "documents_year_idx",
             "facet_tags_value_document_idx",
         } <= index_names
+        assert "documents_image_idx" not in index_names
 
         assert connection.execute("SELECT COUNT(*) FROM sqlite_stat1").fetchone()[0] > 0
 
@@ -255,6 +273,58 @@ def test_final_database_schema_indexes_and_query_plans(tmp_path: Path) -> None:
         )
     finally:
         connection.close()
+
+
+def test_artifact_omits_content_hash_and_url_autoindex(tmp_path: Path) -> None:
+    config_path, _ = _write_fixture_project(tmp_path)
+
+    result = compile_site(config_path)
+
+    connection = sqlite3.connect(f"file:{result.db_path}?mode=ro&immutable=1", uri=True)
+    try:
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(documents)")
+        }
+        assert "content_hash" not in columns
+        assert "url" in columns
+
+        document_autoindexes = [
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index' "
+                "AND name LIKE 'sqlite_autoindex_documents_%'"
+            )
+        ]
+        assert document_autoindexes == []
+
+        documents_sql = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'documents'"
+        ).fetchone()[0]
+        assert "UNIQUE" not in documents_sql.upper()
+    finally:
+        connection.close()
+
+    assert "content_hash" not in result.manifest
+
+
+def test_duplicate_urls_fail_at_discovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # URL uniqueness is enforced at discovery time; the shipped documents table
+    # no longer carries a UNIQUE(url) constraint. Force a URL collision to prove
+    # discovery remains the sole guard.
+    import dredge.compiler as compiler_module
+
+    monkeypatch.setattr(
+        compiler_module, "_canonical_url", lambda base_url, rel_path: "/dupe/"
+    )
+    config_path, output_dir = _write_fixture_project(tmp_path)
+
+    with pytest.raises(BuildError) as error:
+        compile_site(config_path)
+
+    assert error.value.code == "DISCOVERY_DUPLICATE_URL"
+    assert not (output_dir / "search-manifest.json").exists()
 
 
 def test_invalid_config_fails_before_output(tmp_path: Path) -> None:
@@ -558,10 +628,15 @@ def test_compile_writes_generated_types_worker_protocol_and_stale_handling(
     source = client_path.read_text(encoding="utf-8")
     assert "export interface DredgeFilters" in source
     assert "category?: string | string[];" in source
+    assert "image?:" not in source.split("export interface DredgeFilters", 1)[1].split("}", 1)[0]
     assert "tags?: string | string[];" in source
     assert "year?: number | number[] | DredgeRange<number>;" in source
     assert "published?: string | string[] | DredgeRange<string>;" in source
     assert "export type DredgeWorkerRequest" in source
+    assert "image?: string;" in source
+    assert '"SCHEMA_VERSION_MISMATCH"' in source
+    assert '"FILTER_INVALID"' in source
+    assert '"QUERY_INVALID"' in source
     assert "export type DredgeWorkerResponse" in source
     assert "rejectOlderSearches" in source
     assert "STALE_RESPONSE" in source
@@ -662,6 +737,33 @@ def test_codegen_cli_requires_client_output(tmp_path: Path) -> None:
     assert main(["codegen", "--config", str(config_path)]) == 1
 
 
+def test_config_rejects_invalid_store_fields(tmp_path: Path) -> None:
+    config_path, _ = _write_fixture_project(tmp_path)
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+
+    raw["store_fields"] = {"category": {"type": "string", "source": "data-image"}}
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    with pytest.raises(BuildError) as error:
+        load_config(config_path)
+    assert error.value.code == "CONFIG_INVALID"
+    assert "share field name" in str(error.value)
+
+    raw["store_fields"] = {"gallery": {"type": "string_array", "source": "data-gallery"}}
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    with pytest.raises(BuildError) as error:
+        load_config(config_path)
+    assert error.value.code == "CONFIG_INVALID"
+    assert "store field 'gallery' has unsupported type" in str(error.value)
+
+    raw["store_fields"] = {"image": {"type": "string", "source": "data-dredge-image"}}
+    raw["composite_indices"] = [["category", "image"]]
+    config_path.write_text(json.dumps(raw), encoding="utf-8")
+    with pytest.raises(BuildError) as error:
+        load_config(config_path)
+    assert error.value.code == "CONFIG_INVALID"
+    assert "composite index cannot include store field" in str(error.value)
+
+
 def test_generated_client_typechecks_fixture_app_with_pnpm(tmp_path: Path) -> None:
     pnpm = shutil.which("pnpm")
     if pnpm is None:
@@ -693,6 +795,8 @@ def test_generated_client_typechecks_fixture_app_with_pnpm(tmp_path: Path) -> No
         async function runSearch() {
           const response = await client.search(request);
           const firstTitle: string | undefined = response.hits[0]?.title;
+          const firstImage: string | undefined = response.hits[0]?.image;
+          void firstImage;
           return firstTitle;
         }
 
@@ -752,7 +856,8 @@ def _write_fixture_project(
         "data-dredge-year='2024' "
         "data-dredge-rating='4.5' "
         "data-dredge-featured='yes' "
-        "data-dredge-published='2024-01-30'"
+        "data-dredge-published='2024-01-30' "
+        "data-dredge-image='/images/alpha.jpg'"
     )
     index_description = (
         '<meta name="description" content="Guide to alpha tombs">'
@@ -801,6 +906,7 @@ def _write_fixture_project(
               data-dredge-rating="3.25"
               data-dredge-featured="false"
               data-dredge-published="2023-11-02"
+              data-dredge-image="/images/beta.jpg"
             >
               <h1>Beta Collection</h1>
               <p>Catalog records and images.</p>
@@ -837,7 +943,10 @@ def _write_fixture_project(
             },
             "year": {"type": "integer", "source": "data-dredge-year"},
         },
-        "result_fields": ["title", "url", "description", "category", "year"],
+        "store_fields": {
+            "image": {"type": "string", "source": "data-dredge-image"},
+        },
+        "result_fields": ["title", "url", "description", "category", "year", "image"],
         "composite_indices": [["category", "year"]],
     }
     if client is not None:

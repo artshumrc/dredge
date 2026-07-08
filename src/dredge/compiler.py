@@ -25,7 +25,7 @@ import brotli
 from . import __version__
 from .progress import CompileProgress
 
-DB_SCHEMA_VERSION = 1
+DB_SCHEMA_VERSION = 2
 MANIFEST_VERSION = 1
 SQLITE_PAGE_SIZE = 16_384
 DB_COMPRESSION = "brotli"
@@ -53,6 +53,7 @@ TOP_LEVEL_KEYS = {
     "selectors",
     "search_fields",
     "facets",
+    "store_fields",
     "result_fields",
     "composite_indices",
     "client",
@@ -62,6 +63,7 @@ SELECTOR_KEYS = {"title", "body", "description"}
 FACET_KEYS = {"type", "source", "required"}
 CLIENT_KEYS = {"out", "worker_url"}
 FACET_TYPES = {"string", "string_array", "integer", "number", "boolean", "date"}
+STORE_FIELD_TYPES = {"string", "integer", "number", "boolean", "date"}
 SCALAR_SQL_TYPES = {
     "string": "TEXT",
     "integer": "INTEGER",
@@ -180,6 +182,12 @@ class FacetConfig:
 
 
 @dataclass(frozen=True)
+class SearchFieldConfig:
+    source: str
+    hot: bool = False
+
+
+@dataclass(frozen=True)
 class DredgeConfig:
     path: Path
     raw: dict[str, Any]
@@ -189,8 +197,9 @@ class DredgeConfig:
     include: tuple[str, ...]
     exclude: tuple[str, ...]
     selectors: dict[str, str]
-    search_fields: tuple[str, ...]
+    search_fields: tuple[SearchFieldConfig, ...]
     facets: tuple[FacetConfig, ...]
+    store_fields: tuple[FacetConfig, ...]
     result_fields: tuple[str, ...]
     composite_indices: tuple[tuple[str, ...], ...]
     client: dict[str, str]
@@ -200,6 +209,14 @@ class DredgeConfig:
     @property
     def facet_map(self) -> dict[str, FacetConfig]:
         return {facet.name: facet for facet in self.facets}
+
+    @property
+    def store_field_map(self) -> dict[str, FacetConfig]:
+        return {field.name: field for field in self.store_fields}
+
+    @property
+    def field_map(self) -> dict[str, FacetConfig]:
+        return {field.name: field for field in (*self.facets, *self.store_fields)}
 
     @property
     def scalar_facets(self) -> tuple[FacetConfig, ...]:
@@ -230,9 +247,9 @@ class ExtractedDocument:
     title: str
     description: str | None
     body: str
-    content_hash: str
     scalar_facets: dict[str, str | int | float | None]
     array_facets: dict[str, tuple[str, ...]]
+    store_fields: dict[str, str | int | float | None]
 
 
 @dataclass(frozen=True)
@@ -440,12 +457,21 @@ def load_config(config_path: Path) -> DredgeConfig:
     selectors = _load_selectors(raw)
     search_fields = tuple(_load_search_fields(raw))
     facets = _load_facets(raw)
+    store_fields = _load_store_fields(raw)
     facet_map = {facet.name: facet for facet in facets}
+    store_field_map = {field.name: field for field in store_fields}
+    collisions = sorted(set(facet_map) & set(store_field_map))
+    if collisions:
+        raise BuildError(
+            "CONFIG_INVALID",
+            f"facets and store_fields share field name(s): {', '.join(collisions)}",
+        )
+    field_map = {**facet_map, **store_field_map}
     result_fields = tuple(
         _optional_string_list(raw, "result_fields", ["title", "url", "description"])
     )
-    _validate_result_fields(result_fields, facet_map)
-    composite_indices = tuple(_load_composite_indices(raw, facet_map))
+    _validate_result_fields(result_fields, field_map)
+    composite_indices = tuple(_load_composite_indices(raw, facet_map, store_field_map))
     client = _load_client(raw)
 
     effective_config = {
@@ -456,7 +482,9 @@ def load_config(config_path: Path) -> DredgeConfig:
         "include": list(include),
         "exclude": list(exclude),
         "selectors": selectors,
-        "search_fields": list(search_fields),
+        "search_fields": [
+            {"source": field.source, "hot": field.hot} for field in search_fields
+        ],
         "facets": {
             facet.name: {
                 "type": facet.type,
@@ -464,6 +492,14 @@ def load_config(config_path: Path) -> DredgeConfig:
                 "required": facet.required,
             }
             for facet in facets
+        },
+        "store_fields": {
+            field.name: {
+                "type": field.type,
+                "source": field.source,
+                "required": field.required,
+            }
+            for field in store_fields
         },
         "result_fields": list(result_fields),
         "composite_indices": [list(index) for index in composite_indices],
@@ -487,6 +523,7 @@ def load_config(config_path: Path) -> DredgeConfig:
         selectors=selectors,
         search_fields=search_fields,
         facets=facets,
+        store_fields=store_fields,
         result_fields=result_fields,
         composite_indices=composite_indices,
         client=client,
@@ -657,6 +694,7 @@ def _compile_site(
                 ui.set_phase("table_creation")
                 _configure_build_database(connection)
                 _create_tables(connection, config)
+                connection.commit()
             insert_sql = _document_insert_sql(config)
             array_insert_sql = {
                 facet.name: f"INSERT OR IGNORE INTO {_quote_identifier(_array_table_name(facet.name))} "
@@ -850,12 +888,42 @@ def _load_selectors(raw: dict[str, Any]) -> dict[str, str]:
     return selectors
 
 
-def _load_search_fields(raw: dict[str, Any]) -> list[str]:
-    fields = _optional_string_list(raw, "search_fields", [])
-    for index, source in enumerate(fields, start=1):
+def _load_search_fields(raw: dict[str, Any]) -> list[SearchFieldConfig]:
+    value = raw.get("search_fields", [])
+    if not isinstance(value, list):
+        raise BuildError("CONFIG_INVALID", "search_fields must be an array")
+    fields: list[SearchFieldConfig] = []
+    for index, item in enumerate(value, start=1):
+        hot = False
+        if isinstance(item, str):
+            source = item
+        elif isinstance(item, dict):
+            unknown = sorted(set(item) - {"source", "hot"})
+            if unknown:
+                raise BuildError(
+                    "CONFIG_INVALID",
+                    f"unknown key(s) on search_fields[{index}]: {', '.join(unknown)}",
+                )
+            source = item.get("source")
+            hot_value = item.get("hot", False)
+            if not isinstance(hot_value, bool):
+                raise BuildError(
+                    "CONFIG_INVALID", f"search_fields[{index}].hot must be a boolean"
+                )
+            hot = hot_value
+        else:
+            raise BuildError(
+                "CONFIG_INVALID",
+                f"search_fields[{index}] must be a string or object",
+            )
+        if not isinstance(source, str) or not source.strip():
+            raise BuildError(
+                "CONFIG_INVALID", f"search_fields[{index}].source must be a non-empty string"
+            )
         _validate_selector_source(
-            source, f"search_fields[{index}]", allow_direct_attribute=True
+            source.strip(), f"search_fields[{index}]", allow_direct_attribute=True
         )
+        fields.append(SearchFieldConfig(source=source.strip(), hot=hot))
     return fields
 
 
@@ -906,8 +974,54 @@ def _load_facets(raw: dict[str, Any]) -> tuple[FacetConfig, ...]:
     return tuple(facets)
 
 
+def _load_store_fields(raw: dict[str, Any]) -> tuple[FacetConfig, ...]:
+    value = raw.get("store_fields", {})
+    if not isinstance(value, dict):
+        raise BuildError("CONFIG_INVALID", "store_fields must be an object")
+
+    fields: list[FacetConfig] = []
+    for name in sorted(value):
+        if not IDENTIFIER_RE.match(name):
+            raise BuildError(
+                "CONFIG_INVALID",
+                f"store field name must match {IDENTIFIER_RE.pattern}: {name!r}",
+            )
+        field_raw = value[name]
+        if not isinstance(field_raw, dict):
+            raise BuildError("CONFIG_INVALID", f"store field {name!r} must be an object")
+        unknown = sorted(set(field_raw) - FACET_KEYS)
+        if unknown:
+            raise BuildError(
+                "CONFIG_INVALID",
+                f"unknown key(s) on store field {name!r}: {', '.join(unknown)}",
+            )
+        field_type = field_raw.get("type")
+        if field_type not in STORE_FIELD_TYPES:
+            raise BuildError(
+                "CONFIG_INVALID",
+                f"store field {name!r} has unsupported type: {field_type!r}",
+            )
+        source = field_raw.get("source")
+        if not isinstance(source, str) or not source.strip():
+            raise BuildError(
+                "CONFIG_INVALID", f"store field {name!r} source must be a non-empty string"
+            )
+        required = field_raw.get("required", False)
+        if not isinstance(required, bool):
+            raise BuildError(
+                "CONFIG_INVALID", f"store field {name!r} required must be a boolean"
+            )
+        _validate_selector_source(
+            source.strip(), f"store_fields.{name}.source", allow_direct_attribute=True
+        )
+        fields.append(
+            FacetConfig(name=name, type=field_type, source=source.strip(), required=required)
+        )
+    return tuple(fields)
+
+
 def _load_composite_indices(
-    raw: dict[str, Any], facets: dict[str, FacetConfig]
+    raw: dict[str, Any], facets: dict[str, FacetConfig], store_fields: dict[str, FacetConfig]
 ) -> list[tuple[str, ...]]:
     value = raw.get("composite_indices", [])
     if not isinstance(value, list):
@@ -924,6 +1038,11 @@ def _load_composite_indices(
                 f"composite_indices[{index_number}] must contain at least two facet names",
             )
         for name in index:
+            if name in store_fields:
+                raise BuildError(
+                    "CONFIG_INVALID",
+                    f"composite index cannot include store field: {name!r}",
+                )
             facet = facets.get(name)
             if facet is None:
                 raise BuildError(
@@ -989,15 +1108,33 @@ def _create_tables(connection: sqlite3.Connection, config: DredgeConfig) -> None
         f"{_quote_identifier(facet.name)} {SCALAR_SQL_TYPES[facet.type]}"
         for facet in config.scalar_facets
     ]
+    store_columns = [
+        f"{_quote_identifier(field.name)} {SCALAR_SQL_TYPES[field.type]}"
+        for field in config.store_fields
+    ]
     document_columns = [
         "id INTEGER PRIMARY KEY",
-        "url TEXT NOT NULL UNIQUE",
+        "url TEXT NOT NULL",
         "title TEXT NOT NULL",
         "description TEXT",
-        "content_hash TEXT NOT NULL",
         *scalar_columns,
+        *store_columns,
     ]
     connection.execute(f"CREATE TABLE documents ({', '.join(document_columns)}) STRICT")
+    connection.execute(
+        "CREATE TABLE dredge_fields ("
+        "name TEXT PRIMARY KEY, "
+        "role TEXT NOT NULL, "
+        "type TEXT NOT NULL"
+        ") STRICT"
+    )
+    connection.executemany(
+        "INSERT INTO dredge_fields(name, role, type) VALUES (?, ?, ?)",
+        [
+            *((facet.name, "facet", facet.type) for facet in config.facets),
+            *((field.name, "store", field.type) for field in config.store_fields),
+        ],
+    )
     connection.execute(
         "CREATE VIRTUAL TABLE documents_fts USING fts5("
         "title, body, content='', tokenize='unicode61 remove_diacritics 2')"
@@ -1043,9 +1180,9 @@ def _create_indexes(connection: sqlite3.Connection, config: DredgeConfig) -> Non
 
 
 def _document_insert_sql(config: DredgeConfig) -> str:
-    columns = ["id", "url", "title", "description", "content_hash"] + [
+    columns = ["id", "url", "title", "description"] + [
         facet.name for facet in config.scalar_facets
-    ]
+    ] + [field.name for field in config.store_fields]
     placeholders = ", ".join("?" for _ in columns)
     sql_columns = ", ".join(_quote_identifier(column) for column in columns)
     return f"INSERT INTO documents ({sql_columns}) VALUES ({placeholders})"
@@ -1076,11 +1213,11 @@ def _queue_document_insert(
         document.url,
         document.title,
         document.description,
-        document.content_hash,
     ]
     values.extend(
         document.scalar_facets.get(facet.name) for facet in config.scalar_facets
     )
+    values.extend(document.store_fields.get(field.name) for field in config.store_fields)
     batches.documents.append(tuple(values))
     batches.fts.append((document.id, document.title, document.body))
     for facet in config.array_facets:
@@ -1129,6 +1266,9 @@ def _extract_document(
     facet_raw_values = {
         facet.name: _extract_values(tree, facet.source) for facet in config.facets
     }
+    store_field_raw_values = {
+        field.name: _extract_values(tree, field.source) for field in config.store_fields
+    }
     _remove_non_indexable_content(tree)
 
     title_values = _extract_values(tree, config.selectors["title"])
@@ -1157,8 +1297,8 @@ def _extract_document(
 
     body_values = _extract_values(tree, config.selectors["body"])
     extra_search_values: list[str] = []
-    for source in config.search_fields:
-        extra_search_values.extend(_extract_values(tree, source))
+    for field in config.search_fields:
+        extra_search_values.extend(_extract_values(tree, field.source))
     body = _normalize_text(" ".join((*body_values, *extra_search_values)))
     if not body_values:
         warnings.add(
@@ -1210,15 +1350,39 @@ def _extract_document(
             facet, raw_values[0], candidate.path
         )
 
+    store_fields: dict[str, str | int | float | None] = {}
+    for field in config.store_fields:
+        raw_values = store_field_raw_values[field.name]
+        if not raw_values:
+            if field.required:
+                raise BuildError(
+                    "FIELD_REQUIRED_MISSING",
+                    f"missing required store field {field.name!r} in {candidate.path} from source {field.source!r}",
+                    path=candidate.path,
+                    field=field.name,
+                    selector=field.source,
+                )
+            store_fields[field.name] = None
+            continue
+        if len(raw_values) > 1:
+            warnings.add(
+                code="FIELD_MULTIPLE_VALUES",
+                message=f"store field {field.name!r} found multiple values; using the first value",
+                path=candidate.path,
+                field=field.name,
+                selector=field.source,
+            )
+        store_fields[field.name] = _coerce_scalar_facet(field, raw_values[0], candidate.path)
+
     return ExtractedDocument(
         id=document_id,
         url=candidate.url,
         title=title,
         description=description,
         body=body,
-        content_hash=_sha256_bytes(html_bytes),
         scalar_facets=scalar_facets,
         array_facets=array_facets,
+        store_fields=store_fields,
     )
 
 

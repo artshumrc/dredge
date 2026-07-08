@@ -7,6 +7,8 @@ import type { BootTimings, DredgeError, DredgeManifest, DredgeStatus } from "./p
 // Name of the OPFS SAH pool VFS. Files imported into the pool live under this
 // namespace inside OPFS.
 const VFS_NAME = "dredge-sahpool";
+const MANIFEST_VERSION = 1;
+const DB_SCHEMA_VERSION = 2;
 
 export type StatusFn = (status: DredgeStatus, detail?: string) => void;
 
@@ -23,6 +25,13 @@ export class WorkerError extends Error {
 export function toDredgeError(error: unknown): DredgeError {
   if (error instanceof WorkerError) {
     return { code: error.code, message: error.message, details: error.details };
+  }
+  if (
+    error instanceof Error &&
+    "code" in error &&
+    typeof (error as { code?: unknown }).code === "string"
+  ) {
+    return { code: (error as { code: string }).code, message: error.message };
   }
   if (error instanceof Error) {
     return { code: "QUERY_FAILED", message: error.message };
@@ -122,6 +131,21 @@ async function fetchManifest(manifestUrl: string): Promise<DredgeManifest> {
   }
 }
 
+export function validateManifest(manifest: DredgeManifest): void {
+  if (manifest.manifest_version !== MANIFEST_VERSION) {
+    throw new WorkerError({
+      code: "SCHEMA_VERSION_MISMATCH",
+      message: `Manifest version ${manifest.manifest_version} is not supported; expected ${MANIFEST_VERSION}.`,
+    });
+  }
+  if (manifest.db_schema_version !== DB_SCHEMA_VERSION) {
+    throw new WorkerError({
+      code: "SCHEMA_VERSION_MISMATCH",
+      message: `Database schema version ${manifest.db_schema_version} is not supported; expected ${DB_SCHEMA_VERSION}.`,
+    });
+  }
+}
+
 function dbPathFor(manifest: DredgeManifest): string {
   // Namespace the stored database by its content hash so a new database never
   // collides with a stale one.
@@ -181,6 +205,35 @@ async function decompress(compressed: Uint8Array, manifest: DredgeManifest): Pro
     });
   }
   return decompressed;
+}
+
+function toHex(buffer: ArrayBuffer): string {
+  const bytes = new Uint8Array(buffer);
+  let hex = "";
+  for (const byte of bytes) {
+    hex += byte.toString(16).padStart(2, "0");
+  }
+  return hex;
+}
+
+// Verify that raw (already-decompressed) database bytes hash to the sha256 the
+// manifest recorded, before anything is persisted to OPFS or opened. A
+// truncated or corrupted download must never be stored and served. Reusable
+// across every download path (full tier here; hot tier once it lands).
+export async function verifyDatabaseHash(
+  bytes: Uint8Array,
+  expectedSha256: string,
+): Promise<void> {
+  // The DOM BufferSource type is backed by ArrayBuffer specifically; our bytes
+  // are a Uint8Array<ArrayBufferLike>, which is safe to hash directly.
+  const digest = await crypto.subtle.digest("SHA-256", bytes as BufferSource);
+  const actual = toHex(digest);
+  if (actual !== expectedSha256) {
+    throw new WorkerError({
+      code: "DB_STORAGE_CORRUPT",
+      message: `Downloaded database failed integrity check: sha256 ${actual} does not match manifest ${expectedSha256}.`,
+    });
+  }
 }
 
 function cleanupStaleDatabases(keepPath: string): void {
@@ -295,6 +348,7 @@ async function bootInMemory(
   status("decompressing_db");
   const decompressStart = performance.now();
   const raw = await decompress(compressed, manifest);
+  await verifyDatabaseHash(raw, manifest.db_sha256);
   const decompressMs = performance.now() - decompressStart;
   const decompressedBytes = raw.byteLength;
 
@@ -328,6 +382,7 @@ export async function boot(manifestUrl: string, reset: boolean, status: StatusFn
   const t0 = performance.now();
   status("fetching_manifest");
   const manifest = await fetchManifest(manifestUrl);
+  validateManifest(manifest);
   const manifestDone = performance.now();
 
   if (backend === "memory") {
@@ -367,6 +422,7 @@ export async function boot(manifestUrl: string, reset: boolean, status: StatusFn
     status("decompressing_db");
     const decompressStart = performance.now();
     const raw = await decompress(compressed, manifest);
+    await verifyDatabaseHash(raw, manifest.db_sha256);
     const decompressEnd = performance.now();
     decompressMs = decompressEnd - decompressStart;
     decompressedBytes = raw.byteLength;

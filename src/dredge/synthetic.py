@@ -191,6 +191,7 @@ def _render_page(
       data-dredge-rating="{rating:.2f}"
       data-dredge-featured="{"true" if featured else "false"}"
       data-dredge-published="{published}"
+      data-dredge-image="/images/{doc_id}.jpg"
     >
       <h1>{escape(title)}</h1>
       <p>{escape(body)}</p>
@@ -227,7 +228,10 @@ def _config(source_dir: Path, output_dir: Path) -> dict[str, object]:
                 "source": "meta[property='article:tag']@content",
             },
         },
-        "result_fields": ["title", "url", "description", "category", "year", "rating"],
+        "store_fields": {
+            "image": {"type": "string", "source": "data-dredge-image"},
+        },
+        "result_fields": ["title", "url", "description", "category", "year", "rating", "image"],
         "composite_indices": [["category", "year"]],
     }
 
