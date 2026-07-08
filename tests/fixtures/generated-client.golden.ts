@@ -128,7 +128,15 @@ export class DredgeSearchClient {
   private status: DredgeStatus = "idle";
   private initPromise: Promise<void> | undefined;
   private nextRequestId = 1;
-  private latestSearchRequestId = 0;
+  private inFlightSearchId: number | undefined = undefined;
+  private pendingSearch:
+    | {
+        id: number;
+        request: DredgeSearchRequest;
+        resolve: (response: DredgeSearchResponse) => void;
+        reject: (error: DredgeClientError) => void;
+      }
+    | undefined = undefined;
   private readonly pending = new Map<number, PendingRequest>();
   private readonly statusListeners = new Set<(status: DredgeStatus) => void>();
 
@@ -183,15 +191,21 @@ export class DredgeSearchClient {
       throw new DredgeClientError({ code: "CLIENT_NOT_READY", message: "Dredge worker is not ready." });
     }
 
-    const worker = this.ensureWorker();
+    this.ensureWorker();
     const id = this.allocateRequestId();
-    this.rejectOlderSearches(id);
-    this.latestSearchRequestId = id;
-    const message: DredgeWorkerRequest = { type: "search", id, request };
 
     return new Promise<DredgeSearchResponse>((resolve, reject) => {
-      this.pending.set(id, { kind: "search", resolve, reject });
-      worker.postMessage(message);
+      if (this.inFlightSearchId === undefined) {
+        // Nothing in flight: submit immediately.
+        this.submitSearch(id, request, resolve, reject);
+        return;
+      }
+      // Busy: retain only the newest pending request. Any prior pending is
+      // displaced and rejected; intermediate keystrokes never reach the worker.
+      if (this.pendingSearch) {
+        this.pendingSearch.reject(this.staleError());
+      }
+      this.pendingSearch = { id, request, resolve, reject };
     });
   }
 
@@ -204,7 +218,6 @@ export class DredgeSearchClient {
     }
     this.rejectAll({ code: "WORKER_TERMINATED", message: "Dredge worker was terminated." });
     this.initPromise = undefined;
-    this.latestSearchRequestId = 0;
     this.setStatus("idle");
   }
 
@@ -249,6 +262,9 @@ export class DredgeSearchClient {
           pending.reject(error);
           if (pending.kind === "init") {
             this.fail(message.error);
+          } else if (message.id === this.inFlightSearchId) {
+            this.inFlightSearchId = undefined;
+            this.submitPendingSearch();
           }
           return;
         }
@@ -257,29 +273,57 @@ export class DredgeSearchClient {
       return;
     }
 
-    if (message.id < this.latestSearchRequestId) {
+    const pending = this.pending.get(message.id);
+    if (pending?.kind !== "search") {
       this.pending.delete(message.id);
       return;
     }
+    this.pending.delete(message.id);
 
-    const pending = this.pending.get(message.id);
-    if (pending?.kind === "search") {
-      this.pending.delete(message.id);
-      pending.resolve(message.response);
+    if (message.id === this.inFlightSearchId) {
+      this.inFlightSearchId = undefined;
+      if (this.pendingSearch) {
+        // A newer search arrived while this one was in flight: discard it.
+        pending.reject(this.staleError());
+      } else {
+        pending.resolve(message.response);
+      }
+      this.submitPendingSearch();
+      return;
     }
+
+    // Defensive: a response for a search that is no longer in flight.
+    pending.reject(this.staleError());
   };
 
   private readonly handleWorkerError = (): void => {
     this.fail({ code: "WORKER_ERROR", message: "Dredge worker failed." });
   };
 
-  private rejectOlderSearches(newestRequestId: number): void {
-    for (const [id, pending] of this.pending) {
-      if (pending.kind === "search" && id < newestRequestId) {
-        this.pending.delete(id);
-        pending.reject(new DredgeClientError({ code: "STALE_RESPONSE", message: "A newer Dredge search superseded this request." }));
-      }
+  private submitSearch(
+    id: number,
+    request: DredgeSearchRequest,
+    resolve: (response: DredgeSearchResponse) => void,
+    reject: (error: DredgeClientError) => void,
+  ): void {
+    const worker = this.ensureWorker();
+    this.inFlightSearchId = id;
+    this.pending.set(id, { kind: "search", resolve, reject });
+    const message: DredgeWorkerRequest = { type: "search", id, request };
+    worker.postMessage(message);
+  }
+
+  private submitPendingSearch(): void {
+    const next = this.pendingSearch;
+    if (!next) {
+      return;
     }
+    this.pendingSearch = undefined;
+    this.submitSearch(next.id, next.request, next.resolve, next.reject);
+  }
+
+  private staleError(): DredgeClientError {
+    return new DredgeClientError({ code: "STALE_RESPONSE", message: "A newer Dredge search superseded this request." });
   }
 
   private rejectAll(error: DredgeError): void {
@@ -288,6 +332,11 @@ export class DredgeSearchClient {
       pending.reject(clientError);
     }
     this.pending.clear();
+    if (this.pendingSearch) {
+      this.pendingSearch.reject(clientError);
+      this.pendingSearch = undefined;
+    }
+    this.inFlightSearchId = undefined;
   }
 
   private fail(error: DredgeError): void {

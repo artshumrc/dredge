@@ -545,7 +545,7 @@ def test_compile_writes_generated_types_worker_protocol_and_stale_handling(
     assert '"FILTER_INVALID"' in source
     assert '"QUERY_INVALID"' in source
     assert "export type DredgeWorkerResponse" in source
-    assert "rejectOlderSearches" in source
+    assert "pendingSearch" in source
     assert "STALE_RESPONSE" in source
     assert 'const DEFAULT_WORKER_URL = "/search/dredge-worker.abc123.js";' in source
 
