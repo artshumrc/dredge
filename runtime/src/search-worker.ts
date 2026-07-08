@@ -1,8 +1,10 @@
 /// <reference lib="webworker" />
 
-import { browserBootEnv } from "./browser-boot-env";
-import { boot, closeDatabase, getExec, getTier, toDredgeError } from "./db";
-import type { Tier } from "./db";
+import { browserBootEnv, browserCoordinationEnv } from "./browser-boot-env";
+import { boot, closeDatabase, getExec, getTier, loadValidatedManifest, WorkerError, toDredgeError } from "./db";
+import type { StatusFn, Tier } from "./db";
+import { startCoordinatedSession } from "./coordination";
+import type { CoordinatedSession, LocalBackend } from "./coordination";
 import { introspectSchema, search } from "./search";
 import type { DredgeSearchRequest, DredgeSearchResponse, SchemaInfo } from "./search";
 import type { DredgeError, DredgeStatus } from "./protocol";
@@ -18,11 +20,11 @@ type WorkerResponse =
   | { type: "searchResult"; id: number; response: DredgeSearchResponse }
   | { type: "error"; id?: number; error: DredgeError };
 
-let schema: SchemaInfo | undefined;
-// The tier `schema` was introspected from. When the Tier Swap flips the active
-// handle from hot to full, we re-introspect so facet/store roles and columns
-// reflect the tier now serving searches.
-let schemaTier: Tier | undefined;
+// The active session: a leader that owns the database, or a follower relaying to
+// the leader tab. Election happens on `init`.
+let session: CoordinatedSession | undefined;
+let manifestUrl = "";
+let reset = false;
 
 function post(message: WorkerResponse): void {
   (self as DedicatedWorkerGlobalScope).postMessage(message);
@@ -32,38 +34,75 @@ function status(value: DredgeStatus, detail?: string): void {
   post({ type: "status", status: value, detail });
 }
 
-self.onmessage = async (event: MessageEvent<WorkerRequest>) => {
-  const message = event.data;
-  try {
-    if (message.type === "init") {
-      // Resolves once the first tier is open (Hot Tier on a cold visit, Full
-      // Tier on a warm one); any background Full Tier upgrade keeps running and
-      // reports `ready` via a status message when it swaps in.
-      await boot(message.manifestUrl, message.reset ?? false, status, browserBootEnv);
-      schema = introspectSchema(getExec());
-      schemaTier = getTier();
-      post({ type: "ready", id: message.id, tier: getTier() });
-      return;
-    }
-    if (message.type === "search") {
+// Boot the database and expose it as a LocalBackend for the coordinator. Only a
+// leader tab reaches this; followers never boot. `reset` applies to the first
+// boot only — a follower promoted on failover must reopen the OPFS copy the
+// departed leader left, never wipe it.
+async function bootLocal(onStatus: StatusFn): Promise<LocalBackend> {
+  const useReset = reset;
+  reset = false;
+  await boot(manifestUrl, useReset, onStatus, browserBootEnv);
+  let schema: SchemaInfo | undefined;
+  let schemaTier: Tier | undefined;
+  return {
+    getTier: () => getTier(),
+    search: (request) => {
       const exec = getExec();
       const tier = getTier();
+      // Re-introspect when the Tier Swap flips the active handle so field roles
+      // and columns reflect the tier now serving searches.
       if (!schema || schemaTier !== tier) {
         schema = introspectSchema(exec);
         schemaTier = tier;
       }
-      const response = search(exec, schema, message.request, tier);
+      return search(exec, schema, request, tier);
+    },
+  };
+}
+
+self.onmessage = async (event: MessageEvent<WorkerRequest>) => {
+  const message = event.data;
+
+  if (message.type === "init") {
+    try {
+      manifestUrl = message.manifestUrl;
+      reset = message.reset ?? false;
+      // The manifest sha namespaces the leadership lock and relay channel, and
+      // must be known before election — followers decide not to boot on it.
+      const manifest = await loadValidatedManifest(browserBootEnv, manifestUrl);
+      session = await startCoordinatedSession({
+        manifestSha: manifest.db_sha256,
+        status,
+        bootLocal,
+        env: browserCoordinationEnv,
+      });
+      post({ type: "ready", id: message.id, tier: session.getTier() });
+    } catch (error) {
+      status("failed");
+      post({ type: "error", id: message.id, error: toDredgeError(error) });
+    }
+    return;
+  }
+
+  if (message.type === "search") {
+    // A per-search failure (e.g. a relay timeout, or leader loss mid-flight)
+    // rejects only this request — it does NOT flip the session to `failed`. The
+    // client's coalescing turns the rejection into a re-typed keystroke.
+    try {
+      if (!session) {
+        throw new WorkerError({ code: "QUERY_FAILED", message: "Search issued before init." });
+      }
+      const response = await session.search(message.request);
       post({ type: "searchResult", id: message.id, response });
-      return;
+    } catch (error) {
+      post({ type: "error", id: message.id, error: toDredgeError(error) });
     }
-    if (message.type === "destroy") {
-      closeDatabase();
-      schema = undefined;
-      schemaTier = undefined;
-      return;
-    }
-  } catch (error) {
-    status("failed");
-    post({ type: "error", id: (message as { id?: number }).id, error: toDredgeError(error) });
+    return;
+  }
+
+  if (message.type === "destroy") {
+    session?.destroy();
+    session = undefined;
+    closeDatabase();
   }
 };

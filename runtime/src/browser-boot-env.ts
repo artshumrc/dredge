@@ -3,6 +3,7 @@
 import sqlite3InitModule from "@sqlite.org/sqlite-wasm";
 
 import type { BootEnv, PoolLike } from "./db";
+import type { BroadcastChannelLike, CoordinationEnv, LockManagerLike } from "./coordination";
 
 // Name of the OPFS SAH pool VFS. Files imported into the pool live under this
 // namespace inside OPFS.
@@ -46,3 +47,37 @@ export const browserBootEnv: BootEnv = {
     return Promise.resolve(undefined);
   },
 };
+
+// Real multi-tab coordination primitives for a browser worker: the Web Locks
+// manager (leadership election) and BroadcastChannel (relay), plus timer and id
+// sources. `undefined` when either primitive is missing — the worker then runs
+// the single-tab path (today's behavior, in-memory fallback and all). Both
+// `navigator.locks` and `BroadcastChannel` are available in worker contexts on
+// every browser that also supports the OPFS SAH pool, so this is `undefined`
+// only on legacy engines that already take the memory fallback anyway.
+export const browserCoordinationEnv: CoordinationEnv | undefined = createBrowserCoordinationEnv();
+
+function createBrowserCoordinationEnv(): CoordinationEnv | undefined {
+  const locks =
+    typeof navigator !== "undefined"
+      ? ((navigator as unknown as { locks?: LockManagerLike }).locks ?? undefined)
+      : undefined;
+  if (!locks || typeof locks.request !== "function" || typeof BroadcastChannel === "undefined") {
+    return undefined;
+  }
+  let seq = 0;
+  const tabId = typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+    ? crypto.randomUUID()
+    : `${performance.now()}`;
+  return {
+    locks,
+    createChannel: (name) => new BroadcastChannel(name) as unknown as BroadcastChannelLike,
+    scheduleTimeout: (callback, ms) => {
+      const handle = setTimeout(callback, ms);
+      return () => clearTimeout(handle);
+    },
+    // Per-tab prefix + counter keeps relay ids unique across every tab sharing
+    // the channel without another randomUUID() call per keystroke.
+    newId: () => `${tabId}-${(seq += 1)}`,
+  };
+}

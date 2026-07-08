@@ -179,6 +179,20 @@ export function validateManifest(manifest: DredgeManifest): void {
   }
 }
 
+// Fetch and validate the manifest without booting a database. Multi-tab leader
+// election needs the manifest's sha256 (to namespace the leadership lock and
+// relay channel per deployment) before deciding whether this tab boots the
+// database or follows another tab — followers never call boot(), so they load
+// the manifest through here instead.
+export async function loadValidatedManifest(
+  env: BootEnv,
+  manifestUrl: string,
+): Promise<DredgeManifest> {
+  const manifest = await fetchManifest(env, manifestUrl);
+  validateManifest(manifest);
+  return manifest;
+}
+
 function dbPathFor(manifest: DredgeManifest): string {
   // Namespace the stored database by its content hash so a new database never
   // collides with a stale one.
