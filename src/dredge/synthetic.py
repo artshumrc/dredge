@@ -192,6 +192,7 @@ def _render_page(
       data-dredge-featured="{"true" if featured else "false"}"
       data-dredge-published="{published}"
       data-dredge-image="/images/{doc_id}.jpg"
+      data-dredge-catalog="cat{doc_id}"
     >
       <h1>{escape(title)}</h1>
       <p>{escape(body)}</p>
@@ -213,6 +214,9 @@ def _config(source_dir: Path, output_dir: Path) -> dict[str, object]:
             "body": "main",
             "description": "meta[name='description']@content",
         },
+        "search_fields": [
+            {"source": "data-dredge-catalog", "hot": True},
+        ],
         "facets": {
             "category": {
                 "type": "string",

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import sqlite3
@@ -283,6 +284,113 @@ def test_final_database_schema_indexes_and_query_plans(tmp_path: Path) -> None:
             ("ancient",),
             "facet_tags_value_document_idx",
         )
+    finally:
+        connection.close()
+
+
+def test_compile_emits_hot_tier(tmp_path: Path) -> None:
+    config_path, output_dir = _write_fixture_project(tmp_path)
+
+    result = compile_site(config_path)
+
+    manifest = result.manifest
+    assert manifest["hot_db_file"].startswith("search-hot.")
+    assert manifest["hot_db_file"].endswith(".db.br")
+    assert manifest["hot_db_sha256"] in manifest["hot_db_file"]
+    assert manifest["hot_db_file"] != manifest["db_file"]
+
+    hot_compressed = output_dir / manifest["hot_db_file"]
+    assert hot_compressed.exists()
+    assert hot_compressed.stat().st_size == manifest["hot_db_compressed_bytes"]
+
+    decompressed = brotli.decompress(hot_compressed.read_bytes())
+    assert len(decompressed) == manifest["hot_db_bytes"]
+    assert hashlib.sha256(decompressed).hexdigest() == manifest["hot_db_sha256"]
+
+    # Hot artifact is meaningfully smaller than the full artifact (no body FTS).
+    assert manifest["hot_db_compressed_bytes"] < manifest["db_compressed_bytes"]
+
+    assert result.hot_db_path is not None
+    connection = sqlite3.connect(
+        f"file:{result.hot_db_path}?mode=ro&immutable=1", uri=True
+    )
+    try:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+
+        field_rows = connection.execute(
+            "SELECT name, role, type FROM dredge_fields ORDER BY name"
+        ).fetchall()
+        assert ("image", "store", "string") in field_rows
+        assert ("category", "facet", "string") in field_rows
+
+        # Store fields ride along on the hot documents table, same ids.
+        assert connection.execute(
+            "SELECT image FROM documents WHERE id = 1"
+        ).fetchone() == ("/images/alpha.jpg",)
+
+        fts_sql = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'documents_fts'"
+        ).fetchone()[0]
+        assert "content=''" in fts_sql
+        fts_columns = [
+            row[1] for row in connection.execute("PRAGMA table_info(documents_fts)")
+        ]
+        assert fts_columns == ["title", "hot_0"]
+
+        # Title tokens match.
+        assert connection.execute(
+            "SELECT COUNT(*) FROM documents_fts WHERE documents_fts MATCH ?",
+            ("tombs",),
+        ).fetchone()[0] == 1
+        # Hot-flagged search field text matches.
+        assert connection.execute(
+            "SELECT d.id FROM documents_fts "
+            "JOIN documents d ON d.id = documents_fts.rowid "
+            "WHERE documents_fts MATCH ? ORDER BY d.id",
+            ("zeta9000",),
+        ).fetchall() == [(1,)]
+        # Body-only text does NOT match (body FTS content is absent from hot tier).
+        assert connection.execute(
+            "SELECT COUNT(*) FROM documents_fts WHERE documents_fts MATCH ?",
+            ("golden",),
+        ).fetchone()[0] == 0
+
+        # Facet tables and the title-nocase index ride along.
+        assert connection.execute(
+            "SELECT value FROM facet_tags WHERE document_id = 1 ORDER BY value"
+        ).fetchall() == [("ancient",), ("burial",)]
+        index_names = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index' "
+                "AND name NOT LIKE 'sqlite_autoindex%'"
+            )
+        }
+        assert "documents_title_nocase_idx" in index_names
+        assert "documents_category_idx" in index_names
+    finally:
+        connection.close()
+
+
+def test_compile_emits_title_only_hot_tier_without_hot_fields(tmp_path: Path) -> None:
+    config_path, _ = _write_fixture_project(tmp_path, hot_search_field=False)
+
+    result = compile_site(config_path)
+
+    assert result.manifest["hot_db_file"].startswith("search-hot.")
+    assert result.hot_db_path is not None
+    connection = sqlite3.connect(
+        f"file:{result.hot_db_path}?mode=ro&immutable=1", uri=True
+    )
+    try:
+        fts_columns = [
+            row[1] for row in connection.execute("PRAGMA table_info(documents_fts)")
+        ]
+        assert fts_columns == ["title"]
+        assert connection.execute(
+            "SELECT COUNT(*) FROM documents_fts WHERE documents_fts MATCH ?",
+            ("tombs",),
+        ).fetchone()[0] == 1
     finally:
         connection.close()
 
@@ -768,6 +876,7 @@ def _write_fixture_project(
     index_attrs: str | None = None,
     include_descriptions: bool = True,
     client: dict[str, str] | None = None,
+    hot_search_field: bool = True,
 ) -> tuple[Path, Path]:
     source_dir = tmp_path / "site"
     output_dir = tmp_path / "search"
@@ -780,7 +889,8 @@ def _write_fixture_project(
         "data-dredge-rating='4.5' "
         "data-dredge-featured='yes' "
         "data-dredge-published='2024-01-30' "
-        "data-dredge-image='/images/alpha.jpg'"
+        "data-dredge-image='/images/alpha.jpg' "
+        "data-dredge-catalog='zeta9000'"
     )
     index_description = (
         '<meta name="description" content="Guide to alpha tombs">'
@@ -830,6 +940,7 @@ def _write_fixture_project(
               data-dredge-featured="false"
               data-dredge-published="2023-11-02"
               data-dredge-image="/images/beta.jpg"
+              data-dredge-catalog="qux5001"
             >
               <h1>Beta Collection</h1>
               <p>Catalog records and images.</p>
@@ -872,6 +983,8 @@ def _write_fixture_project(
         "result_fields": ["title", "url", "description", "category", "year", "image"],
         "composite_indices": [["category", "year"]],
     }
+    if hot_search_field:
+        config["search_fields"] = [{"source": "data-dredge-catalog", "hot": True}]
     if client is not None:
         config["client"] = client
     config_path = tmp_path / "dredge.config.json"
