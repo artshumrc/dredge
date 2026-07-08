@@ -259,7 +259,10 @@ function applyReadOnlyPragmas(db: any): void {
   // large FTS doclist scans, and temp tables/sorts stay in memory.
   db.exec("PRAGMA cache_size = -131072"); // 128 MB, enough to hold the whole DB
   db.exec("PRAGMA temp_store = MEMORY");
-  db.exec("PRAGMA query_only = 1");
+  // PRAGMA query_only is intentionally NOT set: single-pass query execution
+  // builds a per-request TEMP TABLE holding the FTS match, and query_only = 1
+  // forbids CREATE TABLE. The database file itself is opened read-only via the
+  // SAH pool / in-memory deserialize, so writes can only ever touch temp.
 }
 
 function openDatabaseHandle(path: string): unknown {

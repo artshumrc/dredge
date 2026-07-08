@@ -68,6 +68,102 @@ describe("runtime search fixture", () => {
     }
   });
 
+  it("evaluates the FTS match exactly once per request with facets requested", () => {
+    const db = new DatabaseSync(fixtureDbPath());
+    try {
+      const base = makeNodeSqliteExec(db);
+      let matchExecutions = 0;
+      const exec: typeof base = (sql, bind) => {
+        if (/documents_fts\s+match/i.test(sql)) {
+          matchExecutions += 1;
+        }
+        return base(sql, bind);
+      };
+      const schema = introspectSchema(exec);
+
+      search(exec, schema, { query: "temple", limit: 5, includeFacets: true });
+
+      expect(matchExecutions).toBe(1);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("keeps facet counts under all-filters-except-own after single-pass", () => {
+    const db = new DatabaseSync(fixtureDbPath());
+    try {
+      const exec = makeNodeSqliteExec(db);
+      const schema = introspectSchema(exec);
+
+      const response = search(exec, schema, {
+        query: "temple",
+        filters: { category: "object" },
+        includeFacets: ["category", "year"],
+        limit: 0,
+      });
+
+      // Filtered to category=object, so the total counts only object docs...
+      expect(response.total).toBe(32);
+      // ...but the category facet skips its own filter and still surfaces the
+      // other categories present among "temple" matches.
+      const category = Object.fromEntries(
+        (response.facets?.category ?? []).map((bucket) => [bucket.value, bucket.count]),
+      );
+      expect(category).toEqual({ object: 32, site: 10, media: 5, publication: 2 });
+      // The year facet, whose own filter is not set, is constrained by the
+      // category filter and so sums to the filtered total.
+      const yearTotal = (response.facets?.year ?? []).reduce((sum, b) => sum + b.count, 0);
+      expect(yearTotal).toBe(32);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("ranks title matches above body mentions", () => {
+    const db = new DatabaseSync(fixtureDbPath());
+    try {
+      const exec = makeNodeSqliteExec(db);
+      const schema = introspectSchema(exec);
+
+      // 49 documents match "temple"; exactly 6 carry it in their title. With the
+      // fixed 10x title weight those six must sort ahead of every body-only hit.
+      const response = search(exec, schema, { query: "temple", limit: 6 });
+      for (const hit of response.hits) {
+        expect(String(hit.title)).toContain("Temple");
+      }
+    } finally {
+      db.close();
+    }
+  });
+
+  it("includes a finite bm25 score on FTS hits and 0 on browse hits", () => {
+    const db = new DatabaseSync(fixtureDbPath());
+    try {
+      const exec = makeNodeSqliteExec(db);
+      const schema = introspectSchema(exec);
+
+      const keyword = search(exec, schema, { query: "temple", limit: 3 });
+      expect(keyword.hits.length).toBeGreaterThan(0);
+      for (const hit of keyword.hits) {
+        expect(typeof hit.score).toBe("number");
+        expect(Number.isFinite(hit.score as number)).toBe(true);
+      }
+      // bm25 ranks are non-positive; better matches sort first (ascending).
+      const scores = keyword.hits.map((hit) => hit.score as number);
+      for (let i = 1; i < scores.length; i += 1) {
+        expect(scores[i]).toBeGreaterThanOrEqual(scores[i - 1]);
+      }
+
+      const browse = search(exec, schema, { limit: 3 });
+      expect(browse.hits.length).toBeGreaterThan(0);
+      for (const hit of browse.hits) {
+        expect(hit.score).toBe(0);
+      }
+    } finally {
+      db.close();
+    }
+  });
+
   it("rejects store fields and unknown fields in query validation", () => {
     const db = new DatabaseSync(fixtureDbPath());
     try {

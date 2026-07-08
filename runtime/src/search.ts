@@ -372,7 +372,7 @@ function buildOrderClause(
     const collate = NOCASE_SORT_COLUMNS.has(sort.field) ? " COLLATE NOCASE" : "";
     return `ORDER BY d.${quoteIdentifier(sort.field)}${collate} ${direction}, d.id`;
   }
-  return usesFts ? "ORDER BY bm25(documents_fts), d.id" : "ORDER BY d.id";
+  return usesFts ? `ORDER BY ${MATCH_TABLE}.rank, d.id` : "ORDER BY d.id";
 }
 
 function facetNamesToCount(schema: SchemaInfo, includeFacets: boolean | string[]): string[] {
@@ -390,6 +390,19 @@ function facetNamesToCount(schema: SchemaInfo, includeFacets: boolean | string[]
   return [];
 }
 
+// Fixed bm25 column weights for the documents_fts(title, body) index: a title
+// hit outranks a body mention by this constant factor. Not configurable in this
+// release (SPEC.md → "Query execution (single pass)").
+const FTS_TITLE_WEIGHT = 10.0;
+const FTS_BODY_WEIGHT = 1.0;
+
+// Name of the per-request temp table holding the FTS match: one row per matching
+// document (`id`) with its bm25 `rank`. The count, hits page, and every facet
+// count read from it, so `documents_fts MATCH` is evaluated exactly once per
+// request. Worker execution is serial, so a single fixed name reused across
+// requests is safe as long as it is always dropped first.
+const MATCH_TABLE = "m";
+
 export function search(
   exec: Exec,
   schema: SchemaInfo,
@@ -398,45 +411,70 @@ export function search(
   const started = performance.now();
   const query = (request.query ?? "").trim();
   const matchExpr = query ? buildMatchExpression(query) : null;
+
+  if (matchExpr === null) {
+    // Browse: no text query, so no FTS evaluation and no temp table — read
+    // directly from the documents table as before.
+    return runSearch(exec, schema, request, false, started);
+  }
+
+  // Single-pass: evaluate the FTS match exactly once into a temp table, then
+  // read the count, hits page, and all facet counts from it.
+  exec(`DROP TABLE IF EXISTS temp.${MATCH_TABLE}`);
+  exec(
+    `CREATE TEMP TABLE ${MATCH_TABLE} AS ` +
+      `SELECT rowid AS id, bm25(documents_fts, ${FTS_TITLE_WEIGHT}, ${FTS_BODY_WEIGHT}) AS rank ` +
+      `FROM documents_fts WHERE documents_fts MATCH ?`,
+    [matchExpr],
+  );
+  try {
+    return runSearch(exec, schema, request, true, started);
+  } finally {
+    exec(`DROP TABLE IF EXISTS temp.${MATCH_TABLE}`);
+  }
+}
+
+// Compute total, hits, and facet counts. When `usesFts` is set, the match temp
+// table already exists and is joined in place of a live `documents_fts MATCH`;
+// otherwise this is the browse path reading the documents table directly.
+function runSearch(
+  exec: Exec,
+  schema: SchemaInfo,
+  request: DredgeSearchRequest,
+  usesFts: boolean,
+  started: number,
+): DredgeSearchResponse {
   const filters = request.filters ?? {};
   const limit = Math.max(0, request.limit ?? 20);
   const offset = Math.max(0, request.offset ?? 0);
 
-  // FROM + base WHERE shared by total/hits.
-  const usesFts = matchExpr !== null;
   const from = usesFts
-    ? "FROM documents_fts JOIN documents d ON d.id = documents_fts.rowid"
+    ? `FROM ${MATCH_TABLE} JOIN documents d ON d.id = ${MATCH_TABLE}.id`
     : "FROM documents d";
 
-  const baseWhere: string[] = [];
-  const baseBind: unknown[] = [];
-  if (usesFts) {
-    baseWhere.push("documents_fts MATCH ?");
-    baseBind.push(matchExpr);
-  }
   const filterClause = buildFilterClauses(schema, filters);
-  baseWhere.push(...filterClause.sql);
-  baseBind.push(...filterClause.bind);
-
-  const whereSql = baseWhere.length ? `WHERE ${baseWhere.join(" AND ")}` : "";
+  const whereSql = filterClause.sql.length ? `WHERE ${filterClause.sql.join(" AND ")}` : "";
 
   // Total matching documents.
-  const totalRows = exec(`SELECT COUNT(*) ${from} ${whereSql}`, baseBind);
+  const totalRows = exec(`SELECT COUNT(*) ${from} ${whereSql}`, filterClause.bind);
   const total = Number(totalRows[0]?.[0] ?? 0);
 
-  // Page of hits with all selectable document columns.
+  // Page of hits with all selectable document columns. FTS hits carry their
+  // bm25 rank as `score` (selected from the temp table); browse hits score 0.
   const columns = schema.documentColumns;
   const select = columns.map((name) => `d.${quoteIdentifier(name)}`).join(", ");
+  const scoreSelect = usesFts ? `, ${MATCH_TABLE}.rank AS score` : "";
   const order = buildOrderClause(schema, request.sort, usesFts);
   const hitRows = exec(
-    `SELECT ${select} ${from} ${whereSql} ${order} LIMIT ? OFFSET ?`,
-    [...baseBind, limit, offset],
+    `SELECT ${select}${scoreSelect} ${from} ${whereSql} ${order} LIMIT ? OFFSET ?`,
+    [...filterClause.bind, limit, offset],
   );
   const hits: DredgeHit[] = hitRows.map((row) => {
     const hit: DredgeHit = {};
     columns.forEach((name, index) => {
       hit[name] = row[index] as string | number | boolean | null;
     });
+    hit.score = usesFts ? Number(row[columns.length]) : 0;
     return hit;
   });
 
@@ -447,22 +485,14 @@ export function search(
     facets = {};
     for (const name of facetNames) {
       const skipClause = buildFilterClauses(schema, filters, name);
-      const where: string[] = [];
-      const bind: unknown[] = [];
-      if (usesFts) {
-        where.push("documents_fts MATCH ?");
-        bind.push(matchExpr);
-      }
-      where.push(...skipClause.sql);
-      bind.push(...skipClause.bind);
-      const facetWhere = where.length ? `WHERE ${where.join(" AND ")}` : "";
+      const facetWhere = skipClause.sql.length ? `WHERE ${skipClause.sql.join(" AND ")}` : "";
 
       if (schema.scalarColumns.includes(name)) {
         const col = `d.${quoteIdentifier(name)}`;
         const rows = exec(
           `SELECT ${col} AS value, COUNT(*) AS n ${from} ${facetWhere} ` +
             `GROUP BY ${col} ORDER BY n DESC`,
-          bind,
+          skipClause.bind,
         );
         facets[name] = rows
           .filter((row) => row[0] !== null)
@@ -473,9 +503,9 @@ export function search(
           `SELECT ft.value AS value, COUNT(*) AS n ` +
             `FROM ${quoteIdentifier(table)} ft ` +
             `JOIN documents d ON d.id = ft.document_id ` +
-            (usesFts ? "JOIN documents_fts ON documents_fts.rowid = d.id " : "") +
+            (usesFts ? `JOIN ${MATCH_TABLE} ON ${MATCH_TABLE}.id = d.id ` : "") +
             `${facetWhere} GROUP BY ft.value ORDER BY n DESC`,
-          bind,
+          skipClause.bind,
         );
         facets[name] = rows.map((row) => ({
           value: row[0] as string | number | boolean,
