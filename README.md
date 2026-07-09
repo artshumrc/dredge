@@ -8,11 +8,54 @@ The Compiler reads a `dredge.config.json`, extracts pages from `source_dir`, bui
 
 The Runtime lives in the browser. Its worker owns SQLite-WASM and the database handle; the generated or hand-written client sends search requests to that worker and receives hits, counts, and optional Facet buckets.
 
-Schema v2 will split shipped data into a Hot Tier and a Full Tier. The Hot Tier is the small first database for cold visits, while the Full Tier is the complete database that warm visitors use from OPFS. Until schema v2 lands, Dredge ships one Full Tier-style database artifact.
+Shipped data is split into a Hot Tier and a Full Tier. The Hot Tier is a small first database (title, hot-flagged search fields, and all result fields) that makes search interactive within seconds on a cold visit. The Full Tier is the complete database that warm visitors open from OPFS. On a cold visit the Runtime serves the Hot Tier while the Full Tier streams in the background and swaps in atomically between requests; warm visitors never fetch the Hot Tier.
+
+## Quick start
+
+Indexing a static site and wiring search into its pages is four steps:
+
+1. **Compile the artifact.** From a `dredge.config.json` (see [Configuration](#configuration)), extract pages and write the database, compressed database, and Manifest into `output_dir`:
+
+   ```sh
+   uv run dredge compile --config dredge.config.json
+   ```
+
+2. **Generate the typed client.** This writes the TypeScript client to the `client.out` path in your config:
+
+   ```sh
+   uv run dredge codegen --config dredge.config.json
+   ```
+
+3. **Install the Runtime assets** (worker, wasm payloads, chunks) into your site's `/search/` directory, alongside the compiled artifact from step 1:
+
+   ```sh
+   cd runtime
+   pnpm install
+   node scripts/install-into-site.mjs --out ../path/to/site
+   ```
+
+4. **Use the client on the page.** Import the generated client, call `search`, and render the hits:
+
+   ```ts
+   import { DredgeSearchClient } from "./dredge-client";
+
+   const client = new DredgeSearchClient();
+
+   const response = await client.search({
+     query: "hello world",
+     filters: { category: "guides" },
+     includeFacets: true,
+     limit: 20,
+   });
+
+   console.log(response.total, response.hits, response.facets);
+   ```
+
+The first `search` call lazily boots the worker; there is no separate setup step. Each response carries a `tier` (`"hot"` or `"full"`) — provisional `"hot"` hits may be superseded once the Full Tier swaps in, so re-run the visible query when the status reaches `ready`. Subscribe with `client.onStatus(listener)` to observe boot progress (`downloading_db` → `ready_hot` → `ready`). Rapid consecutive `search` calls coalesce latest-wins, so intermediate keystrokes never reach the worker.
 
 ## Configuration
 
-A minimal current config looks like this:
+A config declares where the HTML lives, how to extract fields from it, and what the search results carry:
 
 ```json
 {
@@ -27,7 +70,8 @@ A minimal current config looks like this:
     "description": "meta[name='description']@content"
   },
   "search_fields": [
-    "meta[data-pagefind-meta='catalog_id[content]']@content"
+    "meta[name='keywords']@content",
+    { "source": "meta[data-pagefind-meta='catalog_id[content]']@content", "hot": true }
   ],
   "facets": {
     "category": {
@@ -36,7 +80,13 @@ A minimal current config looks like this:
       "required": true
     }
   },
-  "result_fields": ["title", "url", "description", "category"],
+  "store_fields": {
+    "image": {
+      "type": "string",
+      "source": "meta[property='og:image']@content"
+    }
+  },
+  "result_fields": ["title", "url", "description", "category", "image"],
   "composite_indices": [["category", "year"]],
   "client": {
     "out": "src/dredge-client.ts",
@@ -45,51 +95,22 @@ A minimal current config looks like this:
 }
 ```
 
-Current keys:
+Keys:
 
 - `source_dir`: directory containing rendered HTML.
 - `output_dir`: directory where Dredge writes the database, compressed database, Manifest, and optional client.
 - `base_url`: URL prefix used when turning HTML paths into result URLs.
 - `include` and `exclude`: glob lists selecting HTML files under `source_dir`.
-- `selectors`: extraction selectors for built-in `title`, `body`, and `description` fields.
-- `search_fields`: extra selector strings indexed for full-text search.
+- `selectors`: extraction selectors for the built-in `title`, `body`, and `description` fields.
+- `search_fields`: extra fields indexed for full-text search. Each entry is either a selector string or a `{ "source": string, "hot": boolean }` object; `hot: true` opts that field into the Hot Tier. Title is always hot.
 - `facets`: named fields extracted per page, indexed, filterable, and countable at query time. Supported types are `string`, `string_array`, `integer`, `number`, `boolean`, and `date`.
-- `result_fields`: fields returned with each hit. Today these may include built-ins and Facets.
+- `store_fields`: named fields carried into search results but never indexed, filtered, or counted. Scalar types only — `string_array` must stay a Facet.
+- `result_fields`: fields returned with each hit. May reference built-ins, Facets, and Store Fields.
 - `composite_indices`: optional Facet combinations to index together for common filters.
 - `client`: optional generated TypeScript client destination and worker URL.
 - `allow_output_in_source`: set to `true` only when `output_dir` must live inside `source_dir`.
 
-As of upcoming schema v2, fields have explicit roles. A Facet remains indexed, filterable, and countable. A Store Field is carried into search results but never indexed, filtered, or counted. Facets and Store Fields share one namespace, and `result_fields` may reference both roles.
-
-Schema v2 config shape:
-
-```json
-{
-  "facets": {
-    "category": {
-      "type": "string",
-      "source": "data-dredge-category"
-    }
-  },
-  "store_fields": {
-    "image": {
-      "type": "string",
-      "source": "meta[property='og:image']@content"
-    }
-  },
-  "search_fields": [
-    "meta[name='keywords']@content",
-    { "source": "meta[data-pagefind-meta='catalog_id[content]']@content", "hot": true }
-  ],
-  "result_fields": ["title", "url", "description", "category", "image"]
-}
-```
-
-Schema v2 notes:
-
-- `store_fields` is upcoming and is not accepted by the current schema v1 compiler.
-- Store Fields are scalar only; `string_array` stays Facet-only.
-- `search_fields` entries may be either selector strings or `{ "source": string, "hot": boolean }` objects. `hot: true` opts that field into the Hot Tier. Title is always hot.
+Every field has an explicit **role**. A Facet is indexed, filterable, and countable. A Store Field is carried into results but never indexed, filtered, or counted — use it for display-only data (image URLs, thumbnails) so it stops costing index bytes. Facets and Store Fields share one namespace; a name may not be both, and `result_fields` may reference either role. Filtering or counting on a Store Field fails loudly (`FILTER_INVALID`) rather than scanning the whole table.
 
 ## CLI
 
