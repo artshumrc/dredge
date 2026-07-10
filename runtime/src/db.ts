@@ -7,11 +7,6 @@ const DB_SCHEMA_VERSION = 2;
 
 export type StatusFn = (status: DredgeStatus, detail?: string) => void;
 
-// Which database is currently serving searches. A cold visit opens the Hot Tier
-// first ("hot"); the Full Tier swaps in behind it ("full"). A warm visit opens
-// the Full Tier directly.
-export type Tier = "hot" | "full";
-
 // The SAH pool utility installed into a sqlite3 module. Boot logic uses only
 // this surface, which the fake pool in tests mirrors.
 export interface PoolLike {
@@ -42,8 +37,8 @@ export interface BootEnv {
   // detail), matching today's behavior.
   installPool(sqlite3: unknown): Promise<PoolLike | undefined>;
   // Estimate available persistent storage (browser: navigator.storage.estimate).
-  // Used only for the Full Tier quota preflight. Optional: when absent, or when
-  // it resolves without a numeric `quota`, the preflight is skipped and the OPFS
+  // Used only for the OPFS quota preflight. Optional: when absent, or when it
+  // resolves without a numeric `quota`, the preflight is skipped and the OPFS
   // import proceeds as before.
   estimateStorage?(): Promise<StorageEstimateLike | undefined>;
 }
@@ -94,7 +89,6 @@ let sqlite3: any;
 let poolUtil: any;
 let opened: OpenDatabase | undefined;
 let backend: StorageBackend = "opfs";
-let activeTier: Tier = "full";
 
 // Test-only: clear the cached sqlite module, pool, backend and open handle so a
 // fresh boot can be driven with a new injected environment. Production never
@@ -104,7 +98,6 @@ export function resetBootStateForTests(): void {
   poolUtil = undefined;
   opened = undefined;
   backend = "opfs";
-  activeTier = "full";
 }
 
 async function ensureSqlite(env: BootEnv, status: StatusFn): Promise<void> {
@@ -288,8 +281,7 @@ function toHex(buffer: ArrayBuffer): string {
 
 // Verify that raw (already-decompressed) database bytes hash to the sha256 the
 // manifest recorded, before anything is persisted to OPFS or opened. A
-// truncated or corrupted download must never be stored and served. Reusable
-// across every download path (full tier here; hot tier once it lands).
+// truncated or corrupted download must never be stored and served.
 export async function verifyDatabaseHash(
   bytes: Uint8Array,
   expectedSha256: string,
@@ -402,39 +394,15 @@ export function getManifest(): DredgeManifest | undefined {
   return opened?.manifest;
 }
 
-// The tier currently serving searches. Each search response is tagged with it.
-export function getTier(): Tier {
-  return activeTier;
-}
-
-// Install a freshly opened handle as the active database and record its tier.
-// No prior handle is closed — used for the initial open (hot or warm).
-function installDatabase(db: unknown, manifest: DredgeManifest, tier: Tier): void {
+// Install a freshly opened handle as the active database. No prior handle is
+// closed — a worker boots the database exactly once per session.
+function installDatabase(db: unknown, manifest: DredgeManifest): void {
   opened = { db, manifest, exec: makeExec(db) };
-  activeTier = tier;
 }
 
-// Atomically replace the active handle with a newly opened one, then close the
-// old handle. This runs to completion synchronously (no await between the swap
-// and the close), so it lands whole between two turns of the worker's serial
-// message loop — no search ever observes a half-open database. Closing the old
-// in-memory Hot Tier handle frees its WASM memory (opened FREEONCLOSE).
-function swapDatabase(db: unknown, manifest: DredgeManifest, tier: Tier): void {
-  const previous = opened;
-  opened = { db, manifest, exec: makeExec(db) };
-  activeTier = tier;
-  if (previous) {
-    try {
-      (previous.db as any).close();
-    } catch {
-      // ignore
-    }
-  }
-}
-
-// Full Tier quota preflight. Returns true when it is safe to persist the Full
-// Tier to OPFS. When the environment cannot estimate storage, we optimistically
-// proceed (returning true) exactly as before the preflight existed.
+// OPFS quota preflight. Returns true when it is safe to persist the database to
+// OPFS. When the environment cannot estimate storage, we optimistically proceed
+// (returning true) exactly as before the preflight existed.
 async function hasStorageHeadroom(env: BootEnv, dbBytes: number): Promise<boolean> {
   if (!env.estimateStorage) {
     return true;
@@ -455,17 +423,10 @@ async function hasStorageHeadroom(env: BootEnv, dbBytes: number): Promise<boolea
 }
 
 export interface BootSession {
-  // Timings for the tier boot() opened: the Full Tier on a warm visit, the Hot
-  // Tier on a cold visit.
+  // Timings for the database boot() opened.
   timings: BootTimings;
-  // The tier serving searches when boot() resolves.
-  tier: Tier;
-  // Present only on a cold visit (Hot Tier opened). Resolves when the background
-  // Full Tier upgrade settles — whether it swapped in (tier → "full", status
-  // "ready") or failed and left the session on the Hot Tier (status detail).
-  // Never rejects: a failed upgrade is a degraded-but-working state, not a boot
-  // failure. Tests await it; the worker leaves it running in the background.
-  fullTier?: Promise<void>;
+  // Whether the database was opened from the OPFS cache (a warm visit).
+  fromCache: boolean;
 }
 
 export async function boot(
@@ -485,32 +446,31 @@ export async function boot(
   const manifestBase = resolveManifestBase(manifestUrl);
 
   const useOpfs = backend === "opfs";
-  const fullPath = dbPathFor(manifest);
+  const dbPath = dbPathFor(manifest);
 
   if (useOpfs && reset) {
-    // Force a cold boot: drop any cached Full Tier so the warm path below is
-    // skipped and the hot-then-full lifecycle runs from scratch.
+    // Force a cold boot: drop any cached database so the warm path below is
+    // skipped and the database is downloaded from scratch.
     closeDatabase();
-    if (poolHasFile(fullPath)) {
+    if (poolHasFile(dbPath)) {
       try {
-        poolUtil.unlink(fullPath);
+        poolUtil.unlink(dbPath);
       } catch {
         // ignore
       }
     }
   }
 
-  // Warm visit: the Full Tier is already persisted in OPFS. Open it directly and
-  // never fetch the Hot Tier — warm boots stay exactly as fast and cheap as
-  // before the tier split. Only reachable with the OPFS backend.
-  if (useOpfs && !reset && poolHasFile(fullPath)) {
+  // Warm visit: the database is already persisted in OPFS. Open it directly —
+  // no download, no decompression.
+  if (useOpfs && !reset && poolHasFile(dbPath)) {
     status("checking_storage");
     status("opening_db");
     const openStart = performance.now();
     closeDatabase();
-    const db = openDatabaseHandle(fullPath);
+    const db = openDatabaseHandle(dbPath);
     const openMs = performance.now() - openStart;
-    installDatabase(db, manifest, "full");
+    installDatabase(db, manifest);
     status("ready");
     return {
       timings: {
@@ -524,111 +484,77 @@ export async function boot(
         compressedBytes: manifest.db_compressed_bytes,
         decompressedBytes: manifest.db_bytes,
       },
-      tier: "full",
+      fromCache: true,
     };
   }
 
-  // Cold visit: fetch + verify the Hot Tier, open it in WASM memory (never
-  // persisted), and serve searches from it immediately as `ready_hot`. A Hot
-  // Tier integrity failure is fatal — it propagates and fails boot.
-  status("downloading_db", "hot tier");
-  const hotDownloadStart = performance.now();
-  const hotCompressed = await downloadCompressed(env, manifest.hot_db_file, manifestBase);
-  const hotDownloadMs = performance.now() - hotDownloadStart;
-
-  status("decompressing_db", "hot tier");
-  const hotDecompressStart = performance.now();
-  const hotRaw = await decompress(hotCompressed, manifest.hot_db_bytes);
-  await verifyDatabaseHash(hotRaw, manifest.hot_db_sha256);
-  const hotDecompressMs = performance.now() - hotDecompressStart;
-
-  status("opening_db", "hot tier");
-  const hotOpenStart = performance.now();
-  closeDatabase();
-  const hotDb = openInMemoryDatabase(hotRaw);
-  const hotOpenMs = performance.now() - hotOpenStart;
-  installDatabase(hotDb, manifest, "hot");
-  status("ready_hot");
-
-  const timings: BootTimings = {
-    fromCache: false,
-    manifestMs: manifestDone - t0,
-    downloadMs: hotDownloadMs,
-    decompressMs: hotDecompressMs,
-    writeOpfsMs: 0,
-    openMs: hotOpenMs,
-    totalMs: performance.now() - t0,
-    compressedBytes: hotCompressed.byteLength,
-    decompressedBytes: hotRaw.byteLength,
-  };
-
-  // Upgrade to the Full Tier in the background. A failure here must NOT fail the
-  // session: we stay on the Hot Tier and surface the cause as a status detail
-  // (contract: no in-session retry; the next boot retries).
-  const fullTier = upgradeToFullTier(
-    env,
-    manifest,
-    manifestBase,
-    useOpfs ? fullPath : undefined,
-    status,
-  ).catch((error) => {
-    status(
-      "ready_hot",
-      `full tier unavailable, staying on hot tier: ${toDredgeError(error).message}`,
-    );
-  });
-
-  return { timings, tier: "hot", fullTier };
-}
-
-// Background Full Tier upgrade: download, verify, persist to OPFS (or fall back
-// to memory), open, and atomically swap it in for the Hot Tier. Emits `ready`
-// on success. Throws on any failure so boot()'s handler keeps the session on
-// the Hot Tier instead of transitioning to `failed`.
-async function upgradeToFullTier(
-  env: BootEnv,
-  manifest: DredgeManifest,
-  manifestBase: string,
-  fullPath: string | undefined,
-  status: StatusFn,
-): Promise<void> {
-  status("downloading_db", "full tier");
+  // Cold visit: download + verify the database, persist it to OPFS (or fall back
+  // to memory), and open it. An integrity failure is fatal — it propagates and
+  // fails boot.
+  status("downloading_db");
+  const downloadStart = performance.now();
   const compressed = await downloadCompressed(env, manifest.db_file, manifestBase);
+  const downloadMs = performance.now() - downloadStart;
 
-  status("decompressing_db", "full tier");
+  status("decompressing_db");
+  const decompressStart = performance.now();
   const raw = await decompress(compressed, manifest.db_bytes);
   await verifyDatabaseHash(raw, manifest.db_sha256);
+  const decompressMs = performance.now() - decompressStart;
 
   // Persist to OPFS unless there is no pool (memory backend) or the quota
   // preflight reports insufficient headroom — either way, open it in memory.
-  let persist = fullPath !== undefined;
+  let persist = useOpfs;
   if (persist && !(await hasStorageHeadroom(env, manifest.db_bytes))) {
     persist = false;
     status(
-      "ready_hot",
-      "insufficient storage quota to persist the full tier; opening it in memory for this session.",
+      "checking_storage",
+      "insufficient storage quota to persist the database; opening it in memory for this session.",
     );
   }
 
-  let fullDb: unknown;
-  if (persist && fullPath !== undefined) {
-    status("writing_opfs", "full tier");
+  closeDatabase();
+  let writeOpfsMs = 0;
+  let openMs = 0;
+  let db: unknown;
+  if (persist) {
+    status("writing_opfs");
+    const writeStart = performance.now();
     try {
-      poolUtil.importDb(fullPath, raw);
+      poolUtil.importDb(dbPath, raw);
     } catch (error) {
       throw new WorkerError({
         code: "QUOTA_EXCEEDED",
         message: `Failed to store database in OPFS: ${(error as Error).message}`,
       });
     }
-    cleanupStaleDatabases(fullPath);
-    status("opening_db", "full tier");
-    fullDb = openDatabaseHandle(fullPath);
+    cleanupStaleDatabases(dbPath);
+    writeOpfsMs = performance.now() - writeStart;
+    status("opening_db");
+    const openStart = performance.now();
+    db = openDatabaseHandle(dbPath);
+    openMs = performance.now() - openStart;
   } else {
-    status("opening_db", "full tier");
-    fullDb = openInMemoryDatabase(raw);
+    status("opening_db");
+    const openStart = performance.now();
+    db = openInMemoryDatabase(raw);
+    openMs = performance.now() - openStart;
   }
-
-  swapDatabase(fullDb, manifest, "full");
+  installDatabase(db, manifest);
   status("ready");
+
+  return {
+    timings: {
+      fromCache: false,
+      manifestMs: manifestDone - t0,
+      downloadMs,
+      decompressMs,
+      writeOpfsMs,
+      openMs,
+      totalMs: performance.now() - t0,
+      compressedBytes: compressed.byteLength,
+      decompressedBytes: raw.byteLength,
+    },
+    fromCache: false,
+  };
 }

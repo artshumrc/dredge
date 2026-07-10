@@ -10,12 +10,6 @@ export interface DredgeManifest {
   db_bytes: number;
   db_compressed_bytes: number;
   db_compression: string;
-  // Hot Tier artifact: the small database fetched first on a cold visit so
-  // search becomes interactive before the full tier streams in. Always emitted.
-  hot_db_file: string;
-  hot_db_sha256: string;
-  hot_db_bytes: number;
-  hot_db_compressed_bytes: number;
   sqlite_page_size: number;
   page_count: number;
   config_hash: string;
@@ -31,9 +25,6 @@ export type DredgeStatus =
   | "decompressing_db"
   | "writing_opfs"
   | "opening_db"
-  // Cold visit only: the Hot Tier is open and serving searches while the Full
-  // Tier downloads in the background. Searches are accepted here and in `ready`.
-  | "ready_hot"
   | "ready"
   | "failed";
 

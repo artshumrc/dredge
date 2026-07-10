@@ -13,11 +13,10 @@ import type {
   WorkerResponse,
 } from "./protocol";
 
-// Milestone 4 validation harness worker. Boot is delegated to the shared tier
+// Milestone 4 validation harness worker. Boot is delegated to the shared boot
 // state machine in db.ts (via the injected BootEnv), so the harness exercises
-// the real Hot Tier → Full Tier lifecycle and its status progression
-// (downloading_db → ready_hot → ... → ready). Benchmarks then run against the
-// Full Tier once it has swapped in.
+// the real boot path and its status progression (downloading_db → ... →
+// ready). Benchmarks then run against the opened database.
 
 let lastBoot: BootTimings | undefined;
 
@@ -31,11 +30,6 @@ function status(status: DredgeStatus, detail?: string): void {
 
 async function init(manifestUrl: string, reset: boolean): Promise<BootTimings> {
   const session = await boot(manifestUrl, reset, status, browserBootEnv);
-  // On a cold visit boot() resolves on the Hot Tier; wait for the Full Tier to
-  // swap in before benchmarking so query timings measure the full database.
-  if (session.fullTier) {
-    await session.fullTier;
-  }
   return session.timings;
 }
 

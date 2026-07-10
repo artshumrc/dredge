@@ -5,7 +5,6 @@ import {
   type DredgeSearchRequest,
   type DredgeSearchResponse,
   type DredgeStatus,
-  type DredgeTier,
   type DredgeWorkerRequest,
   type DredgeWorkerResponse,
 } from "../src/client.template";
@@ -17,15 +16,10 @@ class FakeWorker {
   readonly posts: DredgeWorkerRequest[] = [];
   private readonly messageListeners = new Set<(event: { data: DredgeWorkerResponse }) => void>();
 
-  // Which tier the auto-answered init reports. "full" mimics a warm boot
-  // (client reaches "ready"); "hot" mimics a cold boot (client reaches
-  // "ready_hot" until a later status message swaps it to "ready").
-  initTier: DredgeTier = "full";
-
   postMessage(message: DredgeWorkerRequest): void {
     this.posts.push(message);
     if (message.type === "init") {
-      this.emit({ type: "ready", id: message.id, tier: this.initTier });
+      this.emit({ type: "ready", id: message.id });
     }
   }
 
@@ -72,8 +66,8 @@ function flush(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
-function makeResponse(total = 0, tier: DredgeTier = "full"): DredgeSearchResponse {
-  return { total, hits: [], elapsedMs: 1, tier };
+function makeResponse(total = 0): DredgeSearchResponse {
+  return { total, hits: [], elapsedMs: 1 };
 }
 
 function makeClient(): { client: DredgeSearchClient; worker: FakeWorker } {
@@ -163,41 +157,20 @@ describe("DredgeSearchClient coalescing", () => {
   });
 });
 
-describe("DredgeSearchClient tier lifecycle", () => {
-  it("reaches ready_hot on a cold boot and accepts searches there", async () => {
+describe("DredgeSearchClient boot", () => {
+  it("reaches ready on init and accepts searches", async () => {
     const { client, worker } = makeClient();
-    worker.initTier = "hot";
     const seen: DredgeStatus[] = [];
     client.onStatus((status) => seen.push(status));
 
     await client.init();
-    expect(client.getStatus()).toBe("ready_hot");
-
-    // A search is accepted on the hot tier and carries tier: "hot".
-    const p = client.search({ query: "cold" });
-    await flush();
-    expect(worker.searchPosts()).toHaveLength(1);
-    worker.respondSearch(worker.searchPosts()[0].id, makeResponse(3, "hot"));
-    await expect(p).resolves.toMatchObject({ total: 3, tier: "hot" });
-
-    // The background full-tier swap arrives as a plain status message.
-    worker.emitStatus("ready");
     expect(client.getStatus()).toBe("ready");
-    expect(seen).toContain("ready_hot");
     expect(seen).toContain("ready");
 
-    // Subsequent responses are tagged full.
-    const p2 = client.search({ query: "warm" });
+    const p = client.search({ query: "temple" });
     await flush();
-    worker.respondSearch(worker.searchPosts()[1].id, makeResponse(9, "full"));
-    await expect(p2).resolves.toMatchObject({ total: 9, tier: "full" });
-  });
-
-  it("reaches ready directly on a warm boot", async () => {
-    const { client, worker } = makeClient();
-    worker.initTier = "full";
-
-    await client.init();
-    expect(client.getStatus()).toBe("ready");
+    expect(worker.searchPosts()).toHaveLength(1);
+    worker.respondSearch(worker.searchPosts()[0].id, makeResponse(3));
+    await expect(p).resolves.toMatchObject({ total: 3 });
   });
 });

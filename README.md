@@ -8,7 +8,7 @@ The Compiler reads a `dredge.config.json`, extracts pages from `source_dir`, bui
 
 The Runtime lives in the browser. Its worker owns SQLite-WASM and the database handle; the generated or hand-written client sends search requests to that worker and receives hits, counts, and optional Facet buckets.
 
-Shipped data is split into a Hot Tier and a Full Tier. The Hot Tier is a small first database (title, hot-flagged search fields, and all result fields) that makes search interactive within seconds on a cold visit. The Full Tier is the complete database that warm visitors open from OPFS. On a cold visit the Runtime serves the Hot Tier while the Full Tier streams in the background and swaps in atomically between requests; warm visitors never fetch the Hot Tier.
+Dredge ships a single database artifact. On a cold visit the Runtime downloads it, verifies its integrity, persists it to OPFS, and opens it; warm visitors reopen the OPFS copy directly without re-downloading.
 
 ## Quick start
 
@@ -51,7 +51,7 @@ Indexing a static site and wiring search into its pages is four steps:
    console.log(response.total, response.hits, response.facets);
    ```
 
-The first `search` call lazily boots the worker; there is no separate setup step. Each response carries a `tier` (`"hot"` or `"full"`) — provisional `"hot"` hits may be superseded once the Full Tier swaps in, so re-run the visible query when the status reaches `ready`. Subscribe with `client.onStatus(listener)` to observe boot progress (`downloading_db` → `ready_hot` → `ready`). Rapid consecutive `search` calls coalesce latest-wins, so intermediate keystrokes never reach the worker.
+The first `search` call lazily boots the worker; there is no separate setup step. Subscribe with `client.onStatus(listener)` to observe boot progress (`downloading_db` → `opening_db` → `ready`); searches resolve once the status reaches `ready`. Rapid consecutive `search` calls coalesce latest-wins, so intermediate keystrokes never reach the worker.
 
 ## Configuration
 
@@ -71,7 +71,7 @@ A config declares where the HTML lives, how to extract fields from it, and what 
   },
   "search_fields": [
     "meta[name='keywords']@content",
-    { "source": "meta[data-pagefind-meta='catalog_id[content]']@content", "hot": true }
+    { "source": "meta[data-pagefind-meta='catalog_id[content]']@content" }
   ],
   "facets": {
     "category": {
@@ -102,7 +102,7 @@ Keys:
 - `base_url`: URL prefix used when turning HTML paths into result URLs.
 - `include` and `exclude`: glob lists selecting HTML files under `source_dir`.
 - `selectors`: extraction selectors for the built-in `title`, `body`, and `description` fields.
-- `search_fields`: extra fields indexed for full-text search. Each entry is either a selector string or a `{ "source": string, "hot": boolean }` object; `hot: true` opts that field into the Hot Tier. Title is always hot.
+- `search_fields`: extra fields indexed for full-text search. Each entry is either a selector string or a `{ "source": string }` object; its text is folded into the body full-text index alongside the `body` selector.
 - `facets`: named fields extracted per page, indexed, filterable, and countable at query time. Supported types are `string`, `string_array`, `integer`, `number`, `boolean`, and `date`.
 - `store_fields`: named fields carried into search results but never indexed, filtered, or counted. Scalar types only — `string_array` must stay a Facet.
 - `result_fields`: fields returned with each hit. May reference built-ins, Facets, and Store Fields.
@@ -146,4 +146,4 @@ uv run dredge synth /tmp/dredge-synthetic --count 1000 --seed 1 --shard-size 100
 
 ## Vocabulary
 
-Project vocabulary is defined in `CONTEXT.md`. Use those terms when discussing Dredge internals: Facet, Store Field, Field, Field Role, Hot Tier, Full Tier, Tier Swap, Manifest, Runtime, and Compiler.
+Project vocabulary is defined in `CONTEXT.md`. Use those terms when discussing Dredge internals: Facet, Store Field, Field, Field Role, Database Artifact, Boot, Manifest, Runtime, and Compiler.

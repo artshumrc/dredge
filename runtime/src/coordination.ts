@@ -20,7 +20,7 @@
 // fallback inside boot().
 
 import { WorkerError, toDredgeError } from "./db";
-import type { StatusFn, Tier } from "./db";
+import type { StatusFn } from "./db";
 import type { DredgeError } from "./protocol";
 import type { DredgeSearchRequest, DredgeSearchResponse } from "./search";
 
@@ -77,12 +77,11 @@ export interface CoordinationEnv {
 // both this tab's client and relayed follower requests. The worker builds it by
 // booting the database and closing over schema introspection + search().
 export interface LocalBackend {
-  getTier(): Tier;
   search(request: DredgeSearchRequest): DredgeSearchResponse;
 }
 
 // Boot the database and return a LocalBackend. Receives the status callback the
-// coordinator wants boot() to report through (so a leader's tier progression is
+// coordinator wants boot() to report through (so a leader's boot progression is
 // both surfaced to its own client and broadcast to followers).
 export type BootLocal = (status: StatusFn) => Promise<LocalBackend>;
 
@@ -100,7 +99,6 @@ export interface CoordinatedSessionOptions {
 
 export interface CoordinatedSession {
   readonly role: "leader" | "follower";
-  getTier(): Tier;
   search(request: DredgeSearchRequest): Promise<DredgeSearchResponse>;
   destroy(): void;
 }
@@ -109,7 +107,7 @@ export interface CoordinatedSession {
 
 type ChannelMessage =
   | { kind: "leader-query" }
-  | { kind: "leader-state"; tier: Tier }
+  | { kind: "leader-ready" }
   | { kind: "search-request"; reqId: string; request: DredgeSearchRequest }
   | { kind: "search-response"; reqId: string; response: DredgeSearchResponse }
   | { kind: "search-error"; reqId: string; error: DredgeError };
@@ -138,8 +136,6 @@ class Session implements CoordinatedSession {
   private channel: BroadcastChannelLike | undefined;
   private channelListener: ((event: { data: unknown }) => void) | undefined;
   private backend: LocalBackend | undefined;
-  // Last tier the leader advertised; the answer to getTier() while a follower.
-  private followerTier: Tier = "hot";
   private readonly relayPending = new Map<string, RelayPending>();
   // Resolves the leadership lock's held-forever promise, releasing it.
   private releaseLock: (() => void) | undefined;
@@ -172,13 +168,6 @@ class Session implements CoordinatedSession {
     this.openChannel();
     this.queueFailover();
     await this.waitForServing();
-  }
-
-  getTier(): Tier {
-    if (this.role === "leader") {
-      return this.backend?.getTier() ?? this.followerTier;
-    }
-    return this.followerTier;
   }
 
   async search(request: DredgeSearchRequest): Promise<DredgeSearchResponse> {
@@ -278,16 +267,17 @@ class Session implements CoordinatedSession {
     this.role = "leader";
     const status: StatusFn = (value, detail) => {
       this.opts.status(value, detail);
-      // Once the database is open, mirror tier changes (e.g. the Hot→Full swap)
-      // to followers so their status and response tags track the leader's.
-      if ((value === "ready" || value === "ready_hot") && this.channel && this.backend) {
-        this.broadcastLeaderState();
+      // Once the database is open and serving, announce readiness to followers
+      // so they resolve their startup gate and stop relaying against a closed
+      // leader.
+      if (value === "ready" && this.channel && this.backend) {
+        this.broadcastLeaderReady();
       }
     };
     this.backend = await this.opts.bootLocal(status);
     if (this.env) {
       this.openChannel();
-      this.broadcastLeaderState();
+      this.broadcastLeaderReady();
     }
   }
 
@@ -312,7 +302,7 @@ class Session implements CoordinatedSession {
 
   private handleAsLeader(message: ChannelMessage): void {
     if (message.kind === "leader-query") {
-      this.broadcastLeaderState();
+      this.broadcastLeaderReady();
       return;
     }
     if (message.kind === "search-request") {
@@ -330,12 +320,12 @@ class Session implements CoordinatedSession {
         });
       }
     }
-    // leader-state / search-response / search-error are follower-directed.
+    // leader-ready / search-response / search-error are follower-directed.
   }
 
   private handleAsFollower(message: ChannelMessage): void {
-    if (message.kind === "leader-state") {
-      this.applyLeaderState(message.tier);
+    if (message.kind === "leader-ready") {
+      this.applyLeaderReady();
       return;
     }
     if (message.kind === "search-response") {
@@ -358,18 +348,17 @@ class Session implements CoordinatedSession {
     // leader-query / search-request are leader-directed.
   }
 
-  private broadcastLeaderState(): void {
+  private broadcastLeaderReady(): void {
     if (!this.channel || !this.backend) {
       return;
     }
-    this.channel.postMessage({ kind: "leader-state", tier: this.backend.getTier() });
+    this.channel.postMessage({ kind: "leader-ready" });
   }
 
-  private applyLeaderState(tier: Tier): void {
-    this.followerTier = tier;
-    // Followers mirror the leader's advertised tier as their own status: the
-    // Hot Tier reads "ready_hot", the Full Tier reads "ready".
-    this.opts.status(tier === "full" ? "ready" : "ready_hot");
+  private applyLeaderReady(): void {
+    // A follower is ready to serve as soon as it knows the leader is serving:
+    // it relays searches over the channel and mirrors the leader's readiness.
+    this.opts.status("ready");
     this.settleStart();
   }
 
@@ -408,12 +397,12 @@ class Session implements CoordinatedSession {
 
   // --- Startup gate ----------------------------------------------------------
 
-  // Resolves once this follower has learned the leader's tier (or has itself
+  // Resolves once this follower has learned the leader is serving (or has itself
   // been promoted to leader), so start() only returns on a serving session.
   private waitForServing(): Promise<void> {
     return new Promise<void>((resolve) => {
       this.settleStartFn = resolve;
-      // Ask the current leader to announce its tier. If the leader has just
+      // Ask the current leader to announce it is ready. If the leader has just
       // vanished, our queued failover request will instead promote us — either
       // way settleStart() fires.
       this.channel?.postMessage({ kind: "leader-query" });

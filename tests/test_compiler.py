@@ -288,105 +288,69 @@ def test_final_database_schema_indexes_and_query_plans(tmp_path: Path) -> None:
         connection.close()
 
 
-def test_compile_emits_hot_tier(tmp_path: Path) -> None:
+def test_compile_emits_single_database_and_indexes_search_fields(
+    tmp_path: Path,
+) -> None:
     config_path, output_dir = _write_fixture_project(tmp_path)
 
     result = compile_site(config_path)
 
     manifest = result.manifest
-    assert manifest["hot_db_file"].startswith("search-hot.")
-    assert manifest["hot_db_file"].endswith(".db.br")
-    assert manifest["hot_db_sha256"] in manifest["hot_db_file"]
-    assert manifest["hot_db_file"] != manifest["db_file"]
+    # A single database artifact is emitted — no hot tier.
+    assert manifest["db_file"].startswith("search.")
+    assert manifest["db_file"].endswith(".db.br")
+    assert not any(key.startswith("hot_") for key in manifest)
 
-    hot_compressed = output_dir / manifest["hot_db_file"]
-    assert hot_compressed.exists()
-    assert hot_compressed.stat().st_size == manifest["hot_db_compressed_bytes"]
+    compressed = output_dir / manifest["db_file"]
+    assert compressed.exists()
+    decompressed = brotli.decompress(compressed.read_bytes())
+    assert hashlib.sha256(decompressed).hexdigest() == manifest["db_sha256"]
 
-    decompressed = brotli.decompress(hot_compressed.read_bytes())
-    assert len(decompressed) == manifest["hot_db_bytes"]
-    assert hashlib.sha256(decompressed).hexdigest() == manifest["hot_db_sha256"]
-
-    # Hot artifact is meaningfully smaller than the full artifact (no body FTS).
-    assert manifest["hot_db_compressed_bytes"] < manifest["db_compressed_bytes"]
-
-    assert result.hot_db_path is not None
     connection = sqlite3.connect(
-        f"file:{result.hot_db_path}?mode=ro&immutable=1", uri=True
+        f"file:{result.db_path}?mode=ro&immutable=1", uri=True
     )
     try:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
-
-        field_rows = connection.execute(
-            "SELECT name, role, type FROM dredge_fields ORDER BY name"
-        ).fetchall()
-        assert ("image", "store", "string") in field_rows
-        assert ("category", "facet", "string") in field_rows
-
-        # Store fields ride along on the hot documents table, same ids.
-        assert connection.execute(
-            "SELECT image FROM documents WHERE id = 1"
-        ).fetchone() == ("/images/alpha.jpg",)
-
-        fts_sql = connection.execute(
-            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'documents_fts'"
-        ).fetchone()[0]
-        assert "content=''" in fts_sql
+        # The one FTS index covers title and body.
         fts_columns = [
             row[1] for row in connection.execute("PRAGMA table_info(documents_fts)")
         ]
-        assert fts_columns == ["title", "hot_0"]
+        assert fts_columns == ["title", "body"]
 
         # Title tokens match.
         assert connection.execute(
             "SELECT COUNT(*) FROM documents_fts WHERE documents_fts MATCH ?",
             ("tombs",),
         ).fetchone()[0] == 1
-        # Hot-flagged search field text matches.
+        # Search-field text (from data-dredge-catalog) is folded into the body FTS.
         assert connection.execute(
             "SELECT d.id FROM documents_fts "
             "JOIN documents d ON d.id = documents_fts.rowid "
             "WHERE documents_fts MATCH ? ORDER BY d.id",
             ("zeta9000",),
         ).fetchall() == [(1,)]
-        # Body-only text does NOT match (body FTS content is absent from hot tier).
+        # Body content is searchable too.
         assert connection.execute(
             "SELECT COUNT(*) FROM documents_fts WHERE documents_fts MATCH ?",
             ("golden",),
-        ).fetchone()[0] == 0
-
-        # Facet tables and the title-nocase index ride along.
-        assert connection.execute(
-            "SELECT value FROM facet_tags WHERE document_id = 1 ORDER BY value"
-        ).fetchall() == [("ancient",), ("burial",)]
-        index_names = {
-            row[0]
-            for row in connection.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'index' "
-                "AND name NOT LIKE 'sqlite_autoindex%'"
-            )
-        }
-        assert "documents_title_nocase_idx" in index_names
-        assert "documents_category_idx" in index_names
+        ).fetchone()[0] == 1
     finally:
         connection.close()
 
 
-def test_compile_emits_title_only_hot_tier_without_hot_fields(tmp_path: Path) -> None:
-    config_path, _ = _write_fixture_project(tmp_path, hot_search_field=False)
+def test_compile_without_search_fields_indexes_title_and_body(tmp_path: Path) -> None:
+    config_path, _ = _write_fixture_project(tmp_path, search_field=False)
 
     result = compile_site(config_path)
 
-    assert result.manifest["hot_db_file"].startswith("search-hot.")
-    assert result.hot_db_path is not None
+    assert not any(key.startswith("hot_") for key in result.manifest)
     connection = sqlite3.connect(
-        f"file:{result.hot_db_path}?mode=ro&immutable=1", uri=True
+        f"file:{result.db_path}?mode=ro&immutable=1", uri=True
     )
     try:
         fts_columns = [
             row[1] for row in connection.execute("PRAGMA table_info(documents_fts)")
         ]
-        assert fts_columns == ["title"]
+        assert fts_columns == ["title", "body"]
         assert connection.execute(
             "SELECT COUNT(*) FROM documents_fts WHERE documents_fts MATCH ?",
             ("tombs",),
@@ -921,7 +885,7 @@ def _write_multi_page_site(
         "store_fields": {},
         "result_fields": ["title", "url", "description", "category"],
         "composite_indices": [],
-        "search_fields": [{"source": "data-dredge-catalog", "hot": True}],
+        "search_fields": [{"source": "data-dredge-catalog"}],
     }
     config_path = tmp_path / "dredge.config.json"
     config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
@@ -946,7 +910,6 @@ def test_parallel_and_serial_compiles_are_byte_identical(tmp_path: Path) -> None
 
     assert parallel.page_count == serial.page_count == 40
     assert parallel.manifest["db_sha256"] == serial.manifest["db_sha256"]
-    assert parallel.manifest["hot_db_sha256"] == serial.manifest["hot_db_sha256"]
 
 
 def test_parallel_extraction_preserves_warning_buckets(tmp_path: Path) -> None:
@@ -1021,7 +984,7 @@ def _write_fixture_project(
     index_attrs: str | None = None,
     include_descriptions: bool = True,
     client: dict[str, str] | None = None,
-    hot_search_field: bool = True,
+    search_field: bool = True,
 ) -> tuple[Path, Path]:
     source_dir = tmp_path / "site"
     output_dir = tmp_path / "search"
@@ -1128,8 +1091,8 @@ def _write_fixture_project(
         "result_fields": ["title", "url", "description", "category", "year", "image"],
         "composite_indices": [["category", "year"]],
     }
-    if hot_search_field:
-        config["search_fields"] = [{"source": "data-dredge-catalog", "hot": True}]
+    if search_field:
+        config["search_fields"] = [{"source": "data-dredge-catalog"}]
     if client is not None:
         config["client"] = client
     config_path = tmp_path / "dredge.config.json"

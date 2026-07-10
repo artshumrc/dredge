@@ -11,7 +11,7 @@ import type {
   LockRequestOptions,
   LocalBackend,
 } from "../src/coordination";
-import type { StatusFn, Tier } from "../src/db";
+import type { StatusFn } from "../src/db";
 import type { DredgeSearchRequest, DredgeSearchResponse } from "../src/search";
 import type { DredgeStatus } from "../src/protocol";
 
@@ -182,19 +182,9 @@ class FakeScheduler {
 // --- Fake local backend -------------------------------------------------------
 
 class FakeBackend implements LocalBackend {
-  tier: Tier;
   readonly searches: DredgeSearchRequest[] = [];
 
-  constructor(
-    readonly label: string,
-    tier: Tier = "full",
-  ) {
-    this.tier = tier;
-  }
-
-  getTier(): Tier {
-    return this.tier;
-  }
+  constructor(readonly label: string) {}
 
   search(request: DredgeSearchRequest): DredgeSearchResponse {
     this.searches.push(request);
@@ -202,7 +192,6 @@ class FakeBackend implements LocalBackend {
       total: 1,
       hits: [{ url: `${this.label}:${request.query ?? ""}` }],
       elapsedMs: 1,
-      tier: this.tier,
     };
   }
 }
@@ -215,8 +204,8 @@ interface TabControls {
   bootLocal: (onStatus: StatusFn) => Promise<LocalBackend>;
   bootCalls: number;
   backend: FakeBackend;
-  // Trigger a tier-progression status from inside the (leader) boot: the
-  // captured status callback is boot()'s own status sink.
+  // Trigger a status from inside the (leader) boot: the captured status callback
+  // is boot()'s own status sink.
   emitLeaderStatus: (status: DredgeStatus) => void;
   statuses: DredgeStatus[];
   scheduler: FakeScheduler;
@@ -226,9 +215,9 @@ function makeTab(
   hub: FakeChannelHub | undefined,
   locks: FakeLockManager | undefined,
   label: string,
-  options: { tier?: Tier; bootStatus?: DredgeStatus; relayTimeoutMs?: number } = {},
+  options: { bootStatus?: DredgeStatus; relayTimeoutMs?: number } = {},
 ): { start: () => Promise<CoordinatedSession>; controls: TabControls } {
-  const backend = new FakeBackend(label, options.tier ?? "full");
+  const backend = new FakeBackend(label);
   const scheduler = new FakeScheduler();
   const statuses: DredgeStatus[] = [];
   const controls: TabControls = {
@@ -300,13 +289,12 @@ describe("multi-tab leader election (CoordinationEnv seam)", () => {
     expect(follower.role).toBe("follower");
     // The follower downloaded nothing: it never booted a database.
     expect(tabB.controls.bootCalls).toBe(0);
-    // It learned the leader's tier and reports it.
-    expect(follower.getTier()).toBe("full");
+    // It learned the leader is serving and reports ready.
     expect(tabB.controls.statuses).toContain("ready");
 
     // A follower search is answered by the leader's backend and relayed back.
     const response = await follower.search({ query: "hello" });
-    expect(response).toMatchObject({ total: 1, tier: "full" });
+    expect(response).toMatchObject({ total: 1 });
     expect(response.hits[0].url).toBe("A:hello");
     // The leader ran it; the follower ran nothing locally.
     expect(tabA.controls.backend.searches).toEqual([{ query: "hello" }]);
@@ -399,36 +387,6 @@ describe("multi-tab leader election (CoordinationEnv seam)", () => {
     // Still a follower — it did NOT boot a 200 MB in-memory copy.
     expect(follower.role).toBe("follower");
     expect(tabB.controls.bootCalls).toBe(0);
-
-    leader.destroy();
-    follower.destroy();
-  });
-
-  it("mirrors the leader's Hot→Full tier swap to the follower", async () => {
-    const hub = new FakeChannelHub();
-    const locks = new FakeLockManager();
-    // Leader boots cold: opens on the Hot Tier.
-    const tabA = makeTab(hub, locks, "A", { tier: "hot", bootStatus: "ready_hot" });
-    const tabB = makeTab(hub, locks, "B");
-
-    const leader = await tabA.start();
-    const follower = await tabB.start();
-    expect(follower.getTier()).toBe("hot");
-    expect(tabB.controls.statuses).toContain("ready_hot");
-
-    // The leader's background Full Tier swaps in: its backend flips to full and
-    // boot() reports "ready" through the status sink the coordinator wrapped.
-    tabA.controls.backend.tier = "full";
-    tabA.controls.emitLeaderStatus("ready");
-    await flush();
-
-    // The follower now reads full and reports ready.
-    expect(follower.getTier()).toBe("full");
-    expect(tabB.controls.statuses).toContain("ready");
-
-    // A relayed search now carries tier "full", verbatim from the leader.
-    const response = await follower.search({ query: "x" });
-    expect(response.tier).toBe("full");
 
     leader.destroy();
     follower.destroy();

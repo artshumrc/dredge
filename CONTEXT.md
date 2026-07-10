@@ -18,16 +18,12 @@ The umbrella for facets and store fields. All fields share one namespace; a name
 **Field Role**:
 Whether a field is a `facet` or a `store` field, recorded in the shipped database's `dredge_fields` table so the runtime enforces it.
 
-**Hot Tier**:
-The small database fetched first on a cold visit (title + hot-flagged search fields, all result fields). Lives only in WASM memory; never persisted. Searches answered from it are tagged `tier: "hot"`.
-_Avoid_: hot shard, tier 1, mini index
+**Database Artifact**:
+The single SQLite database Dredge ships (body FTS included). A cold visitor downloads, verifies, and persists it to OPFS; a warm visitor reopens the OPFS copy directly. When OPFS is unavailable or over quota it opens in WASM memory for that session instead.
+_Avoid_: hot tier, full tier, shard
 
-**Full Tier**:
-The complete database (body FTS included). Persisted in OPFS; the only tier a warm visitor ever touches.
-_Avoid_: tier 2, main DB
-
-**Tier Swap**:
-The background transition from hot to full within a session: download, verify, import to OPFS, atomically switch the worker's handle, emit `ready`. Apps decide how to react.
+**Boot**:
+The worker bringing the database up on `init`: fetch the Manifest, then either open the cached OPFS copy (warm) or download → decompress → verify → persist → open (cold), emitting status up to `ready`.
 
 **Manifest**:
 `search-manifest.json` — the small, always-fetched JSON describing the current database artifact (file name, sha256, sizes, schema version).

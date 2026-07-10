@@ -1,12 +1,12 @@
 /// <reference lib="webworker" />
 
 import { browserBootEnv, browserCoordinationEnv } from "./browser-boot-env";
-import { boot, closeDatabase, getExec, getTier, loadValidatedManifest, WorkerError, toDredgeError } from "./db";
-import type { StatusFn, Tier } from "./db";
+import { boot, closeDatabase, getExec, loadValidatedManifest, WorkerError, toDredgeError } from "./db";
+import type { StatusFn } from "./db";
 import { startCoordinatedSession } from "./coordination";
 import type { CoordinatedSession, LocalBackend } from "./coordination";
 import { introspectSchema, search } from "./search";
-import type { DredgeSearchRequest, DredgeSearchResponse, SchemaInfo } from "./search";
+import type { DredgeSearchRequest, DredgeSearchResponse } from "./search";
 import type { DredgeError, DredgeStatus } from "./protocol";
 
 type WorkerRequest =
@@ -16,7 +16,7 @@ type WorkerRequest =
 
 type WorkerResponse =
   | { type: "status"; status: DredgeStatus; detail?: string }
-  | { type: "ready"; id: number; tier: Tier }
+  | { type: "ready"; id: number }
   | { type: "searchResult"; id: number; response: DredgeSearchResponse }
   | { type: "error"; id?: number; error: DredgeError };
 
@@ -42,21 +42,12 @@ async function bootLocal(onStatus: StatusFn): Promise<LocalBackend> {
   const useReset = reset;
   reset = false;
   await boot(manifestUrl, useReset, onStatus, browserBootEnv);
-  let schema: SchemaInfo | undefined;
-  let schemaTier: Tier | undefined;
+  // The worker opens the database exactly once per session, so the handle and
+  // its schema are stable — introspect once and reuse.
+  const exec = getExec();
+  const schema = introspectSchema(exec);
   return {
-    getTier: () => getTier(),
-    search: (request) => {
-      const exec = getExec();
-      const tier = getTier();
-      // Re-introspect when the Tier Swap flips the active handle so field roles
-      // and columns reflect the tier now serving searches.
-      if (!schema || schemaTier !== tier) {
-        schema = introspectSchema(exec);
-        schemaTier = tier;
-      }
-      return search(exec, schema, request, tier);
-    },
+    search: (request) => search(exec, schema, request),
   };
 }
 
@@ -76,7 +67,7 @@ self.onmessage = async (event: MessageEvent<WorkerRequest>) => {
         bootLocal,
         env: browserCoordinationEnv,
       });
-      post({ type: "ready", id: message.id, tier: session.getTier() });
+      post({ type: "ready", id: message.id });
     } catch (error) {
       status("failed");
       post({ type: "error", id: message.id, error: toDredgeError(error) });

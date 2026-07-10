@@ -258,7 +258,6 @@ class FacetConfig:
 @dataclass(frozen=True)
 class SearchFieldConfig:
     source: str
-    hot: bool = False
 
 
 @dataclass(frozen=True)
@@ -293,10 +292,6 @@ class DredgeConfig:
         return {field.name: field for field in (*self.facets, *self.store_fields)}
 
     @property
-    def hot_search_fields(self) -> tuple[SearchFieldConfig, ...]:
-        return tuple(field for field in self.search_fields if field.hot)
-
-    @property
     def scalar_facets(self) -> tuple[FacetConfig, ...]:
         return tuple(facet for facet in self.facets if not facet.is_array)
 
@@ -328,8 +323,6 @@ class ExtractedDocument:
     scalar_facets: dict[str, str | int | float | None]
     array_facets: dict[str, tuple[str, ...]]
     store_fields: dict[str, str | int | float | None]
-    # Per-hot-field extracted text, aligned to ``config.hot_search_fields``.
-    hot_search_texts: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -339,8 +332,6 @@ class CompileResult:
     manifest_path: Path
     manifest: dict[str, Any]
     page_count: int
-    hot_db_path: Path | None = None
-    hot_compressed_db_path: Path | None = None
     client_path: Path | None = None
     warnings: tuple[BuildWarning, ...] = dataclass_field(default_factory=tuple)
     skipped: tuple[SkippedFile, ...] = dataclass_field(default_factory=tuple)
@@ -566,9 +557,7 @@ def load_config(config_path: Path) -> DredgeConfig:
         "include": list(include),
         "exclude": list(exclude),
         "selectors": selectors,
-        "search_fields": [
-            {"source": field.source, "hot": field.hot} for field in search_fields
-        ],
+        "search_fields": [{"source": field.source} for field in search_fields],
         "facets": {
             facet.name: {
                 "type": facet.type,
@@ -773,10 +762,8 @@ def _compile_site(
     compact_db_path = temp_dir / "compact.db"
     warnings = _WarningCollector()
 
-    hot_compact_path = temp_dir / "hot-compact.db"
     try:
         smoke_token: str | None = None
-        smoke_title_token: str | None = None
         smoke_filter: tuple[str, str, str | int | float] | None = None
         connection = sqlite3.connect(build_db_path)
         try:
@@ -784,7 +771,6 @@ def _compile_site(
                 ui.set_phase("table_creation")
                 _configure_build_database(connection)
                 _create_tables(connection, config)
-                _create_hot_source_table(connection, config)
                 connection.commit()
             insert_sql = _document_insert_sql(config)
             array_insert_sql = {
@@ -792,7 +778,6 @@ def _compile_site(
                 "(document_id, value) VALUES (?, ?)"
                 for facet in config.array_facets
             }
-            hot_insert_sql = _hot_source_insert_sql(config)
             batches = _InsertBatches.for_config(config)
             reporter = (
                 None
@@ -815,8 +800,6 @@ def _compile_site(
                 ):
                     for record in warning_records:
                         warnings.add(**record)
-                    if smoke_title_token is None:
-                        smoke_title_token = _first_search_token(document.title)
                     if smoke_token is None:
                         smoke_token = _first_search_token(
                             document.title
@@ -832,15 +815,13 @@ def _compile_site(
                     build_db_bytes = None
                     if len(batches.documents) >= INSERT_BATCH_SIZE or report_due:
                         _flush_insert_batches(
-                            connection, insert_sql, array_insert_sql, batches,
-                            hot_insert_sql,
+                            connection, insert_sql, array_insert_sql, batches
                         )
                         if report_due:
                             build_db_bytes = _sqlite_database_size_bytes(connection)
                     if index % BATCH_SIZE == 0:
                         _flush_insert_batches(
-                            connection, insert_sql, array_insert_sql, batches,
-                            hot_insert_sql,
+                            connection, insert_sql, array_insert_sql, batches
                         )
                         connection.commit()
                         if reporter is not None:
@@ -854,7 +835,7 @@ def _compile_site(
                         reporter.maybe_report(index, build_db_bytes=build_db_bytes)
                     files_advance(index, build_db_bytes)
                 _flush_insert_batches(
-                    connection, insert_sql, array_insert_sql, batches, hot_insert_sql
+                    connection, insert_sql, array_insert_sql, batches
                 )
                 connection.commit()
                 final_db_bytes = _path_size(build_db_path)
@@ -872,13 +853,6 @@ def _compile_site(
                 ui.set_phase("index_creation")
                 _create_indexes(connection, config)
             connection.commit()
-            with metrics.phase("hot_build"):
-                ui.set_phase("hot_build")
-                _build_hot_database(build_db_path, hot_compact_path, config)
-            # Drop the build-only hot source before vacuuming so it never ships
-            # in the full artifact.
-            connection.execute("DROP TABLE IF EXISTS dredge_hot_source")
-            connection.commit()
             _finalize_database(connection, compact_db_path, metrics, ui)
         except Exception:
             connection.rollback()
@@ -894,18 +868,11 @@ def _compile_site(
             db_path = config.output_dir / uncompressed_file
             compact_db_path.replace(db_path)
 
-            hot_db_sha256 = _sha256_file(hot_compact_path)
-            hot_db_file = f"search-hot.{hot_db_sha256}.db.br"
-            hot_uncompressed_file = f"search-hot.{hot_db_sha256}.db"
-            hot_db_path = config.output_dir / hot_uncompressed_file
-            hot_compact_path.replace(hot_db_path)
-
         with metrics.phase("post_build_checks"):
             ui.set_phase("post_build_checks")
             payload_report = _run_post_build_checks(
                 db_path, config, smoke_token, smoke_filter, warnings
             )
-            _run_hot_post_build_checks(hot_db_path, smoke_title_token)
 
         with metrics.phase("compression"):
             ui.set_phase("compression")
@@ -918,13 +885,6 @@ def _compile_site(
                 quality=brotli_quality,
                 on_chunk=compress_advance,
             )
-            hot_compressed_db_path = config.output_dir / hot_db_file
-            hot_db_bytes = hot_db_path.stat().st_size
-            hot_db_compressed_bytes = _brotli_compress_file(
-                hot_db_path,
-                hot_compressed_db_path,
-                quality=brotli_quality,
-            )
 
         with metrics.phase("manifest_write"):
             ui.set_phase("manifest_write")
@@ -936,10 +896,6 @@ def _compile_site(
                 "db_bytes": db_bytes,
                 "db_compressed_bytes": db_compressed_bytes,
                 "db_compression": DB_COMPRESSION,
-                "hot_db_file": hot_db_file,
-                "hot_db_sha256": hot_db_sha256,
-                "hot_db_bytes": hot_db_bytes,
-                "hot_db_compressed_bytes": hot_db_compressed_bytes,
                 "sqlite_page_size": SQLITE_PAGE_SIZE,
                 "page_count": len(candidates),
                 "config_hash": config.config_hash,
@@ -977,8 +933,6 @@ def _compile_site(
             manifest_path=manifest_path,
             manifest=manifest,
             page_count=len(candidates),
-            hot_db_path=hot_db_path,
-            hot_compressed_db_path=hot_compressed_db_path,
             client_path=client_path,
             warnings=warning_tuple,
             skipped=skipped,
@@ -1026,23 +980,16 @@ def _load_search_fields(raw: dict[str, Any]) -> list[SearchFieldConfig]:
         raise BuildError("CONFIG_INVALID", "search_fields must be an array")
     fields: list[SearchFieldConfig] = []
     for index, item in enumerate(value, start=1):
-        hot = False
         if isinstance(item, str):
             source = item
         elif isinstance(item, dict):
-            unknown = sorted(set(item) - {"source", "hot"})
+            unknown = sorted(set(item) - {"source"})
             if unknown:
                 raise BuildError(
                     "CONFIG_INVALID",
                     f"unknown key(s) on search_fields[{index}]: {', '.join(unknown)}",
                 )
             source = item.get("source")
-            hot_value = item.get("hot", False)
-            if not isinstance(hot_value, bool):
-                raise BuildError(
-                    "CONFIG_INVALID", f"search_fields[{index}].hot must be a boolean"
-                )
-            hot = hot_value
         else:
             raise BuildError(
                 "CONFIG_INVALID",
@@ -1055,7 +1002,7 @@ def _load_search_fields(raw: dict[str, Any]) -> list[SearchFieldConfig]:
         _validate_selector_source(
             source.strip(), f"search_fields[{index}]", allow_direct_attribute=True
         )
-        fields.append(SearchFieldConfig(source=source.strip(), hot=hot))
+        fields.append(SearchFieldConfig(source=source.strip()))
     return fields
 
 
@@ -1298,38 +1245,6 @@ def _create_tables(connection: sqlite3.Connection, config: DredgeConfig) -> None
     _create_array_facet_tables(connection, config)
 
 
-def _create_hot_source_table(
-    connection: sqlite3.Connection, config: DredgeConfig
-) -> None:
-    """Build-only table capturing per-hot-field text for the hot tier's FTS.
-
-    Dropped before the full artifact is vacuumed, so it never ships. Only
-    created when the config declares at least one hot search field.
-    """
-    if not config.hot_search_fields:
-        return
-    columns = [
-        f"{_quote_identifier(_hot_fts_column_name(index))} TEXT"
-        for index in range(len(config.hot_search_fields))
-    ]
-    connection.execute(
-        "CREATE TABLE dredge_hot_source ("
-        f"document_id INTEGER PRIMARY KEY, {', '.join(columns)})"
-    )
-
-
-def _hot_source_insert_sql(config: DredgeConfig) -> str | None:
-    if not config.hot_search_fields:
-        return None
-    columns = ["document_id"] + [
-        _hot_fts_column_name(index)
-        for index in range(len(config.hot_search_fields))
-    ]
-    placeholders = ", ".join("?" for _ in columns)
-    sql_columns = ", ".join(_quote_identifier(column) for column in columns)
-    return f"INSERT INTO dredge_hot_source ({sql_columns}) VALUES ({placeholders})"
-
-
 def _create_indexes(connection: sqlite3.Connection, config: DredgeConfig) -> None:
     # Case-insensitive title index so match-all browse can stream results in
     # alphabetical order (ORDER BY title COLLATE NOCASE) without a full sort.
@@ -1372,7 +1287,6 @@ class _InsertBatches:
     documents: list[tuple[Any, ...]]
     fts: list[tuple[int, str, str]]
     array_facets: dict[str, list[tuple[int, str]]]
-    hot_source: list[tuple[Any, ...]]
 
     @classmethod
     def for_config(cls, config: DredgeConfig) -> _InsertBatches:
@@ -1380,7 +1294,6 @@ class _InsertBatches:
             documents=[],
             fts=[],
             array_facets={facet.name: [] for facet in config.array_facets},
-            hot_source=[],
         )
 
 
@@ -1405,8 +1318,6 @@ def _queue_document_insert(
         batches.array_facets[facet.name].extend(
             (document.id, value) for value in document.array_facets.get(facet.name, ())
         )
-    if config.hot_search_fields:
-        batches.hot_source.append((document.id, *document.hot_search_texts))
 
 
 def _flush_insert_batches(
@@ -1414,7 +1325,6 @@ def _flush_insert_batches(
     insert_sql: str,
     array_insert_sql: dict[str, str],
     batches: _InsertBatches,
-    hot_insert_sql: str | None = None,
 ) -> None:
     if batches.documents:
         connection.executemany(insert_sql, batches.documents)
@@ -1429,9 +1339,6 @@ def _flush_insert_batches(
         if rows:
             connection.executemany(array_insert_sql[facet_name], rows)
             rows.clear()
-    if hot_insert_sql is not None and batches.hot_source:
-        connection.executemany(hot_insert_sql, batches.hot_source)
-        batches.hot_source.clear()
 
 
 def _resolve_jobs(jobs: int | None, candidate_count: int) -> int:
@@ -1551,12 +1458,8 @@ def _extract_document(
 
     body_values = _extract_values(tree, config.selectors["body"])
     extra_search_values: list[str] = []
-    hot_search_texts: list[str] = []
     for field in config.search_fields:
-        field_values = _extract_values(tree, field.source)
-        extra_search_values.extend(field_values)
-        if field.hot:
-            hot_search_texts.append(_normalize_text(" ".join(field_values)))
+        extra_search_values.extend(_extract_values(tree, field.source))
     body = _normalize_text(" ".join((*body_values, *extra_search_values)))
     if not body_values:
         warnings.add(
@@ -1641,7 +1544,6 @@ def _extract_document(
         scalar_facets=scalar_facets,
         array_facets=array_facets,
         store_fields=store_fields,
-        hot_search_texts=tuple(hot_search_texts),
     )
 
 
@@ -1773,130 +1675,6 @@ def _finalize_database(
     with metrics.phase("vacuum_into"):
         ui.set_phase("vacuum_into")
         connection.execute(f"VACUUM INTO {_quote_sql_string(str(compact_db_path))}")
-
-
-def _create_hot_tables(connection: sqlite3.Connection, config: DredgeConfig) -> None:
-    document_columns = _documents_column_defs(config)
-    connection.execute(f"CREATE TABLE documents ({', '.join(document_columns)}) STRICT")
-    _create_dredge_fields_table(connection, config)
-    fts_columns = ", ".join(_quote_identifier(name) for name in _hot_fts_columns(config))
-    connection.execute(
-        f"CREATE VIRTUAL TABLE documents_fts USING fts5({fts_columns}, "
-        "content='', tokenize='unicode61 remove_diacritics 2')"
-    )
-    _create_array_facet_tables(connection, config)
-
-
-def _populate_hot_fts(connection: sqlite3.Connection, config: DredgeConfig) -> None:
-    """Insert the hot tier's contentless FTS rows from the attached full build.
-
-    Title comes from ``full.documents``; each hot-flagged search field's text
-    comes from the ``full.dredge_hot_source`` build-only table.
-    """
-    target_columns = ["rowid", *_hot_fts_columns(config)]
-    quoted_targets = ", ".join(_quote_identifier(name) for name in target_columns)
-    if config.hot_search_fields:
-        hot_selects = ", ".join(
-            f"h.{_quote_identifier(_hot_fts_column_name(index))}"
-            for index in range(len(config.hot_search_fields))
-        )
-        connection.execute(
-            f"INSERT INTO documents_fts ({quoted_targets}) "
-            f"SELECT d.id, d.title, {hot_selects} FROM full.documents d "
-            "LEFT JOIN full.dredge_hot_source h ON h.document_id = d.id"
-        )
-    else:
-        connection.execute(
-            f"INSERT INTO documents_fts ({quoted_targets}) "
-            "SELECT id, title FROM full.documents"
-        )
-
-
-def _build_hot_database(
-    build_db_path: Path, hot_compact_path: Path, config: DredgeConfig
-) -> None:
-    """Derive the Hot Tier database from the finished full build.
-
-    The hot database mirrors the full artifact — same ``documents`` columns and
-    ids, ``dredge_fields``, facet tables and indexes — but its FTS covers only
-    the title plus hot-flagged search fields, with no body content. It is built
-    by attaching the full build database read-only and copying forward; the
-    result is compacted with ``VACUUM INTO`` exactly like the full tier.
-    """
-    hot_build_path = build_db_path.parent / "hot-build.db"
-    hot_build_path.unlink(missing_ok=True)
-    connection = sqlite3.connect(hot_build_path)
-    try:
-        _configure_build_database(connection)
-        _create_hot_tables(connection, config)
-        _create_indexes(connection, config)
-        connection.commit()
-        connection.execute(
-            f"ATTACH DATABASE {_quote_sql_string(str(build_db_path))} AS full"
-        )
-        connection.execute("BEGIN")
-        document_columns = [
-            row[1] for row in connection.execute("PRAGMA table_info(documents)")
-        ]
-        column_list = ", ".join(_quote_identifier(name) for name in document_columns)
-        connection.execute(
-            f"INSERT INTO documents ({column_list}) "
-            f"SELECT {column_list} FROM full.documents"
-        )
-        # dredge_fields is populated from config by _create_dredge_fields_table.
-        for facet in config.array_facets:
-            table_name = _quote_identifier(_array_table_name(facet.name))
-            connection.execute(
-                f"INSERT INTO {table_name}(document_id, value) "
-                f"SELECT document_id, value FROM full.{table_name}"
-            )
-        _populate_hot_fts(connection, config)
-        connection.commit()
-        connection.execute("DETACH DATABASE full")
-        connection.execute("INSERT INTO documents_fts(documents_fts) VALUES('optimize')")
-        connection.execute("ANALYZE")
-        connection.execute("PRAGMA optimize")
-        connection.commit()
-        hot_compact_path.unlink(missing_ok=True)
-        connection.execute(
-            f"VACUUM INTO {_quote_sql_string(str(hot_compact_path))}"
-        )
-    except Exception:
-        connection.rollback()
-        raise
-    finally:
-        connection.close()
-        hot_build_path.unlink(missing_ok=True)
-
-
-def _run_hot_post_build_checks(
-    hot_db_path: Path, smoke_title_token: str | None
-) -> None:
-    connection = sqlite3.connect(f"file:{hot_db_path}?mode=ro&immutable=1", uri=True)
-    try:
-        integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
-        if integrity != "ok":
-            raise BuildError(
-                "HOT_DATABASE_INTEGRITY_CHECK_FAILED",
-                f"hot tier PRAGMA integrity_check returned {integrity!r}",
-            )
-        if smoke_title_token is None:
-            raise BuildError(
-                "HOT_SMOKE_QUERY_FAILED",
-                "could not find a title token for the hot tier FTS smoke query",
-            )
-        count = connection.execute(
-            "SELECT COUNT(*) FROM documents_fts WHERE documents_fts MATCH ?",
-            (smoke_title_token,),
-        ).fetchone()[0]
-        if count < 1:
-            raise BuildError(
-                "HOT_SMOKE_QUERY_FAILED",
-                f"hot tier FTS smoke query returned no rows for title token "
-                f"{smoke_title_token!r}",
-            )
-    finally:
-        connection.close()
 
 
 def format_payload_report(report: dict[str, Any]) -> str:
@@ -2422,17 +2200,6 @@ def _brotli_compress_file(
 
 def _array_table_name(facet_name: str) -> str:
     return f"facet_{facet_name}"
-
-
-def _hot_fts_column_name(index: int) -> str:
-    return f"hot_{index}"
-
-
-def _hot_fts_columns(config: DredgeConfig) -> list[str]:
-    return [
-        "title",
-        *(_hot_fts_column_name(index) for index in range(len(config.hot_search_fields))),
-    ]
 
 
 def _composite_index_name(index: tuple[str, ...]) -> str:

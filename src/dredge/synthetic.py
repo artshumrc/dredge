@@ -215,7 +215,7 @@ def _config(source_dir: Path, output_dir: Path) -> dict[str, object]:
             "description": "meta[name='description']@content",
         },
         "search_fields": [
-            {"source": "data-dredge-catalog", "hot": True},
+            {"source": "data-dredge-catalog"},
         ],
         "facets": {
             "category": {
