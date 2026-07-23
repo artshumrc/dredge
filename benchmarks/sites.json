@@ -1,0 +1,41 @@
+{
+  "small": {
+    "name": "darth-website",
+    "source": "~/repos/darth-website/dist",
+    "include": ["**/*.html"],
+    "exclude": ["assets/vendor/**", "pagefind/**"],
+    "title": "title",
+    "body": "main",
+    "search_fields": []
+  },
+  "medium": {
+    "name": "tsumeb-1",
+    "source": "~/repos/tsumeb-1/tsumeb/dist",
+    "include": ["objects/**/index.html"],
+    "exclude": [],
+    "title": "h1, title",
+    "body": "[data-pagefind-body]",
+    "search_fields": []
+  },
+  "large": {
+    "name": "amendments-project",
+    "source": "~/repos/amendments-project/amendments/static_site",
+    "include": ["amendments/**/index.html"],
+    "exclude": [],
+    "title": "h1, title",
+    "body": "main",
+    "search_fields": []
+  },
+  "xlarge": {
+    "name": "giza",
+    "source": "~/repos/giza/dist",
+    "include": ["**/full/index.html"],
+    "exclude": [],
+    "title": "meta[data-pagefind-meta='title[content]']@content",
+    "body": "[data-pagefind-body]",
+    "search_fields": [
+      "meta[data-pagefind-meta='catalog_id[content]']@content",
+      "meta[data-pagefind-meta='searchtext[content]']@content"
+    ]
+  }
+}

@@ -4,3 +4,4 @@ __pycache__/
 .stress/
 node_modules/
 .tracker
+benchmarks/dist/

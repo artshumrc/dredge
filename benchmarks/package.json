@@ -1,0 +1,27 @@
+{
+  "name": "dredge-search-benchmarks",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.33.2",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "prepare:corpus": "uv run --project .. python scripts/prepare.py",
+    "build": "node scripts/build.mjs",
+    "run:browser": "node scripts/run-browser.mjs",
+    "report": "node scripts/report.mjs",
+    "bench": "node scripts/bench.mjs",
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "@orama/orama": "3.1.18",
+    "flexsearch": "0.8.212",
+    "lunr": "2.3.9",
+    "pagefind": "1.5.2"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.8",
+    "playwright": "1.54.1"
+  }
+}
