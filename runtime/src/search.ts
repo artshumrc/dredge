@@ -342,6 +342,36 @@ function buildFilterClauses(
   return { sql, bind };
 }
 
+// Apply every active filter to each requested facet except that facet's own.
+// `requested.name` comes from the long-form facet aggregate below.
+function buildDisjunctiveFilterClauses(
+  schema: SchemaInfo,
+  filters: DredgeFilters,
+): WhereClause {
+  const sql: string[] = [];
+  const bind: unknown[] = [];
+  for (const [name, value] of Object.entries(filters)) {
+    if (value === undefined || value === null) {
+      continue;
+    }
+
+    let clause: WhereClause;
+    if (schema.scalarColumns.includes(name)) {
+      clause = scalarFilterClause(name, value);
+    } else if (schema.arrayFacets.has(name)) {
+      clause = arrayFilterClause(schema.arrayFacets.get(name)!, value);
+    } else {
+      throw invalidFieldError("FILTER_INVALID", schema, name, "filter");
+    }
+
+    if (clause.sql.length > 0) {
+      sql.push(`(requested.name = ? OR (${clause.sql.join(" AND ")}))`);
+      bind.push(name, ...clause.bind);
+    }
+  }
+  return { sql, bind };
+}
+
 function invalidFieldError(
   code: "FILTER_INVALID" | "QUERY_INVALID",
   schema: SchemaInfo,
@@ -487,40 +517,48 @@ function runSearch(
     return hit;
   });
 
-  // Facet counts: each facet is counted applying all filters EXCEPT its own.
+  // Normalize every requested facet to (ordinal, name, value) rows and aggregate
+  // them together. The candidate document set is materialized once, rather than
+  // re-scanned by one GROUP BY query per facet.
   let facets: Record<string, DredgeFacetBucket[]> | undefined;
-  const facetNames = facetNamesToCount(schema, request.includeFacets ?? false);
+  const facetNames = [...new Set(facetNamesToCount(schema, request.includeFacets ?? false))];
   if (facetNames.length > 0) {
-    facets = {};
+    facets = Object.fromEntries(facetNames.map((name) => [name, []]));
+    const valueCases: string[] = [];
+    const valueBind: unknown[] = [];
     for (const name of facetNames) {
-      const skipClause = buildFilterClauses(schema, filters, name);
-      const facetWhere = skipClause.sql.length ? `WHERE ${skipClause.sql.join(" AND ")}` : "";
-
+      valueBind.push(name);
       if (schema.scalarColumns.includes(name)) {
-        const col = `d.${quoteIdentifier(name)}`;
-        const rows = exec(
-          `SELECT ${col} AS value, COUNT(*) AS n ${from} ${facetWhere} ` +
-            `GROUP BY ${col} ORDER BY n DESC`,
-          skipClause.bind,
-        );
-        facets[name] = rows
-          .filter((row) => row[0] !== null)
-          .map((row) => ({ value: row[0] as string | number | boolean, count: Number(row[1]) }));
+        valueCases.push(`WHEN ? THEN json_array(d.${quoteIdentifier(name)})`);
       } else {
         const table = schema.arrayFacets.get(name)!;
-        const rows = exec(
-          `SELECT ft.value AS value, COUNT(*) AS n ` +
-            `FROM ${quoteIdentifier(table)} ft ` +
-            `JOIN documents d ON d.id = ft.document_id ` +
-            (usesFts ? `JOIN ${MATCH_TABLE} ON ${MATCH_TABLE}.id = d.id ` : "") +
-            `${facetWhere} GROUP BY ft.value ORDER BY n DESC`,
-          skipClause.bind,
+        valueCases.push(
+          `WHEN ? THEN (` +
+            `SELECT json_group_array(ft.value) FROM ${quoteIdentifier(table)} ft ` +
+            `WHERE ft.document_id = d.id)`,
         );
-        facets[name] = rows.map((row) => ({
-          value: row[0] as string | number | boolean,
-          count: Number(row[1]),
-        }));
       }
+    }
+
+    const disjunctiveClause = buildDisjunctiveFilterClauses(schema, filters);
+    const facetWhere = ["bucket.value IS NOT NULL", ...disjunctiveClause.sql];
+    const rows = exec(
+      `WITH base AS MATERIALIZED (SELECT d.* ${from}), ` +
+        `requested AS MATERIALIZED (` +
+        `SELECT CAST(key AS INTEGER) AS ordinal, value AS name FROM json_each(?)) ` +
+        `SELECT requested.name, bucket.value, COUNT(*) AS n ` +
+        `FROM base d CROSS JOIN requested ` +
+        `CROSS JOIN json_each(CASE requested.name ${valueCases.join(" ")} ELSE json('[]') END) bucket ` +
+        `WHERE ${facetWhere.join(" AND ")} ` +
+        `GROUP BY requested.ordinal, requested.name, bucket.value ` +
+        `ORDER BY requested.ordinal, n DESC`,
+      [JSON.stringify(facetNames), ...valueBind, ...disjunctiveClause.bind],
+    );
+    for (const row of rows) {
+      facets[String(row[0])].push({
+        value: row[1] as string | number | boolean,
+        count: Number(row[2]),
+      });
     }
   }
 

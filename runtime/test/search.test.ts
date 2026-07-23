@@ -89,7 +89,7 @@ describe("runtime search fixture", () => {
     }
   });
 
-  it("keeps facet counts under all-filters-except-own after single-pass", () => {
+  it("keeps scalar and array facet counts under all-filters-except-own", () => {
     const db = new DatabaseSync(fixtureDbPath());
     try {
       const exec = makeNodeSqliteExec(db);
@@ -98,7 +98,7 @@ describe("runtime search fixture", () => {
       const response = search(exec, schema, {
         query: "temple",
         filters: { category: "object" },
-        includeFacets: ["category", "year"],
+        includeFacets: ["category", "year", "tags"],
         limit: 0,
       });
 
@@ -114,6 +114,61 @@ describe("runtime search fixture", () => {
       // category filter and so sums to the filtered total.
       const yearTotal = (response.facets?.year ?? []).reduce((sum, b) => sum + b.count, 0);
       expect(yearTotal).toBe(32);
+      expect(response.facets?.tags).toEqual([
+        { value: "ritual", count: 8 },
+        { value: "inscription", count: 6 },
+        { value: "art", count: 5 },
+        { value: "military", count: 5 },
+        { value: "architecture", count: 4 },
+        { value: "domestic", count: 4 },
+        { value: "jewelry", count: 4 },
+        { value: "pottery", count: 4 },
+        { value: "tooling", count: 4 },
+        { value: "burial", count: 3 },
+        { value: "funerary", count: 3 },
+        { value: "religious", count: 3 },
+        { value: "royal", count: 3 },
+        { value: "trade", count: 2 },
+      ]);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("keeps all-facet p95 close to one-facet p95", () => {
+    const db = new DatabaseSync(fixtureDbPath());
+    try {
+      const base = makeNodeSqliteExec(db);
+      const exec: typeof base = (sql, bind) => {
+        // Model the fixed worker/WASM cost paid for every aggregation call. A
+        // single aggregate pays it once regardless of the requested dimensions.
+        if (/\bgroup\s+by\b/i.test(sql)) {
+          const until = performance.now() + 1;
+          while (performance.now() < until) {
+            // Intentionally synchronous: Exec is the worker's synchronous seam.
+          }
+        }
+        return base(sql, bind);
+      };
+      const schema = introspectSchema(exec);
+      const facetNames = [...schema.scalarColumns, ...schema.arrayFacets.keys()];
+
+      const measure = (includeFacets: string[]) => {
+        const samples: number[] = [];
+        for (let index = 0; index < 20; index += 1) {
+          const started = performance.now();
+          search(exec, schema, { query: "temple", includeFacets, limit: 0 });
+          samples.push(performance.now() - started);
+        }
+        samples.sort((left, right) => left - right);
+        return samples[Math.ceil(samples.length * 0.95) - 1];
+      };
+
+      measure(facetNames);
+      const oneFacetP95 = measure(facetNames.slice(0, 1));
+      const allFacetsP95 = measure(facetNames);
+
+      expect(allFacetsP95).toBeLessThan(oneFacetP95 * 2.5);
     } finally {
       db.close();
     }
