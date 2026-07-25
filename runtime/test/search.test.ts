@@ -1,12 +1,22 @@
-import { existsSync, readFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdtempSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 
 import { describe, expect, it } from "vitest";
 
-import { toDredgeError, validateManifest, verifyDatabaseHash } from "../src/db";
-import { introspectSchema, search } from "../src/search";
+import {
+  clearConnectionCaches,
+  closeDatabase,
+  setConnectionCacheClearer,
+  setSessionCacheClearer,
+  toDredgeError,
+  validateManifest,
+  verifyDatabaseHash,
+} from "../src/db";
+import type { DredgeSearchRequest, DredgeSearchResponse } from "../src/search";
+import { createSearchSession, introspectSchema, search } from "../src/search";
 import { makeNodeSqliteExec } from "./node-sqlite-exec";
 
 const fixtureRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..", "test-fixtures");
@@ -89,7 +99,32 @@ describe("runtime search fixture", () => {
     }
   });
 
-  it("keeps facet counts under all-filters-except-own after single-pass", () => {
+  it("prefix-matches only the final term of a multi-word query", () => {
+    const db = new DatabaseSync(fixtureDbPath());
+    try {
+      const exec = makeNodeSqliteExec(db);
+      const schema = introspectSchema(exec);
+
+      // "temp" is a strict prefix of the indexed word "temple" but is not itself
+      // an indexed term. As the final term it prefix-matches the temple docs; as
+      // a non-final term it is exact and matches none of them, so the same
+      // two-word query no longer finds them once "temp" leads.
+      const finalPrefix = search(exec, schema, { query: "stone temp", limit: 0 });
+      const leadingPrefix = search(exec, schema, { query: "temp stone", limit: 0 });
+
+      expect(finalPrefix.total).toBeGreaterThan(0);
+      expect(leadingPrefix.total).toBe(0);
+
+      // The same word alone still prefix-matches (single term is always final),
+      // so the drop is the non-final position, not the word.
+      const alone = search(exec, schema, { query: "temp", limit: 0 });
+      expect(alone.total).toBe(finalPrefix.total);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("keeps scalar and array facet counts under all-filters-except-own", () => {
     const db = new DatabaseSync(fixtureDbPath());
     try {
       const exec = makeNodeSqliteExec(db);
@@ -98,7 +133,7 @@ describe("runtime search fixture", () => {
       const response = search(exec, schema, {
         query: "temple",
         filters: { category: "object" },
-        includeFacets: ["category", "year"],
+        includeFacets: ["category", "year", "tags"],
         limit: 0,
       });
 
@@ -114,6 +149,104 @@ describe("runtime search fixture", () => {
       // category filter and so sums to the filtered total.
       const yearTotal = (response.facets?.year ?? []).reduce((sum, b) => sum + b.count, 0);
       expect(yearTotal).toBe(32);
+      expect(response.facets?.tags).toEqual([
+        { value: "ritual", count: 8 },
+        { value: "inscription", count: 6 },
+        { value: "art", count: 5 },
+        { value: "military", count: 5 },
+        { value: "architecture", count: 4 },
+        { value: "domestic", count: 4 },
+        { value: "jewelry", count: 4 },
+        { value: "pottery", count: 4 },
+        { value: "tooling", count: 4 },
+        { value: "burial", count: 3 },
+        { value: "funerary", count: 3 },
+        { value: "religious", count: 3 },
+        { value: "royal", count: 3 },
+        { value: "trade", count: 2 },
+      ]);
+      // Facets appear in the requested order, not sorted or reordered.
+      expect(Object.keys(response.facets ?? {})).toEqual(["category", "year", "tags"]);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("keeps disjunctive facet counts under an active array-facet filter", () => {
+    const db = new DatabaseSync(fixtureDbPath());
+    try {
+      const exec = makeNodeSqliteExec(db);
+      const schema = introspectSchema(exec);
+
+      // The active filter is an ARRAY facet (tags), so every other facet's count
+      // applies it as an EXISTS against `facet_tags` keyed by the match-table id.
+      const response = search(exec, schema, {
+        query: "temple",
+        filters: { tags: "ritual" },
+        includeFacets: ["category", "tags", "year"],
+        limit: 0,
+      });
+
+      // Filtered to tag=ritual, so the total counts only temple docs tagged ritual.
+      expect(response.total).toBe(10);
+      // The category facet is a non-own facet: it is constrained by the active
+      // array filter (applied as EXISTS on `facet_tags`) and so sums to the
+      // filtered total, with each bucket exactly the ritual-tagged distribution.
+      const category = Object.fromEntries(
+        (response.facets?.category ?? []).map((bucket) => [bucket.value, bucket.count]),
+      );
+      expect(category).toEqual({ object: 8, site: 1, publication: 1 });
+      const categoryTotal = (response.facets?.category ?? []).reduce((sum, b) => sum + b.count, 0);
+      expect(categoryTotal).toBe(response.total);
+      const yearTotal = (response.facets?.year ?? []).reduce((sum, b) => sum + b.count, 0);
+      expect(yearTotal).toBe(response.total);
+      // The tags facet skips its own filter (disjunctive), so it surfaces every
+      // tag among the "temple" matches and its `ritual` bucket equals the
+      // filtered total — the same value that constrains the other facets.
+      const ritualBucket = (response.facets?.tags ?? []).find((b) => b.value === "ritual");
+      expect(ritualBucket?.count).toBe(response.total);
+      expect((response.facets?.tags ?? []).length).toBeGreaterThan(1);
+      // Facets appear in requested order regardless of an array facet in the middle.
+      expect(Object.keys(response.facets ?? {})).toEqual(["category", "tags", "year"]);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("keeps all-facet p95 close to one-facet p95", () => {
+    const db = new DatabaseSync(fixtureDbPath());
+    try {
+      const base = makeNodeSqliteExec(db);
+      const exec: typeof base = (sql, bind) => {
+        // Model the fixed worker/WASM cost paid for every aggregation call. A
+        // single aggregate pays it once regardless of the requested dimensions.
+        if (/\bgroup\s+by\b/i.test(sql)) {
+          const until = performance.now() + 1;
+          while (performance.now() < until) {
+            // Intentionally synchronous: Exec is the worker's synchronous seam.
+          }
+        }
+        return base(sql, bind);
+      };
+      const schema = introspectSchema(exec);
+      const facetNames = [...schema.scalarColumns, ...schema.arrayFacets.keys()];
+
+      const measure = (includeFacets: string[]) => {
+        const samples: number[] = [];
+        for (let index = 0; index < 20; index += 1) {
+          const started = performance.now();
+          search(exec, schema, { query: "temple", includeFacets, limit: 0 });
+          samples.push(performance.now() - started);
+        }
+        samples.sort((left, right) => left - right);
+        return samples[Math.ceil(samples.length * 0.95) - 1];
+      };
+
+      measure(facetNames);
+      const oneFacetP95 = measure(facetNames.slice(0, 1));
+      const allFacetsP95 = measure(facetNames);
+
+      expect(allFacetsP95).toBeLessThan(oneFacetP95 * 2.5);
     } finally {
       db.close();
     }
@@ -131,6 +264,97 @@ describe("runtime search fixture", () => {
       for (const hit of response.hits) {
         expect(String(hit.title)).toContain("Temple");
       }
+    } finally {
+      db.close();
+    }
+  });
+
+  it("paginates relevance-ordered hits without dropping or duplicating across page boundaries", () => {
+    const db = new DatabaseSync(fixtureDbPath());
+    try {
+      const exec = makeNodeSqliteExec(db);
+      const schema = introspectSchema(exec);
+
+      // A broad keyword with many matches, so several full pages exist.
+      const full = search(exec, schema, { query: "temple", limit: 1000 });
+      expect(full.total).toBeGreaterThan(30);
+      expect(full.hits.length).toBe(full.total);
+      const reference = full.hits.map((hit) => ({ id: hit.id, score: hit.score }));
+
+      // Walking fixed-size pages reproduces the single-shot ordering exactly:
+      // same ids, same scores, no gaps or repeats at the page seams.
+      const limit = 7;
+      const walked: { id: unknown; score: unknown }[] = [];
+      for (let offset = 0; offset < full.total; offset += limit) {
+        const page = search(exec, schema, { query: "temple", limit, offset });
+        expect(page.total).toBe(full.total);
+        walked.push(...page.hits.map((hit) => ({ id: hit.id, score: hit.score })));
+      }
+      expect(walked).toEqual(reference);
+      expect(new Set(walked.map((h) => h.id)).size).toBe(reference.length);
+
+      // A deep offset returns exactly the tail of the reference ordering.
+      const deep = search(exec, schema, { query: "temple", limit, offset: full.total - 3 });
+      expect(deep.hits.map((hit) => hit.id)).toEqual(reference.slice(full.total - 3).map((h) => h.id));
+
+      // Past-the-end offset yields an empty page with the correct total; LIMIT 0
+      // is empty regardless of offset.
+      const past = search(exec, schema, { query: "temple", limit, offset: full.total + 50 });
+      expect(past.total).toBe(full.total);
+      expect(past.hits).toEqual([]);
+      const zero = search(exec, schema, { query: "temple", limit: 0, offset: 0 });
+      expect(zero.total).toBe(full.total);
+      expect(zero.hits).toEqual([]);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("paginates filtered relevance hits consistently with the single-shot page", () => {
+    const db = new DatabaseSync(fixtureDbPath());
+    try {
+      const exec = makeNodeSqliteExec(db);
+      const schema = introspectSchema(exec);
+
+      // Scalar filter (binds against the match table's materialized column).
+      const scalarFull = search(exec, schema, {
+        query: "temple",
+        filters: { category: "object" },
+        limit: 1000,
+      });
+      expect(scalarFull.hits.length).toBe(scalarFull.total);
+      const scalarRef = scalarFull.hits.map((hit) => hit.id);
+      const scalarWalked: unknown[] = [];
+      for (let offset = 0; offset < scalarFull.total; offset += 4) {
+        const page = search(exec, schema, {
+          query: "temple",
+          filters: { category: "object" },
+          limit: 4,
+          offset,
+        });
+        scalarWalked.push(...page.hits.map((hit) => hit.id));
+      }
+      expect(scalarWalked).toEqual(scalarRef);
+
+      // Array filter (EXISTS keyed by the match table id inside the page query).
+      const arrayFull = search(exec, schema, {
+        query: "temple",
+        filters: { tags: "ritual" },
+        limit: 1000,
+      });
+      expect(arrayFull.hits.length).toBe(arrayFull.total);
+      const arrayRef = arrayFull.hits.map((hit) => hit.id);
+      const arrayWalked: unknown[] = [];
+      for (let offset = 0; offset < arrayFull.total; offset += 3) {
+        const page = search(exec, schema, {
+          query: "temple",
+          filters: { tags: "ritual" },
+          limit: 3,
+          offset,
+        });
+        arrayWalked.push(...page.hits.map((hit) => hit.id));
+      }
+      expect(arrayWalked).toEqual(arrayRef);
     } finally {
       db.close();
     }
@@ -159,6 +383,188 @@ describe("runtime search fixture", () => {
       for (const hit of browse.hits) {
         expect(hit.score).toBe(0);
       }
+    } finally {
+      db.close();
+    }
+  });
+
+  it("scores explicit-sort keyword hits 0 while relevance keyword hits keep bm25", () => {
+    const db = new DatabaseSync(fixtureDbPath());
+    try {
+      const exec = makeNodeSqliteExec(db);
+      const schema = introspectSchema(exec);
+
+      const sorted = search(exec, schema, {
+        query: "temple",
+        sort: { field: "title" },
+        limit: 5,
+      });
+      expect(sorted.hits.length).toBeGreaterThan(0);
+      for (const hit of sorted.hits) {
+        expect(hit.score).toBe(0);
+      }
+      // Explicit sort orders by the requested column, not relevance.
+      const titles = sorted.hits.map((hit) => String(hit.title));
+      const sortedTitles = [...titles].sort((left, right) =>
+        left.toLowerCase().localeCompare(right.toLowerCase()),
+      );
+      expect(titles).toEqual(sortedTitles);
+
+      // Same query without a sort still ranks by bm25 (non-zero scores).
+      const relevance = search(exec, schema, { query: "temple", limit: 5 });
+      expect(relevance.total).toBe(sorted.total);
+      expect(relevance.hits.some((hit) => (hit.score as number) !== 0)).toBe(true);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("keeps a filtered total equal to that value's unfiltered facet bucket", () => {
+    const db = new DatabaseSync(fixtureDbPath());
+    try {
+      const exec = makeNodeSqliteExec(db);
+      const schema = introspectSchema(exec);
+
+      // Unfiltered counts for a keyword query: with no filters set, each bucket
+      // is the full count of that value among the matches.
+      const unfiltered = search(exec, schema, {
+        query: "temple",
+        includeFacets: ["category", "tags"],
+        limit: 0,
+      });
+
+      // Scalar facet: filtering to category=object must total that bucket.
+      const categoryBucket = (unfiltered.facets?.category ?? []).find(
+        (bucket) => bucket.value === "object",
+      );
+      expect(categoryBucket).toBeDefined();
+      const filteredCategory = search(exec, schema, {
+        query: "temple",
+        filters: { category: "object" },
+        limit: 0,
+      });
+      expect(filteredCategory.total).toBe(categoryBucket?.count);
+
+      // Array facet: filtering to a tag must total that tag's bucket, proving
+      // the count reads the match table via EXISTS with no `documents` join.
+      const tagBucket = (unfiltered.facets?.tags ?? []).find(
+        (bucket) => bucket.value === "ritual",
+      );
+      expect(tagBucket).toBeDefined();
+      const filteredTag = search(exec, schema, {
+        query: "temple",
+        filters: { tags: "ritual" },
+        limit: 0,
+      });
+      expect(filteredTag.total).toBe(tagBucket?.count);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("matches browse facet counts to an independent GROUP BY over documents", () => {
+    const db = new DatabaseSync(fixtureDbPath());
+    try {
+      const exec = makeNodeSqliteExec(db);
+      const schema = introspectSchema(exec);
+
+      // Browse: no keyword, no temp table. Scalar facets group `documents`
+      // directly, the array facet joins `facet_tags`. Every bucket must equal a
+      // plain independent aggregation and stay ordered by descending count.
+      const response = search(exec, schema, { includeFacets: true, limit: 0 });
+
+      for (const name of schema.scalarColumns) {
+        const expected = countMap(
+          exec,
+          `SELECT "${name}", COUNT(*) FROM documents WHERE "${name}" IS NOT NULL GROUP BY "${name}"`,
+        );
+        expectBuckets(response.facets?.[name], expected);
+      }
+      for (const [name, table] of schema.arrayFacets) {
+        const expected = countMap(
+          exec,
+          `SELECT ft.value, COUNT(*) FROM "${table}" ft ` +
+            `JOIN documents d ON d.id = ft.document_id GROUP BY ft.value`,
+        );
+        expectBuckets(response.facets?.[name], expected);
+      }
+    } finally {
+      db.close();
+    }
+  });
+
+  it("keeps browse disjunctive counts and filter consistency", () => {
+    const db = new DatabaseSync(fixtureDbPath());
+    try {
+      const exec = makeNodeSqliteExec(db);
+      const schema = introspectSchema(exec);
+
+      const unfiltered = search(exec, schema, {
+        includeFacets: ["category", "tags"],
+        limit: 0,
+      });
+      const objectBucket = (unfiltered.facets?.category ?? []).find((b) => b.value === "object");
+      expect(objectBucket).toBeDefined();
+
+      const filtered = search(exec, schema, {
+        filters: { category: "object" },
+        includeFacets: ["category", "year"],
+        limit: 0,
+      });
+      // Filtered total equals that value's bucket in the engine's own
+      // unfiltered counts.
+      expect(filtered.total).toBe(objectBucket?.count);
+      // The category facet skips its own filter (disjunctive), so it still
+      // surfaces every category rather than only `object`.
+      const filteredCategory = countMap(
+        exec,
+        "SELECT category, COUNT(*) FROM documents WHERE category IS NOT NULL GROUP BY category",
+      );
+      expectBuckets(filtered.facets?.category, filteredCategory);
+      // A non-own facet is constrained by the active filter and sums to total.
+      const yearTotal = (filtered.facets?.year ?? []).reduce((sum, b) => sum + b.count, 0);
+      expect(yearTotal).toBe(filtered.total);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("keeps multi-select IN and range filter totals consistent with buckets", () => {
+    const db = new DatabaseSync(fixtureDbPath());
+    try {
+      const exec = makeNodeSqliteExec(db);
+      const schema = introspectSchema(exec);
+
+      const unfiltered = search(exec, schema, {
+        query: "temple",
+        includeFacets: ["category", "year"],
+        limit: 0,
+      });
+      const category = bucketMap(unfiltered.facets?.category);
+      const year = bucketMap(unfiltered.facets?.year);
+
+      // Multi-select IN: filtered total equals the sum of the selected values'
+      // unfiltered buckets.
+      const inFilter = search(exec, schema, {
+        query: "temple",
+        filters: { category: ["object", "site"] },
+        limit: 0,
+      });
+      expect(inFilter.total).toBe((category.get("object") ?? 0) + (category.get("site") ?? 0));
+
+      // Range filter: filtered total equals the sum of the in-range buckets.
+      const inRange = search(exec, schema, {
+        query: "temple",
+        filters: { year: { min: 2000, max: 2024 } },
+        limit: 0,
+      });
+      let rangeSum = 0;
+      for (const [value, count] of year) {
+        if (Number(value) >= 2000 && Number(value) <= 2024) {
+          rangeSum += count;
+        }
+      }
+      expect(inRange.total).toBe(rangeSum);
     } finally {
       db.close();
     }
@@ -225,6 +631,483 @@ describe("database integrity verification", () => {
     });
   });
 });
+
+// Session memoization: the database is immutable for the life of a session, so
+// a cached response must be field-identical to a freshly computed one (except
+// elapsedMs), pagination over a cached match must reproduce a cold engine's
+// pages, interleaved requests must never observe each other's results, and the
+// close/reset seam must drop every cache so a changed database is never served
+// stale.
+describe("search session memoization", () => {
+  it("serves an exact repeat field-identically except elapsedMs", () => {
+    const db = new DatabaseSync(fixtureDbPath());
+    try {
+      const exec = makeNodeSqliteExec(db);
+      const schema = introspectSchema(exec);
+      const session = createSearchSession(exec, schema);
+      const request: DredgeSearchRequest = { query: "temple", limit: 5, includeFacets: true };
+
+      const first = session.search(request); // cold: computed
+      const second = session.search(request); // warm: served from the response cache
+
+      expect(typeof second.elapsedMs).toBe("number");
+      expect(stripElapsed(second)).toEqual(stripElapsed(first));
+      // The cache is unobservable to a cold stateless engine.
+      const cold = search(makeNodeSqliteExec(new DatabaseSync(fixtureDbPath())), schema, request);
+      expect(stripElapsed(first)).toEqual(stripElapsed(cold));
+    } finally {
+      db.close();
+    }
+  });
+
+  it("recomputes elapsedMs for the serving request on a cache hit", () => {
+    const db = new DatabaseSync(fixtureDbPath());
+    try {
+      const base = makeNodeSqliteExec(db);
+      // Inflate the cold computation's elapsed time. A response-cache hit touches
+      // no SQLite, so its elapsedMs is its own tiny measurement — unambiguously
+      // below the inflated cold time. Guards against a regression that returns the
+      // cached response verbatim (carrying the original's elapsedMs).
+      let slow = true;
+      const exec: typeof base = (sql, bind) => {
+        if (slow) {
+          const until = performance.now() + 5;
+          while (performance.now() < until) {
+            // Busy-wait per exec call so the cold search's elapsed time is large.
+          }
+        }
+        return base(sql, bind);
+      };
+      const schema = introspectSchema(exec);
+      const session = createSearchSession(exec, schema);
+      const request: DredgeSearchRequest = { query: "temple", limit: 5, includeFacets: true };
+
+      const first = session.search(request); // cold: several inflated exec calls
+      slow = false;
+      const second = session.search(request); // response-cache hit: no SQLite at all
+
+      expect(second.elapsedMs).toBeLessThan(first.elapsedMs);
+      expect(stripElapsed(second)).toEqual(stripElapsed(first));
+    } finally {
+      db.close();
+    }
+  });
+
+  it("paginates a cached match into the same pages a cold engine produces", () => {
+    const db = new DatabaseSync(fixtureDbPath());
+    const coldDb = new DatabaseSync(fixtureDbPath());
+    try {
+      const schema = introspectSchema(makeNodeSqliteExec(db));
+      const session = createSearchSession(makeNodeSqliteExec(db), schema);
+      const coldExec = makeNodeSqliteExec(coldDb);
+
+      const limit = 7;
+      const total = session.search({ query: "temple", limit: 0 }).total;
+      expect(total).toBeGreaterThan(30);
+      for (let offset = 0; offset < total + limit; offset += limit) {
+        const request: DredgeSearchRequest = {
+          query: "temple",
+          limit,
+          offset,
+          includeFacets: ["category", "tags"],
+        };
+        const paged = session.search(request);
+        const cold = search(coldExec, schema, request);
+        expect(stripElapsed(paged)).toEqual(stripElapsed(cold));
+      }
+    } finally {
+      db.close();
+      coldDb.close();
+    }
+  });
+
+  it("returns A's exact results after an A/B/A interleave", () => {
+    const db = new DatabaseSync(fixtureDbPath());
+    const coldDb = new DatabaseSync(fixtureDbPath());
+    try {
+      const schema = introspectSchema(makeNodeSqliteExec(db));
+      const session = createSearchSession(makeNodeSqliteExec(db), schema);
+      const coldExec = makeNodeSqliteExec(coldDb);
+
+      const a: DredgeSearchRequest = { query: "temple", limit: 5, includeFacets: ["category"] };
+      const b: DredgeSearchRequest = { query: "mask", limit: 3, includeFacets: ["year"] };
+      const coldA = search(coldExec, schema, a);
+      const coldB = search(coldExec, schema, b);
+
+      const a1 = session.search(a);
+      const b1 = session.search(b); // rebuilds the match table for B
+      const a2 = session.search(a); // response-cache hit: must be A, not B
+      // A re-run that misses the response cache (deeper page) rebuilds the match
+      // table back to A from B and must still be A's results, never B's.
+      const a3 = session.search({ ...a, offset: 2 });
+      const coldA3 = search(coldExec, schema, { ...a, offset: 2 });
+
+      expect(stripElapsed(a1)).toEqual(stripElapsed(coldA));
+      expect(stripElapsed(b1)).toEqual(stripElapsed(coldB));
+      expect(stripElapsed(a2)).toEqual(stripElapsed(coldA));
+      expect(stripElapsed(a3)).toEqual(stripElapsed(coldA3));
+    } finally {
+      db.close();
+      coldDb.close();
+    }
+  });
+
+  it("rebuilds with rank when a rank-needing request follows a rank-less cached match", () => {
+    const db = new DatabaseSync(fixtureDbPath());
+    const coldDb = new DatabaseSync(fixtureDbPath());
+    try {
+      const schema = introspectSchema(makeNodeSqliteExec(db));
+      const session = createSearchSession(makeNodeSqliteExec(db), schema);
+      const coldExec = makeNodeSqliteExec(coldDb);
+
+      // Explicit sort → the match table is materialized WITHOUT bm25 rank.
+      const sortedReq: DredgeSearchRequest = { query: "temple", sort: { field: "title" }, limit: 5 };
+      const sorted = session.search(sortedReq);
+      expect(stripElapsed(sorted)).toEqual(stripElapsed(search(coldExec, schema, sortedReq)));
+      for (const hit of sorted.hits) {
+        expect(hit.score).toBe(0);
+      }
+
+      // Same query with no sort now needs rank; the rank-less table cannot be
+      // reused, so it is rebuilt with rank and the hits carry real bm25 scores.
+      const rankedReq: DredgeSearchRequest = { query: "temple", limit: 5 };
+      const ranked = session.search(rankedReq);
+      expect(stripElapsed(ranked)).toEqual(stripElapsed(search(coldExec, schema, rankedReq)));
+      expect(ranked.hits.some((hit) => (hit.score as number) !== 0)).toBe(true);
+    } finally {
+      db.close();
+      coldDb.close();
+    }
+  });
+
+  it("never leaks results across interleaved queries, filters, facets, and browse", () => {
+    const db = new DatabaseSync(fixtureDbPath());
+    const coldDb = new DatabaseSync(fixtureDbPath());
+    try {
+      const schema = introspectSchema(makeNodeSqliteExec(db));
+      const session = createSearchSession(makeNodeSqliteExec(db), schema);
+      const coldExec = makeNodeSqliteExec(coldDb);
+
+      const requests: DredgeSearchRequest[] = [
+        { query: "temple", includeFacets: ["category"], limit: 3 },
+        { filters: { category: "object" }, includeFacets: ["tags"], limit: 4 },
+        { query: "temple", filters: { tags: "ritual" }, includeFacets: ["category", "year"], limit: 2 },
+        { query: "mask", limit: 5 },
+        { query: "temple", includeFacets: ["category"], limit: 3 },
+        { includeFacets: true, limit: 6 },
+        { query: "temple", sort: { field: "title" }, limit: 3 },
+        { query: "temple", limit: 3 },
+      ];
+
+      for (const request of requests) {
+        const got = session.search(request);
+        const want = search(coldExec, schema, request);
+        expect(stripElapsed(got)).toEqual(stripElapsed(want));
+      }
+    } finally {
+      db.close();
+      coldDb.close();
+    }
+  });
+
+  it("clears every cache on the close/reset seam so a changed database is never served stale", () => {
+    const scratch = join(mkdtempSync(join(tmpdir(), "dredge-reset-")), "reset.db");
+    copyFileSync(fixtureDbPath(), scratch);
+    const db = new DatabaseSync(scratch);
+    try {
+      const exec = makeNodeSqliteExec(db);
+      const schema = introspectSchema(exec);
+      const session = createSearchSession(exec, schema);
+      // Register the session behind the db.ts seam that closeDatabase() drives.
+      setSessionCacheClearer(() => session.clear());
+
+      const request: DredgeSearchRequest = { query: "uid50", limit: 5 };
+      const before = session.search(request);
+      expect(before.hits[0].title).toBe("Royal Mask 50");
+
+      // Mutate the stored document. The match set is unchanged (uid50 is not the
+      // title), only the display column.
+      db.exec("UPDATE documents SET title = 'Changed Title' WHERE title = 'Royal Mask 50'");
+
+      // Still served from the cache — deliberately, until invalidated.
+      expect(session.search(request).hits[0].title).toBe("Royal Mask 50");
+
+      // The close/reset seam drops the caches...
+      closeDatabase();
+
+      // ...so the next identical request re-reads the changed database.
+      expect(session.search(request).hits[0].title).toBe("Changed Title");
+    } finally {
+      setSessionCacheClearer(undefined);
+      db.close();
+    }
+  });
+});
+
+// Unfiltered-browse facet totals are corpus constants served from a per-facet
+// session map: buckets served from the map must be byte-identical to a cold
+// engine's, partial facet requests must compose (each facet computed once), an
+// active filter must bypass the map entirely, and close/reset must clear it so a
+// different database is never served stale totals.
+describe("browse facet totals cache", () => {
+  it("serves unfiltered browse facets identically on repeat and equal to a cold engine", () => {
+    const db = new DatabaseSync(fixtureDbPath());
+    const coldDb = new DatabaseSync(fixtureDbPath());
+    try {
+      const schema = introspectSchema(makeNodeSqliteExec(db));
+      const session = createSearchSession(makeNodeSqliteExec(db), schema);
+      const coldExec = makeNodeSqliteExec(coldDb);
+      const request: DredgeSearchRequest = { includeFacets: ["category", "tags", "year"], limit: 6 };
+
+      const first = session.search(request); // cold: computes each facet once
+      const second = session.search(request); // served from the map (and response cache)
+      const cold = search(coldExec, schema, request);
+
+      expect(stripElapsed(second)).toEqual(stripElapsed(first));
+      expect(stripElapsed(first)).toEqual(stripElapsed(cold));
+    } finally {
+      db.close();
+      coldDb.close();
+    }
+  });
+
+  it("composes partial facet requests, computing each facet only once", () => {
+    const db = new DatabaseSync(fixtureDbPath());
+    const coldDb = new DatabaseSync(fixtureDbPath());
+    try {
+      const base = makeNodeSqliteExec(db);
+      let groupBys = 0;
+      const exec: typeof base = (sql, bind) => {
+        if (/\bgroup\s+by\b/i.test(sql)) {
+          groupBys += 1;
+        }
+        return base(sql, bind);
+      };
+      const schema = introspectSchema(exec);
+      const session = createSearchSession(exec, schema);
+      const coldExec = makeNodeSqliteExec(coldDb);
+
+      const a: DredgeSearchRequest = { includeFacets: ["category"], limit: 0 };
+      const ab: DredgeSearchRequest = { includeFacets: ["category", "tags"], limit: 0 };
+      const b: DredgeSearchRequest = { includeFacets: ["tags"], limit: 0 };
+
+      groupBys = 0;
+      expect(stripElapsed(session.search(a))).toEqual(stripElapsed(search(coldExec, schema, a)));
+      expect(groupBys).toBe(1); // category aggregated once
+
+      groupBys = 0;
+      expect(stripElapsed(session.search(ab))).toEqual(stripElapsed(search(coldExec, schema, ab)));
+      expect(groupBys).toBe(1); // only tags is new; category is served from the map
+
+      groupBys = 0;
+      expect(stripElapsed(session.search(b))).toEqual(stripElapsed(search(coldExec, schema, b)));
+      expect(groupBys).toBe(0); // tags already in the map
+    } finally {
+      db.close();
+      coldDb.close();
+    }
+  });
+
+  it("bypasses the map for a filtered browse and leaves the map intact", () => {
+    const db = new DatabaseSync(fixtureDbPath());
+    const coldDb = new DatabaseSync(fixtureDbPath());
+    try {
+      const schema = introspectSchema(makeNodeSqliteExec(db));
+      const session = createSearchSession(makeNodeSqliteExec(db), schema);
+      const coldExec = makeNodeSqliteExec(coldDb);
+
+      // Populate the map with the unfiltered category buckets first.
+      const unfiltered: DredgeSearchRequest = { includeFacets: ["category"], limit: 0 };
+      expect(stripElapsed(session.search(unfiltered))).toEqual(
+        stripElapsed(search(coldExec, schema, unfiltered)),
+      );
+
+      // A filtered browse must not be served from the map: the constrained
+      // `year` total and the filtered result must equal a cold engine's.
+      const filtered: DredgeSearchRequest = {
+        filters: { category: "object" },
+        includeFacets: ["category", "year"],
+        limit: 0,
+      };
+      const got = session.search(filtered);
+      expect(stripElapsed(got)).toEqual(stripElapsed(search(coldExec, schema, filtered)));
+
+      // The populated map is untouched by the filtered request.
+      expect(stripElapsed(session.search(unfiltered))).toEqual(
+        stripElapsed(search(coldExec, schema, unfiltered)),
+      );
+    } finally {
+      db.close();
+      coldDb.close();
+    }
+  });
+
+  it("keeps the browse map across a connection swap while dropping the connection caches", () => {
+    // Ticket 04's memory→OPFS swap clears only the connection-scoped caches
+    // (match table, aggregates, responses) through db.ts's clearConnectionCaches
+    // seam; the browse facet-totals map is data about the same database and must
+    // survive. A keyword result must still be correct after the drop, and the
+    // browse totals must be served without re-aggregation.
+    const db = new DatabaseSync(fixtureDbPath());
+    const coldDb = new DatabaseSync(fixtureDbPath());
+    try {
+      const base = makeNodeSqliteExec(db);
+      let groupBys = 0;
+      const exec: typeof base = (sql, bind) => {
+        if (/\bgroup\s+by\b/i.test(sql)) {
+          groupBys += 1;
+        }
+        return base(sql, bind);
+      };
+      const schema = introspectSchema(exec);
+      const session = createSearchSession(exec, schema);
+      const coldExec = makeNodeSqliteExec(coldDb);
+      // Register the session behind the connection-only clearer the swap drives.
+      setConnectionCacheClearer(() => session.clearConnectionCaches());
+
+      const browse: DredgeSearchRequest = { includeFacets: ["category", "tags"], limit: 0 };
+      const keyword: DredgeSearchRequest = { query: "temple", includeFacets: ["category"], limit: 3 };
+
+      const browseBefore = session.search(browse); // populates the browse map
+      session.search(keyword); // populates match/aggregate/response caches
+
+      // Simulate the connection swap's cache handling.
+      clearConnectionCaches();
+
+      // The browse totals are still served from the surviving map — no GROUP BY.
+      groupBys = 0;
+      const browseAfter = session.search(browse);
+      expect(groupBys).toBe(0);
+      expect(stripElapsed(browseAfter)).toEqual(stripElapsed(browseBefore));
+
+      // The keyword caches were dropped, so the match table + aggregate recompute;
+      // the result stays field-identical to a cold engine's.
+      const keywordAfter = session.search(keyword);
+      expect(stripElapsed(keywordAfter)).toEqual(stripElapsed(search(coldExec, schema, keyword)));
+    } finally {
+      setConnectionCacheClearer(undefined);
+      db.close();
+      coldDb.close();
+    }
+  });
+
+  it("answers searches identically after the live connection is genuinely swapped", () => {
+    // Ticket 04's memory→OPFS swap replaces the underlying connection while the
+    // session keeps running, exactly as the worker wires it: the session's exec
+    // is an indirection to the *live* connection (search-worker.ts: (sql, bind)
+    // => getExec()(sql, bind)), and the swap installs a new exec. Drive that end
+    // to end — search, swap the exec onto a different physical handle, clear the
+    // connection caches, then search again — and assert the swapped connection
+    // serves results identical to pre-swap and to a cold engine, with the browse
+    // map surviving the swap.
+    const dbA = new DatabaseSync(fixtureDbPath());
+    const dbB = new DatabaseSync(fixtureDbPath());
+    const coldDb = new DatabaseSync(fixtureDbPath());
+    try {
+      let live = makeNodeSqliteExec(dbA);
+      const exec: typeof live = (sql, bind) => live(sql, bind);
+      const schema = introspectSchema(exec);
+      const session = createSearchSession(exec, schema);
+      setConnectionCacheClearer(() => session.clearConnectionCaches());
+
+      const keyword: DredgeSearchRequest = {
+        query: "temple",
+        limit: 5,
+        includeFacets: ["category", "tags"],
+      };
+      const browse: DredgeSearchRequest = { includeFacets: ["category"], limit: 6 };
+
+      const keywordBefore = session.search(keyword);
+      const browseBefore = session.search(browse); // populates the browse map on A
+
+      // Swap the live connection onto a genuinely different handle and run the
+      // connection-cache clear the swap performs.
+      live = makeNodeSqliteExec(dbB);
+      clearConnectionCaches();
+
+      const keywordAfter = session.search(keyword); // recomputed on B
+      const browseAfter = session.search(browse); // served from the surviving map
+      const coldExec = makeNodeSqliteExec(coldDb);
+
+      expect(stripElapsed(keywordAfter)).toEqual(stripElapsed(keywordBefore));
+      expect(stripElapsed(keywordAfter)).toEqual(stripElapsed(search(coldExec, schema, keyword)));
+      expect(stripElapsed(browseAfter)).toEqual(stripElapsed(browseBefore));
+    } finally {
+      setConnectionCacheClearer(undefined);
+      dbA.close();
+      dbB.close();
+      coldDb.close();
+    }
+  });
+
+  it("clears the browse map on close/reset so a changed database is not served stale", () => {
+    const scratch = join(mkdtempSync(join(tmpdir(), "dredge-browse-reset-")), "reset.db");
+    copyFileSync(fixtureDbPath(), scratch);
+    const db = new DatabaseSync(scratch);
+    try {
+      const exec = makeNodeSqliteExec(db);
+      const schema = introspectSchema(exec);
+      const session = createSearchSession(exec, schema);
+      setSessionCacheClearer(() => session.clear());
+
+      const request: DredgeSearchRequest = { includeFacets: ["category"], limit: 0 };
+      const objectCount = (name: DredgeSearchResponse) =>
+        (name.facets?.category ?? []).find((bucket) => bucket.value === "object")?.count;
+
+      const before = objectCount(session.search(request));
+      expect(before).toBeGreaterThan(0);
+
+      // Move one document out of the `object` category. The corpus constant has
+      // changed, but the map still serves the old bucket until invalidated.
+      db.exec(
+        "UPDATE documents SET category = 'site' " +
+          "WHERE id = (SELECT id FROM documents WHERE category = 'object' LIMIT 1)",
+      );
+      expect(objectCount(session.search(request))).toBe(before);
+
+      // The close/reset seam clears the map...
+      closeDatabase();
+
+      // ...so the next browse re-aggregates the changed database.
+      expect(objectCount(session.search(request))).toBe((before as number) - 1);
+    } finally {
+      setSessionCacheClearer(undefined);
+      db.close();
+    }
+  });
+});
+
+function stripElapsed(response: DredgeSearchResponse): Omit<DredgeSearchResponse, "elapsedMs"> {
+  const { elapsedMs: _elapsedMs, ...rest } = response;
+  return rest;
+}
+
+function countMap(exec: ReturnType<typeof makeNodeSqliteExec>, sql: string): Map<unknown, number> {
+  const map = new Map<unknown, number>();
+  for (const row of exec(sql)) {
+    map.set(row[0], Number(row[1]));
+  }
+  return map;
+}
+
+function bucketMap(
+  buckets: { value: string | number | boolean; count: number }[] | undefined,
+): Map<unknown, number> {
+  return new Map((buckets ?? []).map((bucket) => [bucket.value, bucket.count]));
+}
+
+// Assert a facet's buckets carry exactly the expected value->count pairs and are
+// ordered by descending count.
+function expectBuckets(
+  buckets: { value: string | number | boolean; count: number }[] | undefined,
+  expected: Map<unknown, number>,
+): void {
+  expect(bucketMap(buckets)).toEqual(expected);
+  const counts = (buckets ?? []).map((bucket) => bucket.count);
+  for (let i = 1; i < counts.length; i += 1) {
+    expect(counts[i]).toBeLessThanOrEqual(counts[i - 1]);
+  }
+}
 
 function expectErrorCode(fn: () => unknown, expected: { code: string; message: string }): void {
   try {

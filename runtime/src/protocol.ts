@@ -56,8 +56,15 @@ export interface BootTimings {
   manifestMs: number;
   downloadMs: number;
   decompressMs: number;
+  // Time spent writing the database to OPFS. On a cold visit this write is now
+  // deferred to the background (after `ready`), so this records the background
+  // write and is populated only once it completes; it is 0 while — or if — no
+  // OPFS write runs (warm visit, memory-only backend, quota-short device).
   writeOpfsMs: number;
   openMs: number;
+  // Time to `ready`: the point search can serve. On a cold visit this now ends
+  // at the in-memory open and excludes the deferred OPFS write (writeOpfsMs),
+  // which no longer sits on the path to the first search.
   totalMs: number;
   compressedBytes: number;
   decompressedBytes: number;

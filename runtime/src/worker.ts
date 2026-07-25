@@ -30,6 +30,12 @@ function status(status: DredgeStatus, detail?: string): void {
 
 async function init(manifestUrl: string, reset: boolean): Promise<BootTimings> {
   const session = await boot(manifestUrl, reset, status, browserBootEnv);
+  // Unlike the search worker (which serves the user the instant boot reports
+  // ready and lets persistence run detached), the harness awaits the deferred
+  // background persist so the reported timings carry the completed writeOpfsMs
+  // and the benchmark queries run against the swapped OPFS-backed connection —
+  // the representative steady state. totalMs was already captured at ready.
+  await session.persistence;
   return session.timings;
 }
 
