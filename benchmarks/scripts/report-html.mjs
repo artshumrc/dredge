@@ -36,7 +36,7 @@ const GLOSSARY = {
   filter_consistency: "If a visitor filters by a category value, does the result count match what that same value showed before the filter was applied? A mismatch means the filter is quietly losing matches.",
   example: "A real search from this test run, showing exactly what came back — the results and the count for each filter option.",
   mt_tabs: "How many browser tabs were open on the site at once, to see what happens when a visitor keeps several tabs open at the same time.",
-  mt_single: "How much memory just one browser tab uses.",
+  mt_single: "How much memory the heaviest of the open tabs uses on its own — for engines that elect one tab to hold the shared index, that's the leader; for the rest, every tab is about the same size anyway. Taken from this same multi-tab run (not a separate single-tab test), so it's directly comparable to the total next to it.",
   mt_total: "How much memory ALL the open tabs use, added together. Most engines load a full, separate copy of the search index into every tab, so memory use multiplies with each extra tab a visitor opens. Dredge instead keeps one shared copy across all of a visitor's tabs, so its total climbs much more slowly.",
   mt_p95: "How slow the worst-performing tab gets when every open tab is searching at the same moment — the worst wait a visitor sees with several tabs open.",
 };
@@ -169,7 +169,15 @@ function tableHtml(headerCells, rows) {
     const max = Math.max(...values);
     return min === max ? null : { min, max };
   });
-  const head = `<tr>${headerCells.map((cell) => `<th>${cell}</th>`).join("")}</tr>`;
+  // Any column with at least two comparable values is click-sortable — reruns
+  // the same best/worst-highlighted values in a new row order, nothing else
+  // changes, so the highlighting computed above stays correct after a sort.
+  const head = `<tr>${headerCells
+    .map((cell, index) => {
+      if (index === 0 || !columnStats[index]) return `<th>${cell}</th>`;
+      return `<th class="sortable" data-col="${index}" tabindex="0" role="button" aria-label="Sort by this column">${cell}<span class="sort-ind" aria-hidden="true"></span></th>`;
+    })
+    .join("")}</tr>`;
   const body = rows
     .map((row) => {
       const cells = row.cells
@@ -179,18 +187,21 @@ function tableHtml(headerCells, rows) {
           const classes = [];
           if (index === 0) classes.push("engine");
           const stats = columnStats[index];
+          let dataAttr = "";
           if (isObject && stats && cell.value != null) {
             if (cell.value === stats.min) classes.push("best");
             else if (cell.value === stats.max) classes.push("worst");
+            dataAttr = ` data-v="${cell.value}"`;
           }
           const attr = classes.length ? ` class="${classes.join(" ")}"` : "";
-          return `<td${attr}>${text}</td>`;
+          return `<td${attr}${dataAttr}>${text}</td>`;
         })
         .join("");
-      return `<tr${row.dredge ? ' class="row-dredge"' : ""}>${cells}</tr>`;
+      const rowClasses = [row.dredge && "row-dredge", row.caution && "row-caution"].filter(Boolean);
+      return `<tr${rowClasses.length ? ` class="${rowClasses.join(" ")}"` : ""}>${cells}</tr>`;
     })
     .join("");
-  return `<div class="scroll"><table>${head}${body}</table></div>`;
+  return `<div class="scroll"><table><thead>${head}</thead><tbody>${body}</tbody></table></div>`;
 }
 
 // Per-band column header: the label (with a tooltip carrying the band detail)
@@ -210,45 +221,14 @@ function banner(text, tip) {
   return `<div class="banner">${tip ? term(text, tip) : esc(text)}</div>`;
 }
 
-function rankingNoteHtml(engines) {
-  const models = engines
-    .map((engine) => {
-      const model = rankingModelFor(engine);
-      return `${esc(engine)} ${term(model.label, model.detail)}`;
-    })
-    .join(" · ");
-  return `<p class="ranking-note"><strong>Ranking in this timing:</strong> ${models}. Relevance quality is not measured.</p>`;
-}
-
+// Every table row shows an engine's ranking model as a small caption with its
+// own tooltip, so the per-table ranking callouts this used to require aren't
+// needed — the provenance travels with the row everywhere it appears.
 function engineCellHtml(engine) {
   const model = rankingModelFor(engine);
   return `${esc(engine)}<span class="engine-ranking">${term(model.label, model.detail)}</span>`;
 }
 
-function bm25NoteHtml(engines) {
-  return `<p class="ranking-note bm25-note"><strong>BM25-only view:</strong> ${esc(engines.join(", "))}. Non-BM25 engines are not eligible for best-in-column highlighting here; that is a capability boundary, not a failure.</p>`;
-}
-
-function explicitOrderNoteHtml(noKeyword = false) {
-  const verb = noKeyword ? "is not used" : "is replaced by the requested sort";
-  return `<p class="ranking-note"><strong>Order in this timing:</strong> alphabetical title. Native relevance ranking ${verb}.</p>`;
-}
-
-function rankingOverviewHtml(engines) {
-  const headers = ["Engine", "Keyword ranking model", "BM25-only view"];
-  const rows = engines.map((engine) => {
-    const model = rankingModelFor(engine);
-    return {
-      dredge: engine === "dredge",
-      cells: [
-        esc(engine),
-        `${term(model.label, model.detail)}<span class="model-detail">${esc(model.detail)}</span>`,
-        model.bm25 ? '<span class="ok">eligible</span>' : '<span class="muted">not eligible</span>',
-      ],
-    };
-  });
-  return `<section class="ranking-overview"><h2>Ranking models</h2><p class="units">Keyword timings include each engine's native relevance work. Raw timings compare complete product behaviour, not equivalent relevance quality.</p>${tableHtml(headers, rows)}</section>`;
-}
 
 // Measured on the build machine: index build cost and artifact size.
 function buildMachineSection(site, siteReport, engines) {
@@ -262,7 +242,7 @@ function buildMachineSection(site, siteReport, engines) {
   const rows = engines.map((engine) => {
     const item = siteReport.engines[engine];
     return {
-      dredge: engine === "dredge",
+      dredge: engine === "dredge", caution: engine === "flexsearch",
       cells: [
         engineCellHtml(engine),
         numCell(item?.build?.wall_ms, fmtNum(item?.build?.wall_ms, 1000)),
@@ -290,7 +270,7 @@ function deliveryInitSection(site, siteReport, engines) {
     const cold = coldOf(item);
     const warm = warmOf(item);
     return {
-      dredge: engine === "dredge",
+      dredge: engine === "dredge", caution: engine === "flexsearch",
       cells: [
         engineCellHtml(engine),
         miBCell(cold?.network_bytes),
@@ -304,7 +284,7 @@ function deliveryInitSection(site, siteReport, engines) {
   return `<h3>Delivery &amp; initialization</h3>${tableHtml(headers, rows)}`;
 }
 
-function latencySection(title, tip, site, siteReport, engines, { mode, filtered, bm25Only = false }) {
+function latencySection(title, tip, site, siteReport, engines, { mode, filtered }) {
   const workload = filtered ? siteReport.filtered_queries : siteReport.queries;
   const byLabelQuery = Object.fromEntries(workload.map((q) => [q.label, q]));
   const headers = [
@@ -314,12 +294,11 @@ function latencySection(title, tip, site, siteReport, engines, { mode, filtered,
   const rows = engines.map((engine) => {
     const slice = sliceByLabel(siteReport.engines[engine], { mode, filtered });
     return {
-      dredge: engine === "dredge",
+      dredge: engine === "dredge", caution: engine === "flexsearch",
       cells: [engineCellHtml(engine), ...workload.map((q) => cellHtml(slice[q.label]))],
     };
   });
-  const rankingNote = bm25Only ? bm25NoteHtml(engines) : rankingNoteHtml(engines);
-  return `<h3>${term(title, tip)} <span class="sub">${term("warm p95 ms", GLOSSARY.p95)}</span></h3>${rankingNote}${tableHtml(headers, rows)}`;
+  return `<h3>${term(title, tip)} <span class="sub">${term("warm p95 ms", GLOSSARY.p95)}</span></h3>${tableHtml(headers, rows)}`;
 }
 
 // How facet-count latency scales with the number of dimensions counted.
@@ -338,13 +317,13 @@ function facetScalingSection(site, siteReport, engines) {
           row.label === "broad" && row.facet_mode === mode && !row.filtered && row.page_size === 10,
       );
     return {
-      dredge: engine === "dredge",
+      dredge: engine === "dredge", caution: engine === "flexsearch",
       cells: [engineCellHtml(engine), cellHtml(at("none")), cellHtml(at("one")), cellHtml(at("all"))],
     };
   });
   const inventory = facetInventoryText(siteReport);
-  const note = inventory ? `<p class="units">${esc(inventory)}</p>` : "";
-  return `<h3>${term("Facet scaling — broad query", GLOSSARY.facet_scaling)} <span class="sub">${term("warm p95 ms", GLOSSARY.p95)}</span></h3>${rankingNoteHtml(engines)}${note}${tableHtml(headers, rows)}`;
+  const tip = inventory ? `${GLOSSARY.facet_scaling} This corpus has ${inventory}.` : GLOSSARY.facet_scaling;
+  return `<h3>${term("Facet scaling — broad query", tip)} <span class="sub">${term("warm p95 ms", GLOSSARY.p95)}</span></h3>${tableHtml(headers, rows)}`;
 }
 
 function paginationSection(site, siteReport, engines) {
@@ -354,7 +333,7 @@ function paginationSection(site, siteReport, engines) {
     const rows = engines.map((engine) => {
       const measurements = warmOf(siteReport.engines[engine])?.measurements ?? [];
       return {
-        dredge: engine === "dredge",
+        dredge: engine === "dredge", caution: engine === "flexsearch",
         cells: [
           engineCellHtml(engine),
           ...pageSizes.map((size) => {
@@ -370,7 +349,6 @@ function paginationSection(site, siteReport, engines) {
   };
   return (
     `<h3>${term("Pagination — broad query", GLOSSARY.pagination)} <span class="sub">${term("warm p95 ms", GLOSSARY.p95)}</span></h3>` +
-    rankingNoteHtml(engines) +
     tableFor("none") +
     tableFor("all")
   );
@@ -387,7 +365,7 @@ function deepPaginationSection(site, siteReport, engines) {
   const rows = engines.map((engine) => {
     const measurements = warmOf(siteReport.engines[engine])?.measurements ?? [];
     return {
-      dredge: engine === "dredge",
+      dredge: engine === "dredge", caution: engine === "flexsearch",
       cells: [
         engineCellHtml(engine),
         ...offsets.map((offset) => {
@@ -397,7 +375,7 @@ function deepPaginationSection(site, siteReport, engines) {
       ],
     };
   });
-  return `<h3>${term("Deep pagination — broad query", GLOSSARY.deep)} <span class="sub">${term("warm p95 ms", GLOSSARY.p95)}</span></h3>${rankingNoteHtml(engines)}${tableHtml(headers, rows)}`;
+  return `<h3>${term("Deep pagination — broad query", GLOSSARY.deep)} <span class="sub">${term("warm p95 ms", GLOSSARY.p95)}</span></h3>${tableHtml(headers, rows)}`;
 }
 
 // Sorted keyword: the broad query re-sorted alphabetically, with and without
@@ -412,9 +390,9 @@ function sortedSection(site, siteReport, engines) {
     const measurements = warmOf(siteReport.engines[engine])?.measurements ?? [];
     const at = (mode) =>
       measurements.find((row) => row.scenario === "sorted" && row.facet_mode === mode);
-    return { dredge: engine === "dredge", cells: [engineCellHtml(engine), cellHtml(at("none")), cellHtml(at("all"))] };
+    return { dredge: engine === "dredge", caution: engine === "flexsearch", cells: [engineCellHtml(engine), cellHtml(at("none")), cellHtml(at("all"))] };
   });
-  return `<h3>${term("Sorted keyword — broad + alphabetical title", GLOSSARY.sorted_keyword)} <span class="sub">${term("warm p95 ms", GLOSSARY.p95)}</span></h3>${explicitOrderNoteHtml()}${tableHtml(headers, rows)}`;
+  return `<h3>${term("Sorted keyword — broad + alphabetical title", GLOSSARY.sorted_keyword)} <span class="sub">${term("warm p95 ms", GLOSSARY.p95)}</span></h3>${tableHtml(headers, rows)}`;
 }
 
 // No-keyword alphabetical browse, with and without facet counts.
@@ -428,9 +406,9 @@ function browseSection(site, siteReport, engines) {
     const measurements = warmOf(siteReport.engines[engine])?.measurements ?? [];
     const at = (mode) =>
       measurements.find((row) => row.scenario === "browse" && row.facet_mode === mode);
-    return { dredge: engine === "dredge", cells: [engineCellHtml(engine), cellHtml(at("none")), cellHtml(at("all"))] };
+    return { dredge: engine === "dredge", caution: engine === "flexsearch", cells: [engineCellHtml(engine), cellHtml(at("none")), cellHtml(at("all"))] };
   });
-  return `<h3>${term("Browse — no keyword, alphabetical", GLOSSARY.browse)} <span class="sub">${term("warm p95 ms", GLOSSARY.p95)}</span></h3>${explicitOrderNoteHtml(true)}${tableHtml(headers, rows)}`;
+  return `<h3>${term("Browse — no keyword, alphabetical", GLOSSARY.browse)} <span class="sub">${term("warm p95 ms", GLOSSARY.p95)}</span></h3>${tableHtml(headers, rows)}`;
 }
 
 // Facet-count latency when a structured filter is already active (gap 3).
@@ -442,7 +420,7 @@ function filteredFacetSection(site, siteReport, engines) {
   const rows = engines.map((engine) => {
     const measurements = warmOf(siteReport.engines[engine])?.measurements ?? [];
     return {
-      dredge: engine === "dredge",
+      dredge: engine === "dredge", caution: engine === "flexsearch",
       cells: [
         engineCellHtml(engine),
         ...workload.map((q) => {
@@ -454,7 +432,7 @@ function filteredFacetSection(site, siteReport, engines) {
       ],
     };
   });
-  return `<h3>${term("Facet counts under an active filter", GLOSSARY.lat_facet)} <span class="sub">${term("warm p95 ms", GLOSSARY.p95)}</span></h3>${rankingNoteHtml(engines)}${tableHtml(headers, rows)}`;
+  return `<h3>${term("Facet counts under an active filter", GLOSSARY.lat_facet)} <span class="sub">${term("warm p95 ms", GLOSSARY.p95)}</span></h3>${tableHtml(headers, rows)}`;
 }
 
 // A worked example: a real query from this run and the actual facet counts it
@@ -514,11 +492,11 @@ function correctnessSection(site, siteReport, engines) {
   const rows = engines.map((engine) => {
     const correctness = siteReport.engines[engine]?.correctness ?? {};
     return {
-      dredge: engine === "dredge",
+      dredge: engine === "dredge", caution: engine === "flexsearch",
       cells: [engineCellHtml(engine), ...CORRECTNESS_COLUMNS.map(([key]) => mark(correctness[key]))],
     };
   });
-  return `<h3>Result correctness</h3><p class="ranking-note"><strong>Ranking:</strong> these checks validate totals, facets, filters, and explicit sorts; they do not evaluate relevance ordering or quality.</p>${tableHtml(headers, rows)}`;
+  return `<h3>${term("Result correctness", "These checks validate totals, facets, filters, and explicit sorts; they do not evaluate relevance ordering or quality.")}</h3>${tableHtml(headers, rows)}`;
 }
 
 function multiTabSection(site, siteReport, engines) {
@@ -532,17 +510,25 @@ function multiTabSection(site, siteReport, engines) {
   const rows = engines.map((engine) => {
     const item = siteReport.engines[engine];
     const multitab = item?.browser?.multitab;
-    const single = warmOf(item)?.memory?.bytes;
     if (!multitab?.pages?.length) {
-      return { dredge: engine === "dredge", cells: [engineCellHtml(engine), "–", miBCell(single), "–", "–"] };
+      const single = warmOf(item)?.memory?.bytes;
+      return { dredge: engine === "dredge", caution: engine === "flexsearch", cells: [engineCellHtml(engine), "–", miBCell(single), "–", "–"] };
     }
     const pages = multitab.pages;
     const mems = pages.map((page) => page.memory?.bytes).filter((v) => v != null);
+    // "Single" is the heaviest tab in THIS SAME run — the one actually holding
+    // the index (the leader, for engines that elect one) — not a separate
+    // standalone single-tab measurement. Mixing the two would be dishonest:
+    // Dredge's standalone tab and its multi-tab leader tab aren't guaranteed
+    // to carry identical memory, so comparing "Total" against an unrelated
+    // baseline could hide or fabricate the very multiplication this table
+    // exists to show.
+    const single = mems.length ? Math.max(...mems) : null;
     const total = mems.length ? mems.reduce((t, v) => t + v, 0) : null;
     const p95s = pages.map((page) => page?.measurements?.[0]?.p95_ms).filter((v) => v != null);
     const worstP95 = p95s.length ? Math.max(...p95s) : null;
     return {
-      dredge: engine === "dredge",
+      dredge: engine === "dredge", caution: engine === "flexsearch",
       cells: [
         engineCellHtml(engine),
         String(multitab.tabs),
@@ -552,7 +538,7 @@ function multiTabSection(site, siteReport, engines) {
       ],
     };
   });
-  return `<h3>${term("Multi-tab", "Several browser tabs open on the site at once. 'Total' adds up every tab's memory. Most engines load a full copy of the search index into every tab, so memory use multiplies with each tab a visitor opens — Dredge instead keeps one shared copy across all of a visitor's tabs. The p95 number is how slow the worst tab gets when every tab searches at the same time.")} memory &amp; latency</h3>${rankingNoteHtml(engines)}${tableHtml(headers, rows)}`;
+  return `<h3>${term("Multi-tab", "Several browser tabs open on the site at once. 'Total' adds up every tab's memory. Most engines load a full copy of the search index into every tab, so memory use multiplies with each tab a visitor opens — Dredge instead keeps one shared copy across all of a visitor's tabs. The p95 number is how slow the worst tab gets when every tab searches at the same time.")} memory &amp; latency</h3>${tableHtml(headers, rows)}`;
 }
 
 const CAVEATS = [
@@ -648,11 +634,18 @@ function engineColor(engine, engines) {
   return ENGINE_PALETTE[index % ENGINE_PALETTE.length];
 }
 
+// Hoverable/clickable: hovering or tapping an engine's name dims every other
+// engine's line across all charts sharing this legend (see the engine-line
+// highlight script at the bottom of the page), so a reader can trace one
+// engine through five overlapping lines without the others in the way.
 function engineLegend(engines) {
   const items = engines
-    .map((engine) => `<span class="lg"><i style="background:${engineColor(engine, engines)}"></i>${esc(engine)}</span>`)
+    .map(
+      (engine) =>
+        `<span class="lg" data-engine="${attr(engine)}" tabindex="0" role="button" aria-label="Highlight ${attr(engine)}"><i style="background:${engineColor(engine, engines)}"></i>${esc(engine)}</span>`,
+    )
     .join("");
-  return `<div class="legend">${items}</div>`;
+  return `<div class="legend engine-legend">${items}</div>`;
 }
 
 // Tick label for a power-of-ten value: 0.01, 1, 100, 1k, 10k...
@@ -662,18 +655,42 @@ function formatTick(v) {
   return String(parseFloat(v.toFixed(2)));
 }
 
+// A one-sentence, plain-English readout of the chart's rightmost (largest)
+// corpus: dredge's value against its closest non-dredge competitor there —
+// not the weakest competitor, so the comparison stays honest even when it's
+// unflattering. Returns "" if dredge or every competitor is missing a value.
+function scalingTakeaway(sites, valueFor, unitWord, verbs) {
+  if (!sites.length) return "";
+  const [siteKey, lastSite] = sites[sites.length - 1];
+  const dredgeValue = valueFor(lastSite.engines?.dredge);
+  const others = Object.keys(lastSite.engines ?? {})
+    .filter((engine) => engine !== "dredge")
+    .map((engine) => ({ engine, value: valueFor(lastSite.engines[engine]) }))
+    .filter((o) => o.value != null && o.value > 0);
+  if (dredgeValue == null || dredgeValue <= 0 || !others.length) return "";
+  const closest = others.reduce((a, b) => (b.value < a.value ? b : a));
+  const pages = (lastSite.page_count ?? 0).toLocaleString();
+  const siteLabel = esc(lastSite.label ?? siteKey);
+  const ratio = dredgeValue < closest.value ? closest.value / dredgeValue : dredgeValue / closest.value;
+  if (ratio < 1.05) {
+    return `<p class="takeaway">At <strong>${siteLabel}</strong> (${pages} pages), dredge is about the same as its closest competitor here, ${esc(closest.engine)} (${dredgeValue.toFixed(2)} vs. ${closest.value.toFixed(2)} ${esc(unitWord)}).</p>`;
+  }
+  const verb = dredgeValue < closest.value ? verbs.smaller : verbs.larger;
+  return `<p class="takeaway">At <strong>${siteLabel}</strong> (${pages} pages): dredge is <strong>${ratio.toFixed(1)}×</strong> ${verb} than its closest competitor here, ${esc(closest.engine)} (${dredgeValue.toFixed(2)} vs. ${closest.value.toFixed(2)} ${esc(unitWord)}).</p>`;
+}
+
 // A log-scale line chart, one line per engine, x-axis is the corpus (categorical,
 // since there are only a handful of sites): the shape that best shows how a
 // metric grows with corpus size across three-plus orders of magnitude — a bar
 // chart per corpus cannot show that trend at all. Values <= 0 or missing break
 // the line rather than being plotted at a false position.
-function scalingLineChart(title, tip, unit, sites, engines, valueFor) {
-  const width = CHART_W;
-  const height = 220;
-  const padLeft = 46;
-  const padRight = 14;
-  const padTop = 10;
-  const padBottom = 28;
+function scalingLineChart(title, tip, unit, unitWord, sites, engines, valueFor, verbs = { smaller: "smaller", larger: "bigger" }) {
+  const width = 980;
+  const height = 300;
+  const padLeft = 58;
+  const padRight = 24;
+  const padTop = 16;
+  const padBottom = 34;
   const plotW = width - padLeft - padRight;
   const plotH = height - padTop - padBottom;
 
@@ -699,7 +716,7 @@ function scalingLineChart(title, tip, unit, sites, engines, valueFor) {
       `<text x="${padLeft - 6}" y="${y.toFixed(1)}" class="ga" text-anchor="end" dominant-baseline="middle">${formatTick(10 ** p)}</text>`;
   }
   const xLabels = sites
-    .map(([, sr], i) => `<text x="${xAt(i).toFixed(1)}" y="${height - 8}" class="ga" text-anchor="middle">${esc(sr.label ?? "")}</text>`)
+    .map(([, sr], i) => `<text x="${xAt(i).toFixed(1)}" y="${height - 10}" class="ga" text-anchor="middle">${esc(sr.label ?? "")}</text>`)
     .join("");
 
   const lines = series
@@ -718,13 +735,16 @@ function scalingLineChart(title, tip, unit, sites, engines, valueFor) {
         const y = yAt(value);
         d += `${drawing ? "L" : "M"}${x.toFixed(1)} ${y.toFixed(1)} `;
         drawing = true;
-        dots += `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="${isDredge ? 3.5 : 2.5}" fill="${color}"><title>${esc(engine)} — ${esc(sites[i][1].label ?? sites[i][0])}: ${value.toFixed(2)}</title></circle>`;
+        dots += `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="${isDredge ? 5.5 : 4}" fill="${color}"><title>${esc(engine)} — ${esc(sites[i][1].label ?? sites[i][0])}: ${value.toFixed(2)}</title></circle>`;
       });
-      return `<path d="${d.trim()}" fill="none" stroke="${color}" stroke-width="${isDredge ? 2.6 : 1.6}"></path>${dots}`;
+      return `<g class="engine-line" data-engine="${attr(engine)}"><path d="${d.trim()}" fill="none" stroke="${color}" stroke-width="${isDredge ? 3.6 : 2.4}"></path>${dots}</g>`;
     })
     .join("");
 
-  return `<div class="chart-card"><h4 class="pane">${term(title, tip)} <span class="u">${esc(unit)}</span></h4><svg viewBox="0 0 ${width} ${height}" class="chart linechart" role="img" preserveAspectRatio="xMinYMin meet">${grid}${lines}${xLabels}</svg></div>`;
+  const takeaway = scalingTakeaway(sites, valueFor, unitWord, verbs);
+  const logScaleTip =
+    "Log scale: equal steps up the axis mean equal multiples, not equal amounts — needed here because the values span several orders of magnitude, and a regular axis would flatten every small-corpus difference to the bottom.";
+  return `<div class="chart-card chart-card-wide"><h4 class="pane">${term(title, tip)} <span class="u">${esc(unit)} · ${term("log scale", logScaleTip)}</span></h4>${takeaway}<svg viewBox="0 0 ${width} ${height}" class="chart linechart" role="img" preserveAspectRatio="xMinYMin meet">${grid}${lines}${xLabels}</svg></div>`;
 }
 
 function chartsSection(site, siteReport, engines) {
@@ -759,16 +779,16 @@ function chartsSection(site, siteReport, engines) {
     };
   });
 
-  const card = (title, tip, unit, body, ranking = false) =>
-    `<div class="chart-card"><h4 class="pane">${term(title, tip)} <span class="u">${esc(unit)}</span></h4>${ranking ? rankingNoteHtml(engines) : ""}${body}</div>`;
+  const card = (title, tip, unit, body) =>
+    `<div class="chart-card"><h4 class="pane">${term(title, tip)} <span class="u">${esc(unit)}</span></h4>${body}</div>`;
 
   return `<div class="chart-grid">
-    ${card("Faceted query latency", GLOSSARY.lat_facet, "warm p95 ms · lower is better", svgBars(series(broadAll)), true)}
+    ${card("Faceted query latency", GLOSSARY.lat_facet, "warm p95 ms · lower is better", svgBars(series(broadAll)))}
     ${card("Browser memory", GLOSSARY.warm_mem, "MiB · lower is better", svgBars(series((i) => mib(warmOf(i)?.memory?.bytes))))}
     ${card("Cold encoded response bytes", GLOSSARY.cold_bytes, "MiB · lower is better", svgBars(series((i) => mib(coldOf(i)?.network_bytes))))}
     ${card("Normalized index size (br q5)", GLOSSARY.normalized_brotli, "MiB · lower is better", svgBars(series((i) => mib(i?.artifact?.normalized_brotli_q5_bytes))))}
-    ${card("Facet scaling", GLOSSARY.facet_scaling, "warm p95 ms", legend(["none", "one", "all"]) + svgGroupedBars(scalingGroups, ["none", "one", "all"]), true)}
-    ${card("Pagination (all facets)", GLOSSARY.pagination, "warm p95 ms", legend(["10", "50", "100", "200"], "n=") + svgGroupedBars(pageGroups, ["10", "50", "100", "200"]), true)}
+    ${card("Facet scaling", GLOSSARY.facet_scaling, "warm p95 ms", legend(["none", "one", "all"]) + svgGroupedBars(scalingGroups, ["none", "one", "all"]))}
+    ${card("Pagination (all facets)", GLOSSARY.pagination, "warm p95 ms", legend(["10", "50", "100", "200"], "n=") + svgGroupedBars(pageGroups, ["10", "50", "100", "200"]))}
   </div>`;
 }
 
@@ -788,53 +808,44 @@ function scalingSection(report, engines) {
       head(sr.label ?? site, `The ${sr.label ?? site} corpus.`, `${(sr.page_count ?? 0).toLocaleString()} pages`),
     ),
   ];
-  const metricTable = (
-    title,
-    tip,
-    unit,
-    cellFor,
-    { ranking = false, bm25Only = false, onlyEngines = engines } = {},
-  ) => {
+  const metricTable = (title, tip, unit, cellFor, { onlyEngines = engines } = {}) => {
     const rows = onlyEngines.map((engine) => ({
-      dredge: engine === "dredge",
+      dredge: engine === "dredge", caution: engine === "flexsearch",
       cells: [engineCellHtml(engine), ...sites.map(([, sr]) => cellFor(sr.engines[engine]))],
     }));
-    const note = bm25Only
-      ? bm25NoteHtml(onlyEngines)
-      : ranking
-        ? rankingNoteHtml(onlyEngines)
-        : "";
-    return `<h3>${term(title, tip)} <span class="sub">${esc(unit)}</span></h3>${note}${tableHtml(headers, rows)}`;
+    return `<h3>${term(title, tip)} <span class="sub">${esc(unit)}</span></h3>${tableHtml(headers, rows)}`;
   };
   const richP95 = (item) => cellHtml(richP95Of(item));
   const bm25 = bm25Engines(engines);
   const chartGrid = `<div class="chart-grid scaling-charts">
-    ${scalingLineChart("Rich query latency", GLOSSARY.lat_facet, "warm p95 ms · log scale", sites, engines, (item) => richP95Of(item)?.p95_ms ?? null)}
-    ${scalingLineChart("Cold response bytes", GLOSSARY.cold_bytes, "MiB · log scale", sites, engines, (item) => divOrNull(coldOf(item)?.network_bytes, 1024 * 1024))}
-    ${scalingLineChart("Shipped artifact size", GLOSSARY.shipped, "MiB · log scale", sites, engines, (item) => divOrNull(item?.artifact?.shipped_bytes, 1024 * 1024))}
-    ${scalingLineChart("Warm tab memory", GLOSSARY.warm_mem, "MiB · log scale", sites, engines, (item) => divOrNull(warmOf(item)?.memory?.bytes, 1024 * 1024))}
+    ${scalingLineChart("Rich query latency", GLOSSARY.lat_facet, "warm p95 ms", "ms", sites, engines, (item) => richP95Of(item)?.p95_ms ?? null, { smaller: "faster", larger: "slower" })}
+    ${scalingLineChart("Cold response bytes", GLOSSARY.cold_bytes, "MiB", "MiB", sites, engines, (item) => divOrNull(coldOf(item)?.network_bytes, 1024 * 1024))}
+    ${scalingLineChart("Shipped artifact size", GLOSSARY.shipped, "MiB", "MiB", sites, engines, (item) => divOrNull(item?.artifact?.shipped_bytes, 1024 * 1024))}
+    ${scalingLineChart("Warm tab memory", GLOSSARY.warm_mem, "MiB", "MiB", sites, engines, (item) => divOrNull(warmOf(item)?.memory?.bytes, 1024 * 1024))}
   </div>`;
   return `
-<section class="scaling" id="scaling">
+<section class="scaling tabpanel" id="scaling" data-tab="scaling">
   <h2>Cross-corpus scaling <span class="pages">engines × corpus size — lower is better</span></h2>
-  <p class="units">The whole thesis, visualized and tabulated: how each engine scales from the smallest corpus to the largest. Charts use a log scale on the value axis because the spread across corpora runs to several orders of magnitude — a linear axis would flatten every small-corpus line to the bottom. Below, best value per table column is highlighted, worst de-emphasized.</p>
   ${engineLegend(engines)}
   ${chartGrid}
   ${metricTable("Index build time", GLOSSARY.build_s, "s", (item) => numCell(divOrNull(item?.build?.wall_ms, 1000), fmtNum(item?.build?.wall_ms, 1000)))}
   ${metricTable("Shipped artifact size", GLOSSARY.shipped, "MiB", (item) => miBCell(item?.artifact?.shipped_bytes))}
   ${metricTable("Cold response bytes", GLOSSARY.cold_bytes, "MiB", (item) => miBCell(coldOf(item)?.network_bytes))}
   ${metricTable("Cold initialization", GLOSSARY.cold_init, "ms", (item) => numCell(coldOf(item)?.init_ms, fmtNum(coldOf(item)?.init_ms)))}
-  ${metricTable("Rich query p95 — broad, all facets", GLOSSARY.lat_facet, "warm p95 ms", richP95, { ranking: true })}
-  ${bm25.length ? metricTable("BM25-only rich query p95 — broad, all facets", GLOSSARY.lat_facet, "warm p95 ms", richP95, { bm25Only: true, onlyEngines: bm25 }) : ""}
+  ${metricTable("Rich query p95 — broad, all facets", GLOSSARY.lat_facet, "warm p95 ms", richP95)}
+  ${bm25.length ? metricTable("BM25-only rich query p95 — broad, all facets", GLOSSARY.lat_facet, "warm p95 ms", richP95, { onlyEngines: bm25 }) : ""}
   ${metricTable("Warm tab memory", GLOSSARY.warm_mem, "MiB", (item) => miBCell(warmOf(item)?.memory?.bytes))}
 </section>`;
 }
 
 // Sticky in-page navigation: the scaling section plus one link per site.
+// Doubles as a tab switcher (see the tab script at the bottom of the page):
+// data-tab matches each panel's own data-tab, and href keeps plain anchor
+// navigation working with JavaScript disabled.
 function navHtml(report) {
-  const links = [`<a href="#scaling">Scaling</a>`];
+  const links = [`<a href="#scaling" data-tab="scaling">Scaling</a>`];
   for (const [site, sr] of Object.entries(report.sites)) {
-    links.push(`<a href="#site-${esc(site)}">${esc(sr.label ?? site)}</a>`);
+    links.push(`<a href="#site-${esc(site)}" data-tab="site-${esc(site)}">${esc(sr.label ?? site)}</a>`);
   }
   return `<nav class="sitenav">${links.join("")}</nav>`;
 }
@@ -847,7 +858,7 @@ export function renderHtml(report, engines) {
       const pages = siteReport.page_count?.toLocaleString?.() ?? siteReport.page_count;
       const bm25 = bm25Engines(engines);
       return `
-<section class="site" id="site-${esc(site)}">
+<section class="site tabpanel" id="site-${esc(site)}" data-tab="site-${esc(site)}">
   <h2>${esc(siteReport.label ?? site)} <span class="pages">${esc(pages)} pages</span></h2>
   ${exampleSection(site, siteReport, engines)}
   <div class="view tables">
@@ -859,7 +870,7 @@ export function renderHtml(report, engines) {
         ${banner("Measured in the browser (Chromium, localhost)", "Costs a visitor pays: bytes over the wire, initialization, query latency, and tab memory. Localhost removes bandwidth, so latency is compute-bound and the Cold ↓ column is the network-cost proxy.")}
         ${deliveryInitSection(site, siteReport, engines)}
         ${latencySection("Rich query latency — exact total + all facet counts", GLOSSARY.lat_facet, site, siteReport, engines, { mode: "all", filtered: false })}
-        ${bm25.length ? latencySection("BM25-only rich query latency — exact total + all facet counts", GLOSSARY.lat_facet, site, siteReport, bm25, { mode: "all", filtered: false, bm25Only: true }) : ""}
+        ${bm25.length ? latencySection("BM25-only rich query latency — exact total + all facet counts", GLOSSARY.lat_facet, site, siteReport, bm25, { mode: "all", filtered: false }) : ""}
         ${filteredFacetSection(site, siteReport, engines)}
         ${latencySection("Filtered query latency — no facet counts", GLOSSARY.lat_filtered, site, siteReport, engines, { mode: "none", filtered: true })}
         ${facetScalingSection(site, siteReport, engines)}
@@ -898,6 +909,7 @@ export function renderHtml(report, engines) {
   --card: #fafafb; --accent: #3b5bdb; --accent-soft: #eef2ff;
   --tip-bg: #1f2937; --tip-fg: #f3f4f6; --ok: #1f9d55; --bad: #d64545;
   --bar: #b9c2e8; --chart-1: #3b5bdb; --chart-2: #12b886; --chart-3: #e8963b; --chart-4: #ae3ec9; --chart-5: #d6336c;
+  --warn: #9a6700; --warn-soft: #fff6dc;
 }
 @media (prefers-color-scheme: dark) {
   :root {
@@ -905,6 +917,7 @@ export function renderHtml(report, engines) {
     --card: #1d1d22; --accent: #8aa0ff; --accent-soft: #23273a;
     --tip-bg: #f3f4f6; --tip-fg: #1f2937; --ok: #4ade80; --bad: #f87171;
     --bar: #3a4266; --chart-1: #8aa0ff; --chart-2: #38d9a9; --chart-3: #ffb454; --chart-4: #da77f2; --chart-5: #ff8fa3;
+    --warn: #ffcc66; --warn-soft: #332a10;
   }
 }
 :root[data-theme="dark"] {
@@ -912,12 +925,14 @@ export function renderHtml(report, engines) {
   --card: #1d1d22; --accent: #8aa0ff; --accent-soft: #23273a;
   --tip-bg: #f3f4f6; --tip-fg: #1f2937; --ok: #4ade80; --bad: #f87171;
   --bar: #3a4266; --chart-1: #8aa0ff; --chart-2: #38d9a9; --chart-3: #ffb454; --chart-4: #da77f2; --chart-5: #ff8fa3;
+  --warn: #ffcc66; --warn-soft: #332a10;
 }
 :root[data-theme="light"] {
   --bg: #ffffff; --fg: #1a1a1c; --muted: #6b6b72; --line: #e6e6ea;
   --card: #fafafb; --accent: #3b5bdb; --accent-soft: #eef2ff;
   --tip-bg: #1f2937; --tip-fg: #f3f4f6; --ok: #1f9d55; --bad: #d64545;
   --bar: #b9c2e8; --chart-1: #3b5bdb; --chart-2: #12b886; --chart-3: #e8963b; --chart-4: #ae3ec9; --chart-5: #d6336c;
+  --warn: #9a6700; --warn-soft: #fff6dc;
 }
 * { box-sizing: border-box; }
 body {
@@ -961,16 +976,7 @@ h3 .sub { color: var(--muted); font-weight: 400; font-size: .82rem; }
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace; margin-top: .15rem;
   max-width: 12ch; overflow: hidden; text-overflow: ellipsis;
 }
-.units { color: var(--muted); font-size: .76rem; margin: .1rem 0 .5rem; }
-.ranking-note {
-  margin: .25rem 0 .55rem; padding: .45rem .65rem; border-left: 3px solid var(--accent);
-  background: var(--accent-soft); color: var(--fg); font-size: .78rem;
-}
-.ranking-note .term { white-space: nowrap; }
 .engine-ranking { display: block; color: var(--muted); font-size: .7rem; font-weight: 400; }
-.model-detail { display: block; max-width: 48rem; color: var(--muted); font-size: .74rem; white-space: normal; }
-.ranking-overview { margin-top: 1.4rem; }
-.ranking-overview > h2 { font-size: 1.1rem; margin: 0 0 .2rem; }
 .muted { color: var(--muted); }
 .u { color: var(--muted); font-weight: 400; font-size: .74rem; }
 .scroll { overflow-x: auto; border: 1px solid var(--line); border-radius: 10px; }
@@ -980,8 +986,17 @@ th { background: var(--card); font-weight: 600; font-size: .82rem; position: sti
 th:first-child, td.engine { text-align: left; }
 td.engine { font-weight: 600; }
 tr:last-child td { border-bottom: none; }
+th.sortable { cursor: pointer; user-select: none; outline: none; }
+th.sortable:hover, th.sortable:focus { color: var(--accent); }
+.sort-ind { display: inline-block; width: 1em; color: var(--accent); font-size: .7em; }
 tr.row-dredge td { background: var(--accent-soft); }
 tr.row-dredge td.engine { box-shadow: inset 3px 0 0 var(--accent); }
+/* FlexSearch's rows: not a failure, but its numbers use a cheaper ranking
+   model than the other engines, which is part of why it's often fastest —
+   flagged so a reader doesn't read that speed as a fully apples-to-apples win. */
+tr.row-caution td { background: var(--warn-soft); }
+tr.row-caution td.engine { box-shadow: inset 3px 0 0 var(--warn); }
+tr.row-caution .engine-ranking { color: var(--warn); font-weight: 600; }
 .ok { color: var(--ok); font-weight: 700; }
 .bad { color: var(--bad); font-weight: 700; }
 /* Failure cell (timeout/error/skipped): distinct from a "–" not-measured cell. */
@@ -1021,11 +1036,26 @@ svg.chart .cl.hl { font-weight: 700; fill: var(--accent); }
 svg.chart .cv { fill: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
 svg.chart.linechart { overflow: visible; }
 svg.chart.linechart .gl { stroke: var(--line); stroke-width: 1; }
-svg.chart.linechart .ga { fill: var(--muted); font-size: 10px; font-variant-numeric: tabular-nums; }
-.scaling-charts { margin: .3rem 0 1.4rem; }
+svg.chart.linechart .ga { fill: var(--muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+/* Cross-corpus scaling charts: one full-width chart per row — the whole point
+   is to see a trend line across corpora, which a cramped multi-column grid
+   defeats. */
+.scaling-charts { display: grid; grid-template-columns: 1fr; gap: 1.4rem; margin: .3rem 0 1.6rem; }
+.chart-card-wide { padding: 1rem 1.3rem 1.4rem; }
+.chart-card-wide h4.pane { font-size: .92rem; }
+p.takeaway { margin: .1rem 0 .5rem; font-size: .88rem; color: var(--fg); }
+p.takeaway strong { color: var(--accent); }
+/* Engine-line highlighting: hovering/tapping a legend entry dims every other
+   engine's line on every chart sharing that legend. */
+.engine-line { transition: opacity .15s ease; }
+.engine-legend .lg { cursor: pointer; transition: opacity .15s ease, color .15s ease; border-radius: 5px; outline: none; }
+.engine-legend .lg:hover, .engine-legend .lg:focus { color: var(--fg); }
+.engine-line.dim { opacity: .12; }
+.engine-legend .lg.dim { opacity: .4; }
+.engine-legend .lg.pinned { color: var(--fg); font-weight: 700; }
 .legend { display: flex; flex-wrap: wrap; gap: .1rem .9rem; margin: .2rem 0 .1rem; }
-.legend .lg { display: inline-flex; align-items: center; gap: .3rem; color: var(--muted); font-size: .76rem; }
-.legend .lg i { width: 11px; height: 11px; border-radius: 3px; display: inline-block; }
+.legend .lg { display: inline-flex; align-items: center; gap: .35rem; color: var(--muted); font-size: .82rem; }
+.legend .lg i { width: 12px; height: 12px; border-radius: 3px; display: inline-block; }
 .legend-key { font-size: .8rem; color: var(--muted); margin: .5rem 0 0; }
 .legend-key .muted { color: var(--muted); }
 /* Sticky in-page navigation. */
@@ -1038,6 +1068,11 @@ svg.chart.linechart .ga { fill: var(--muted); font-size: 10px; font-variant-nume
   border-radius: 999px; border: 1px solid var(--line);
 }
 .sitenav a:hover, .sitenav a:focus { color: var(--accent); border-color: var(--accent); outline: none; }
+.sitenav a.active { background: var(--accent-soft); color: var(--accent); border-color: var(--accent); font-weight: 600; }
+/* Tab switching (progressive enhancement): a .tabpanel only disappears once
+   JavaScript has run and marked it .tab-hidden, so a no-JS visitor still gets
+   the original single scrolling page with every section visible. */
+.tabpanel.tab-hidden { display: none; }
 /* Cross-corpus scaling section (leads the page). */
 section.scaling { margin-top: 1.6rem; }
 section.scaling > h2 {
@@ -1064,8 +1099,6 @@ section.scaling > h2 .pages { color: var(--muted); font-weight: 400; font-size: 
 </header>
 
 ${navHtml(report)}
-
-${rankingOverviewHtml(engines)}
 
 <details class="howto">
   <summary>How to read this &amp; caveats</summary>
@@ -1125,6 +1158,103 @@ ${sections}
     var charts = document.body.classList.toggle("show-charts");
     viewToggle.textContent = charts ? "▤ tables" : "◧ charts";
   });
+
+  // Engine-line highlighting: hover previews, click pins (independent of the
+  // tooltip's own pin state above).
+  var legendItems = document.querySelectorAll(".engine-legend .lg[data-engine]");
+  var engineLines = document.querySelectorAll(".engine-line[data-engine]");
+  var pinnedEngine = null;
+  function highlight(engine) {
+    engineLines.forEach(function (el) {
+      el.classList.toggle("dim", !!engine && el.getAttribute("data-engine") !== engine);
+    });
+    legendItems.forEach(function (el) {
+      var mine = el.getAttribute("data-engine") === engine;
+      el.classList.toggle("dim", !!engine && !mine);
+      el.classList.toggle("pinned", !!pinnedEngine && mine);
+    });
+  }
+  legendItems.forEach(function (el) {
+    el.addEventListener("mouseenter", function () { if (!pinnedEngine) highlight(el.getAttribute("data-engine")); });
+    el.addEventListener("mouseleave", function () { if (!pinnedEngine) highlight(null); });
+    el.addEventListener("focus", function () { if (!pinnedEngine) highlight(el.getAttribute("data-engine")); });
+    el.addEventListener("blur", function () { if (!pinnedEngine) highlight(null); });
+    el.addEventListener("click", function () {
+      var engine = el.getAttribute("data-engine");
+      pinnedEngine = pinnedEngine === engine ? null : engine;
+      highlight(pinnedEngine);
+    });
+    el.addEventListener("keydown", function (e) {
+      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); el.click(); }
+    });
+  });
+
+  // Click-to-sort table columns: reorders rows by the clicked column's
+  // underlying numeric value; the best/worst highlighting was computed
+  // per-column at render time, so it stays correct after any reorder.
+  document.querySelectorAll("table").forEach(function (table) {
+    var headers = table.querySelectorAll("th.sortable");
+    headers.forEach(function (th) {
+      function sortBy() {
+        var col = Number(th.getAttribute("data-col"));
+        var asc = th.getAttribute("data-dir") !== "asc";
+        headers.forEach(function (h) {
+          h.removeAttribute("data-dir");
+          h.querySelector(".sort-ind").textContent = "";
+        });
+        th.setAttribute("data-dir", asc ? "asc" : "desc");
+        th.querySelector(".sort-ind").textContent = asc ? "▲" : "▼";
+        var tbody = table.querySelector("tbody");
+        var rows = Array.prototype.slice.call(tbody.querySelectorAll("tr"));
+        rows.sort(function (a, b) {
+          var av = a.children[col].getAttribute("data-v");
+          var bv = b.children[col].getAttribute("data-v");
+          if (av === null && bv === null) return 0;
+          if (av === null) return 1;
+          if (bv === null) return -1;
+          var diff = parseFloat(av) - parseFloat(bv);
+          return asc ? diff : -diff;
+        });
+        rows.forEach(function (row) { tbody.appendChild(row); });
+      }
+      // Capture phase: the header text is wrapped in a .term span whose own
+      // click handler calls stopPropagation (so pinning its tooltip doesn't
+      // also dismiss itself via the document-level click listener below).
+      // That would otherwise swallow every click before it reached a sort
+      // handler bound in the normal bubble phase.
+      th.addEventListener("click", sortBy, true);
+      th.addEventListener("keydown", function (e) {
+        if (e.key === "Enter" || e.key === " ") { e.preventDefault(); sortBy(); }
+      });
+    });
+  });
+
+  // Tab switcher: the sitenav pills swap which section is visible instead of
+  // just scrolling to it. Without JavaScript every panel stays visible and
+  // the links fall back to plain in-page anchors.
+  var tabLinks = document.querySelectorAll(".sitenav a[data-tab]");
+  var panels = document.querySelectorAll(".tabpanel");
+  function activateTab(tab) {
+    panels.forEach(function (panel) {
+      panel.classList.toggle("tab-hidden", panel.getAttribute("data-tab") !== tab);
+    });
+    tabLinks.forEach(function (a) {
+      a.classList.toggle("active", a.getAttribute("data-tab") === tab);
+    });
+  }
+  tabLinks.forEach(function (a) {
+    a.addEventListener("click", function (e) {
+      e.preventDefault();
+      var tab = a.getAttribute("data-tab");
+      activateTab(tab);
+      var panel = document.querySelector('.tabpanel[data-tab="' + tab + '"]');
+      if (panel) panel.scrollIntoView({ behavior: "smooth", block: "start" });
+      history.replaceState(null, "", "#" + tab);
+    });
+  });
+  var initialTab = (location.hash || "#scaling").slice(1);
+  if (!document.querySelector('.tabpanel[data-tab="' + initialTab + '"]')) initialTab = "scaling";
+  activateTab(initialTab);
 })();
 </script>
 </body>

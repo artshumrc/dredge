@@ -9,7 +9,8 @@ export const RANKING_MODELS = {
   },
   pagefind: {
     label: "custom relevance",
-    detail: "Pagefind's term-frequency, weighted-count, page-length, saturation, and term-similarity model; not BM25.",
+    detail:
+      "Pagefind's term-frequency, weighted-count, page-length, saturation, and term-similarity model — not BM25, but a comparably thorough relevance model in its own right. Unlike FlexSearch, this difference isn't a shortcut behind its timings.",
     bm25: false,
   },
   orama: {
@@ -19,7 +20,8 @@ export const RANKING_MODELS = {
   },
   flexsearch: {
     label: "positional scoring",
-    detail: "FlexSearch's document-position scoring slots (default resolution 9); not BM25 term-frequency/IDF scoring.",
+    detail:
+      "FlexSearch's document-position scoring slots (default resolution 9), not BM25 term-frequency/IDF scoring — a capability boundary, not a failure, but also part of why FlexSearch runs fastest in these timings. Its numbers aren't a fully apples-to-apples comparison with the BM25 engines.",
     bm25: false,
   },
   lunr: {

@@ -164,12 +164,10 @@ test("Markdown renders ✗ for a failed cell and – for an absent one", () => {
   assert.match(md, /\| flexsearch \(positional scoring\) \| - \|/);
 });
 
-test("HTML puts ranking provenance before scaling and sites, with sticky nav", () => {
+test("HTML puts scaling before per-site sections, with sticky nav", () => {
   const html = renderHtml(fixtureReport(), ENGINES);
-  const ranking = html.indexOf('class="ranking-overview"');
   const scaling = html.indexOf('id="scaling"');
-  const firstSite = html.indexOf('class="site"');
-  assert.ok(ranking > -1 && ranking < scaling, "ranking overview precedes scaling");
+  const firstSite = html.indexOf('id="site-');
   assert.ok(scaling > -1, "scaling section present");
   assert.ok(firstSite > -1 && scaling < firstSite, "scaling precedes the per-site sections");
   assert.match(html, /Cold response bytes/);
@@ -181,23 +179,40 @@ test("both reports disclose ranking models wherever benchmark results are shown"
   const html = renderHtml(fixtureReport(), ENGINES);
   const md = renderMarkdown(fixtureReport(), ENGINES);
 
-  assert.match(html, /Ranking models/);
   assert.match(html, /FlexSearch's document-position scoring slots/);
   assert.match(md, /flexsearch \| positional scoring:/);
   assert.match(md, /not BM25 term-frequency\/IDF scoring/);
 
-  // Engine labels retain ranking provenance even in build/delivery tables, and
-  // query-bearing sections repeat a local callout rather than relying on the
-  // overview alone.
+  // Engine labels retain ranking provenance even in build/delivery tables — in
+  // HTML as a per-row caption (with its own tooltip); Markdown has no tooltips,
+  // so it still repeats a local callout in every query-bearing section instead.
   assert.match(html, /dredge<span class="engine-ranking">/);
-  assert.ok((html.match(/Ranking in this timing:/g) ?? []).length >= 5);
   assert.match(md, /\| dredge \(BM25\) \| 1\.00 \|/);
   assert.ok((md.match(/\*\*Ranking in this timing:\*\*/g) ?? []).length >= 5);
 
-  assert.match(html, /Order in this timing:<\/strong> alphabetical title/);
   assert.match(md, /Order in this timing:\*\* alphabetical title/);
   assert.match(html, /they do not evaluate relevance ordering or quality/);
   assert.match(md, /Ranking is not evaluated by these checks/);
+});
+
+test("FlexSearch rows are flagged as a ranking-model caution, not just tooltipped", () => {
+  const html = renderHtml(fixtureReport(), ENGINES);
+  // There is no separate "which engines use BM25" overview table anymore —
+  // instead every row FlexSearch appears in is visually flagged, since its
+  // cheaper ranking model is part of why it's often the fastest.
+  assert.doesNotMatch(html, /Ranking models/);
+  assert.match(html, /class="row-caution"/);
+  assert.match(html, /why FlexSearch runs fastest in these timings/);
+  // Dredge (BM25, no caveat) never gets the caution treatment.
+  assert.doesNotMatch(html, /class="row-dredge row-caution"/);
+  assert.doesNotMatch(html, /class="row-caution row-dredge"/);
+});
+
+test("pagefind gets a plain note (not a caution) for its non-BM25 ranking", () => {
+  // Pagefind ranks well despite not being BM25, unlike FlexSearch's simpler
+  // model — it should read as a disclosure, not a warning.
+  assert.match(rankingModelFor("pagefind").detail, /isn't a shortcut behind its timings/);
+  assert.equal(rankingModelFor("pagefind").bm25, false);
 });
 
 test("BM25-only rich-query views exclude non-BM25 engines without marking failure", () => {
