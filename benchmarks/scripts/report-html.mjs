@@ -861,32 +861,28 @@ export function renderHtml(report, engines) {
 <section class="site tabpanel" id="site-${esc(site)}" data-tab="site-${esc(site)}">
   <h2>${esc(siteReport.label ?? site)} <span class="pages">${esc(pages)} pages</span></h2>
   ${exampleSection(site, siteReport, engines)}
-  <div class="view tables">
-    <details class="site-detail">
-      <summary>Full tables — build, delivery, latency, correctness, multi-tab</summary>
-      <div class="site-detail-inner">
-        ${banner("Measured on the build machine", "Costs paid once when the site is built — not by a visitor. Index build time, indexer peak memory, and the deployable artifact size.")}
-        ${buildMachineSection(site, siteReport, engines)}
-        ${banner("Measured in the browser (Chromium, localhost)", "Costs a visitor pays: bytes over the wire, initialization, query latency, and tab memory. Localhost removes bandwidth, so latency is compute-bound and the Cold ↓ column is the network-cost proxy.")}
-        ${deliveryInitSection(site, siteReport, engines)}
-        ${latencySection("Rich query latency — exact total + all facet counts", GLOSSARY.lat_facet, site, siteReport, engines, { mode: "all", filtered: false })}
-        ${bm25.length ? latencySection("BM25-only rich query latency — exact total + all facet counts", GLOSSARY.lat_facet, site, siteReport, bm25, { mode: "all", filtered: false }) : ""}
-        ${filteredFacetSection(site, siteReport, engines)}
-        ${latencySection("Filtered query latency — no facet counts", GLOSSARY.lat_filtered, site, siteReport, engines, { mode: "none", filtered: true })}
-        ${facetScalingSection(site, siteReport, engines)}
-        ${sortedSection(site, siteReport, engines)}
-        ${browseSection(site, siteReport, engines)}
-        ${paginationSection(site, siteReport, engines)}
-        ${deepPaginationSection(site, siteReport, engines)}
-        ${latencySection("Plain query latency — diagnostic", GLOSSARY.lat_plain, site, siteReport, engines, { mode: "none", filtered: false })}
-        ${correctnessSection(site, siteReport, engines)}
-        ${multiTabSection(site, siteReport, engines)}
-      </div>
-    </details>
-  </div>
-  <div class="view charts">
-    ${chartsSection(site, siteReport, engines)}
-  </div>
+  ${chartsSection(site, siteReport, engines)}
+  <details class="site-detail">
+    <summary>Full tables — build, delivery, latency, correctness, multi-tab</summary>
+    <div class="site-detail-inner">
+      ${banner("Measured on the build machine", "Costs paid once when the site is built — not by a visitor. Index build time, indexer peak memory, and the deployable artifact size.")}
+      ${buildMachineSection(site, siteReport, engines)}
+      ${banner("Measured in the browser (Chromium, localhost)", "Costs a visitor pays: bytes over the wire, initialization, query latency, and tab memory. Localhost removes bandwidth, so latency is compute-bound and the Cold ↓ column is the network-cost proxy.")}
+      ${deliveryInitSection(site, siteReport, engines)}
+      ${latencySection("Rich query latency — exact total + all facet counts", GLOSSARY.lat_facet, site, siteReport, engines, { mode: "all", filtered: false })}
+      ${bm25.length ? latencySection("BM25-only rich query latency — exact total + all facet counts", GLOSSARY.lat_facet, site, siteReport, bm25, { mode: "all", filtered: false }) : ""}
+      ${filteredFacetSection(site, siteReport, engines)}
+      ${latencySection("Filtered query latency — no facet counts", GLOSSARY.lat_filtered, site, siteReport, engines, { mode: "none", filtered: true })}
+      ${facetScalingSection(site, siteReport, engines)}
+      ${sortedSection(site, siteReport, engines)}
+      ${browseSection(site, siteReport, engines)}
+      ${paginationSection(site, siteReport, engines)}
+      ${deepPaginationSection(site, siteReport, engines)}
+      ${latencySection("Plain query latency — diagnostic", GLOSSARY.lat_plain, site, siteReport, engines, { mode: "none", filtered: false })}
+      ${correctnessSection(site, siteReport, engines)}
+      ${multiTabSection(site, siteReport, engines)}
+    </div>
+  </details>
 </section>`;
     })
     .join("\n");
@@ -1024,12 +1020,9 @@ td.worst { color: var(--muted); }
 h4.pane { font-size: .82rem; font-weight: 600; color: var(--muted); margin: 1rem 0 .3rem; }
 p.example { margin: .5rem 0 .2rem; font-size: .9rem; }
 p.example .sub { color: var(--muted); font-size: .8rem; }
-/* View switching: tables by default, charts when the body opts in. */
-.view.charts { display: none; }
-body.show-charts .view.tables { display: none; }
-body.show-charts .view.charts { display: block; }
-.chart-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 1rem; margin-top: .6rem; }
-.chart-card { border: 1px solid var(--line); border-radius: 10px; background: var(--card); padding: .7rem .9rem 1rem; }
+.chart-grid { display: grid; grid-template-columns: 1fr; gap: 1.2rem; margin-top: .6rem; }
+.chart-card { border: 1px solid var(--line); border-radius: 10px; background: var(--card); padding: 1rem 1.3rem 1.4rem; }
+.chart-card h4.pane { font-size: .92rem; }
 svg.chart { width: 100%; height: auto; display: block; margin-top: .3rem; overflow: visible; }
 svg.chart .cl { fill: var(--fg); font-size: 12px; }
 svg.chart .cl.hl { font-weight: 700; fill: var(--accent); }
@@ -1085,7 +1078,6 @@ section.scaling > h2 .pages { color: var(--muted); font-weight: 400; font-size: 
 <div class="wrap">
 <header>
   <button class="theme-toggle" id="theme" type="button">◐ theme</button>
-  <button class="theme-toggle" id="view" type="button">◧ charts</button>
   <h1>Static search benchmark</h1>
   <p class="meta">Generated ${esc(report.generated_at ?? "")}${env.cpu ? " · " + esc(env.cpu) : ""}${env.node ? " · Node " + esc(env.node) : ""}</p>
   ${versions ? `<p class="versions">${versions}</p>` : ""}
@@ -1151,12 +1143,6 @@ ${sections}
     var current = document.documentElement.getAttribute("data-theme");
     var next = current === "dark" ? "light" : current === "light" ? "dark" : (matchMedia("(prefers-color-scheme: dark)").matches ? "light" : "dark");
     document.documentElement.setAttribute("data-theme", next);
-  });
-
-  var viewToggle = document.getElementById("view");
-  viewToggle.addEventListener("click", function () {
-    var charts = document.body.classList.toggle("show-charts");
-    viewToggle.textContent = charts ? "▤ tables" : "◧ charts";
   });
 
   // Engine-line highlighting: hover previews, click pins (independent of the
