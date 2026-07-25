@@ -7,38 +7,38 @@ import { bm25Engines, rankingModelFor } from "./ranking-models.mjs";
 // external resources (fonts, scripts, styles) and works from file://.
 
 const GLOSSARY = {
-  build_s: "Wall-clock seconds to build the search index in an isolated process. Corpus extraction happens beforehand and is not counted.",
-  build_rss: "Peak resident memory (RSS) of the indexer *process* during the build, via GNU time on Linux. This is a build-machine cost — not browser memory.",
-  shipped: "Total size of the product-default deployable artifact files on disk. Compiler intermediates are excluded; Dredge's shipped database uses its default Brotli quality 11.",
-  normalized_brotli: "A format-compressibility comparison: every logical artifact file is compressed independently at Brotli quality 5. Dredge's raw database is used instead of its product-default quality-11 .db.br, so every engine is measured at the same compression quality.",
-  cold_bytes: "Encoded response-body bytes sent on a first visit (empty HTTP cache and, for Dredge, empty OPFS). HTTP headers and transport framing are excluded. The server applies negotiated Brotli quality 5 to ordinary compressible responses and passes intrinsic precompressed artifacts such as Dredge's .db.br through unchanged. Counted at the server, including Web Worker fetches.",
-  warm_bytes: "Encoded response-body bytes sent on a repeat visit, excluding HTTP headers and transport framing. The HTTP cache (and Dredge's persisted OPFS database) mean this is usually ~0.",
-  cold_init: "Milliseconds from the adapter starting to the index being queryable, on a first visit. Page navigation and adapter download happen before this timer starts.",
-  warm_init: "Initialization time on a repeat visit, reusing the HTTP cache and any persisted database.",
-  warm_mem: "Total tab memory after querying — main thread, workers, and WASM heap together — via performance.measureUserAgentSpecificMemory(). This is the only fair cross-engine measure, because some engines keep their index in a worker's WASM heap rather than the JS heap.",
-  p95: "95th-percentile query latency (ms) over the measured iterations, after three unrecorded warm-up queries, on a warm page.",
-  lat_plain: "Diagnostic only: a free-text query returning a page of results and the exact total, but NO facet counting. Compare against the rich query table to see what always-accurate facet counts add.",
-  lat_filtered: "The same query restricted to a single benchmark_group value — the engine's structured-filter path — still fully counted.",
-  lat_facet: "The headline scenario: a keyword query returning a page of results, the exact total match count, AND per-value counts for every facet dimension over the WHOLE match set — the full experience a rich search UI ships. Native for Dredge and Pagefind; FlexSearch, Lunr, and Orama enumerate every match and tally in JavaScript (the honest cost).",
-  facet_scaling: "How query latency grows as more facet dimensions are counted on the broad query — no facets, one facet, then all available facets. Each per-value count is the 'number next to a facet value' users expect: how many results would remain if that value were applied.",
-  facet_none: "Baseline: the query with a full result count but no facet counting.",
-  facet_one: "Counting per-value totals for a single facet dimension.",
-  facet_all: "Counting per-value totals for every facet dimension at once. Pagefind computes all facet counts on every search regardless, so its cost is flat across these three.",
-  pagination: "The broad query run at growing page sizes, both without and with all facet counts. Isolates result-hydration cost — materializing 10 vs 200 results — separate from finding and counting them.",
-  deep: "The broad query read at increasing offsets: page one, the middle page, and the last page, all at a fixed page size with all facet counts. Exposes deep-offset cost — an in-memory engine slices an array, while a database must skip rows.",
-  browse: "The no-keyword landing state: every document returned, sorted alphabetically by title, with an exact total count and (optionally) every facet count. This is the faceted-browse entry point before any search term.",
-  counted: "Whether every run returns the true total match count, never a page-capped one. A faceted UI needs the real total for its result count and pagination, so lazy top-k results are disqualified.",
-  sorted_browse: "Whether the no-keyword browse page comes back in alphabetical title order — the defined sort when there is no relevance signal.",
-  sorted_keyword: "A keyword query whose native relevance order is replaced by an explicit alphabetical title sort, with and without facet counts.",
-  sortable_keyword: "Whether the explicit alphabetical-sort keyword scenario returns titles in alphabetical order — the cost of letting a user re-sort keyword results away from relevance.",
-  disjunctive: "When a filter is active on a facet, whether the engine still counts that facet's OTHER values (so a user can switch values within it). Verified numerically: the filtered dimension's counts must reproduce the same query's UNFILTERED counts for that dimension. ✓ is disjunctive/skip-self counting; ✗ is conjunctive (only the applied value survives, so its neighbours read as zero).",
-  facet_integrity: "Whether each facet dimension's own per-value counts sum to the engine's own total on unfiltered facet queries (facets partition the match set). Checked against each engine itself — cross-engine totals differ by design because stemming and prefix rules vary.",
-  filter_consistency: "Whether a filtered query's total equals that value's bucket in the same engine's own unfiltered facet counts. A native filter that silently drops matches (as FlexSearch's tag search does) fails here — its filtered total reads far below its own unfiltered bucket.",
-  example: "A real query from this run and the exact facet counts it returned, to show the shape of what every engine computes on each search.",
-  mt_tabs: "Number of browser tabs opened at once on the same origin.",
-  mt_single: "Memory of a single tab running the full workload — the baseline instance.",
-  mt_total: "Every tab's memory summed with all N open at once. Engines that load a full independent index per tab scale toward N× a single tab (the ~4× jump seen here for Orama, FlexSearch and Lunr). Dredge elects one leader tab to own the SQLite index while the rest relay to it over a BroadcastChannel and download nothing, so the index is held once however many tabs are open — each tab still pays a fixed runtime baseline, so Dredge's total climbs slowly, not with corpus size.",
-  mt_p95: "Query p95 on the slowest of the N tabs while all of them search at once — the worst latency a user sees under multi-tab contention.",
+  build_s: "How long it took to build the search index, in seconds. This happens once, when the site is published — visitors never wait for it.",
+  build_rss: "How much memory the computer needed while building the index. A one-time cost of publishing the site, not something a visitor's device pays.",
+  shipped: "The total size of the files that get deployed with the site — what a visitor's browser has to download to make search work.",
+  normalized_brotli: "A fairer size comparison: every engine's files are compressed the same way and by the same amount, so no engine gets an edge just from using stronger compression.",
+  cold_bytes: "How many bytes a visitor's browser downloads, after compression, to make search work the very first time they visit.",
+  warm_bytes: "How many bytes a returning visitor's browser has to download again. Usually close to zero, since the browser already saved everything from the first visit.",
+  cold_init: "How many milliseconds until search is ready to use on a visitor's very first visit, once the page and its search files have already arrived.",
+  warm_init: "How many milliseconds search takes to become ready on a repeat visit, when the browser already has everything saved from before.",
+  warm_mem: "How much memory the browser uses after doing a search, added up across the whole tab (including anything running in the background). This is the fairest way to compare engines that store their data differently behind the scenes.",
+  p95: "A 'typical worst case' response time, in milliseconds: 95 out of 100 searches were at least this fast. The slowest few outliers are set aside so one fluke doesn't distort the number.",
+  lat_plain: "For comparison only: how fast a plain search is when it just returns matching results and a total count, with none of the per-category counts a real search box would also show. See the row below for what those extra counts cost.",
+  lat_filtered: "How fast a search is once a visitor has already narrowed things down with a filter, like clicking a category.",
+  lat_facet: "The real-world case: a search that returns matching results, an exact total, and also counts how many results sit under every filter option — everything a good search box shows a visitor at once.",
+  facet_scaling: "How much slower a search gets as it's asked to count more filter categories at once: none, then one, then all of them.",
+  facet_none: "A search that returns a result count but doesn't count anything for the filters.",
+  facet_one: "A search that also counts how many results fall under one filter category.",
+  facet_all: "A search that counts how many results fall under every filter category at once — the most counting work a search can be asked to do.",
+  pagination: "How much slower a search gets simply from returning more results per page at once — 10 vs. 50 vs. 100 vs. 200.",
+  deep: "How much slower a search gets when a visitor jumps deep into the results (say, page 50) instead of staying on page one.",
+  browse: "What a visitor sees before typing anything: every item listed, sorted alphabetically, with an exact count.",
+  counted: "Does the engine report the real, exact number of matches — rather than an estimate, or a number capped at whatever fit on one page?",
+  sorted_browse: "When a visitor hasn't typed a search term yet, are the results actually shown in alphabetical order, like they should be?",
+  sorted_keyword: "What happens when a visitor searches for something, but then asks to see the results sorted alphabetically instead of by best match.",
+  sortable_keyword: "When a visitor asks for alphabetical order during a search, does the engine actually deliver it?",
+  disjunctive: "If a visitor has already filtered by one option in a category, can they still see accurate counts for the OTHER options in that same category, so they could switch? ✓ means yes. ✗ means picking one option makes every other option in that category look like it has zero results.",
+  facet_integrity: "Do a category's own counts add up correctly? For example, do all of an engine's 'genre' counts add up to that same engine's own total number of results?",
+  filter_consistency: "If a visitor filters by a category value, does the result count match what that same value showed before the filter was applied? A mismatch means the filter is quietly losing matches.",
+  example: "A real search from this test run, showing exactly what came back — the results and the count for each filter option.",
+  mt_tabs: "How many browser tabs were open on the site at once, to see what happens when a visitor keeps several tabs open at the same time.",
+  mt_single: "How much memory just one browser tab uses.",
+  mt_total: "How much memory ALL the open tabs use, added together. Most engines load a full, separate copy of the search index into every tab, so memory use multiplies with each extra tab a visitor opens. Dredge instead keeps one shared copy across all of a visitor's tabs, so its total climbs much more slowly.",
+  mt_p95: "How slow the worst-performing tab gets when every open tab is searching at the same moment — the worst wait a visitor sees with several tabs open.",
 };
 
 // Band tooltips for the six-query workload: two single-token endpoints and four
@@ -46,16 +46,12 @@ const GLOSSARY = {
 // AND-of-terms, so the band's document frequency is an *adjacency* floor — each
 // engine's own result_count shows how far its stemming/prefix expansion diverges.
 const BAND_BASE = {
-  rare: "Rare band: a single token matching roughly one document.",
-  broad: "Broad band: a single token matching about 10% of the corpus — the widest single-token result set.",
-  "phrase-selective":
-    "Selective phrase (two words), adjacency ~0.1% of the corpus. Sent unquoted and run as AND-of-terms; the band is an adjacency floor.",
-  "phrase-moderate":
-    "Moderate phrase (two words), adjacency ~2% of the corpus. Sent unquoted and run as AND-of-terms; the band is an adjacency floor.",
-  "phrase-broad":
-    "Broad phrase (two words), adjacency ~10% of the corpus. Sent unquoted and run as AND-of-terms; the band is an adjacency floor.",
-  phrase3:
-    "Three-word phrase, adjacency ~0.5% of the corpus. Sent unquoted and run as AND-of-terms; the band is an adjacency floor.",
+  rare: "A rare search word — one that only matches about one page in the whole site.",
+  broad: "A common search word — one that matches roughly 1 out of every 10 pages, the widest single-word test here.",
+  "phrase-selective": "A specific two-word phrase that only turns up on a small slice of pages (roughly 1 in 1,000).",
+  "phrase-moderate": "A moderately common two-word phrase (turns up on roughly 1 in 50 pages).",
+  "phrase-broad": "A common two-word phrase (turns up on roughly 1 in 10 pages).",
+  phrase3: "A three-word phrase that only turns up on a small slice of pages (roughly 1 in 200).",
 };
 
 function esc(value) {
@@ -87,6 +83,15 @@ function numCell(value, text) {
   return { value: Number.isFinite(value) ? value : null, text };
 }
 const miBCell = (bytes) => numCell(bytes == null ? null : bytes / 1024 / 1024, fmtMiB(bytes));
+const divOrNull = (value, divisor = 1) => (value == null ? null : value / divisor);
+
+// The headline rich-query row: broad keyword, all facet counts, warm page.
+// Shared by the cross-corpus table and the cross-corpus latency chart.
+function richP95Of(item) {
+  return (warmOf(item)?.measurements ?? []).find(
+    (r) => r.scenario === "keyword" && r.label === "broad" && r.facet_mode === "all",
+  );
+}
 
 // A latency cell: p95 for a measured row (a superscript discloses a thin sample
 // count), a ✗ failure cell whose reason is in its tooltip — rendered distinctly
@@ -194,7 +199,7 @@ function tableHtml(headerCells, rows) {
 function bandHeader(band, query) {
   const base = BAND_BASE[band] ?? `${band} band.`;
   const detail = query
-    ? ` Here: “${query.query}”, adjacency/document frequency ${query.document_frequency}.`
+    ? ` In this test: “${query.query}”, matching ${query.document_frequency.toLocaleString()} page${query.document_frequency === 1 ? "" : "s"}.`
     : "";
   const queryText = query ? `<span class="qtext">${esc(query.query)}</span>` : "";
   return `${term(band, base + detail)}${queryText}`;
@@ -547,7 +552,7 @@ function multiTabSection(site, siteReport, engines) {
       ],
     };
   });
-  return `<h3>${term("Multi-tab", "N tabs open at once on the same origin. The total is every tab's memory summed. Engines that load a full independent index per tab scale toward N× a single tab; Dredge elects one leader tab to own the SQLite index and the rest relay to it, downloading nothing, so the index is held once no matter how many tabs are open. p95 is the slowest tab with all N searching at once.")} memory &amp; latency</h3>${rankingNoteHtml(engines)}${tableHtml(headers, rows)}`;
+  return `<h3>${term("Multi-tab", "Several browser tabs open on the site at once. 'Total' adds up every tab's memory. Most engines load a full copy of the search index into every tab, so memory use multiplies with each tab a visitor opens — Dredge instead keeps one shared copy across all of a visitor's tabs. The p95 number is how slow the worst tab gets when every tab searches at the same time.")} memory &amp; latency</h3>${rankingNoteHtml(engines)}${tableHtml(headers, rows)}`;
 }
 
 const CAVEATS = [
@@ -631,6 +636,97 @@ function legend(keys, prefix = "") {
   return `<div class="legend">${items}</div>`;
 }
 
+// dredge always draws in the accent color. The other engines get their own
+// palette (not CHART_PALETTE — its first entry equals --accent, which would
+// make a non-dredge line indistinguishable from dredge's) in the order they
+// appear, so color stays stable across every chart.
+const ENGINE_PALETTE = ["var(--chart-2)", "var(--chart-3)", "var(--chart-4)", "var(--chart-5)"];
+function engineColor(engine, engines) {
+  if (engine === "dredge") return "var(--accent)";
+  const others = engines.filter((e) => e !== "dredge");
+  const index = others.indexOf(engine);
+  return ENGINE_PALETTE[index % ENGINE_PALETTE.length];
+}
+
+function engineLegend(engines) {
+  const items = engines
+    .map((engine) => `<span class="lg"><i style="background:${engineColor(engine, engines)}"></i>${esc(engine)}</span>`)
+    .join("");
+  return `<div class="legend">${items}</div>`;
+}
+
+// Tick label for a power-of-ten value: 0.01, 1, 100, 1k, 10k...
+function formatTick(v) {
+  if (v >= 1000) return `${parseFloat((v / 1000).toFixed(1))}k`;
+  if (v >= 1) return String(Math.round(v));
+  return String(parseFloat(v.toFixed(2)));
+}
+
+// A log-scale line chart, one line per engine, x-axis is the corpus (categorical,
+// since there are only a handful of sites): the shape that best shows how a
+// metric grows with corpus size across three-plus orders of magnitude — a bar
+// chart per corpus cannot show that trend at all. Values <= 0 or missing break
+// the line rather than being plotted at a false position.
+function scalingLineChart(title, tip, unit, sites, engines, valueFor) {
+  const width = CHART_W;
+  const height = 220;
+  const padLeft = 46;
+  const padRight = 14;
+  const padTop = 10;
+  const padBottom = 28;
+  const plotW = width - padLeft - padRight;
+  const plotH = height - padTop - padBottom;
+
+  const series = engines.map((engine) => ({
+    engine,
+    points: sites.map(([, sr]) => valueFor(sr.engines[engine])),
+  }));
+  const allValues = series.flatMap((s) => s.points).filter((v) => v != null && v > 0);
+  if (allValues.length < 2) return "";
+
+  const logMin = Math.floor(Math.log10(Math.min(...allValues)));
+  const logMax = Math.ceil(Math.log10(Math.max(...allValues)));
+  const span = Math.max(1, logMax - logMin);
+  const xAt = (i) => (sites.length > 1 ? padLeft + (i / (sites.length - 1)) * plotW : padLeft + plotW / 2);
+  const yAt = (v) => padTop + plotH * (1 - (Math.log10(v) - logMin) / span);
+
+  const step = span > 6 ? 2 : 1;
+  let grid = "";
+  for (let p = logMin; p <= logMax; p += step) {
+    const y = yAt(10 ** p);
+    grid +=
+      `<line x1="${padLeft}" y1="${y.toFixed(1)}" x2="${width - padRight}" y2="${y.toFixed(1)}" class="gl"></line>` +
+      `<text x="${padLeft - 6}" y="${y.toFixed(1)}" class="ga" text-anchor="end" dominant-baseline="middle">${formatTick(10 ** p)}</text>`;
+  }
+  const xLabels = sites
+    .map(([, sr], i) => `<text x="${xAt(i).toFixed(1)}" y="${height - 8}" class="ga" text-anchor="middle">${esc(sr.label ?? "")}</text>`)
+    .join("");
+
+  const lines = series
+    .map(({ engine, points }) => {
+      const color = engineColor(engine, engines);
+      const isDredge = engine === "dredge";
+      let d = "";
+      let drawing = false;
+      let dots = "";
+      points.forEach((value, i) => {
+        if (value == null || value <= 0) {
+          drawing = false;
+          return;
+        }
+        const x = xAt(i);
+        const y = yAt(value);
+        d += `${drawing ? "L" : "M"}${x.toFixed(1)} ${y.toFixed(1)} `;
+        drawing = true;
+        dots += `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="${isDredge ? 3.5 : 2.5}" fill="${color}"><title>${esc(engine)} — ${esc(sites[i][1].label ?? sites[i][0])}: ${value.toFixed(2)}</title></circle>`;
+      });
+      return `<path d="${d.trim()}" fill="none" stroke="${color}" stroke-width="${isDredge ? 2.6 : 1.6}"></path>${dots}`;
+    })
+    .join("");
+
+  return `<div class="chart-card"><h4 class="pane">${term(title, tip)} <span class="u">${esc(unit)}</span></h4><svg viewBox="0 0 ${width} ${height}" class="chart linechart" role="img" preserveAspectRatio="xMinYMin meet">${grid}${lines}${xLabels}</svg></div>`;
+}
+
 function chartsSection(site, siteReport, engines) {
   const mib = (bytes) => (bytes == null ? null : bytes / 1024 / 1024);
   const series = (fn) =>
@@ -710,17 +806,22 @@ function scalingSection(report, engines) {
         : "";
     return `<h3>${term(title, tip)} <span class="sub">${esc(unit)}</span></h3>${note}${tableHtml(headers, rows)}`;
   };
-  const richP95 = (item) =>
-    cellHtml(
-      (warmOf(item)?.measurements ?? []).find(
-        (r) => r.scenario === "keyword" && r.label === "broad" && r.facet_mode === "all",
-      ),
-    );
+  const richP95 = (item) => cellHtml(richP95Of(item));
   const bm25 = bm25Engines(engines);
+  const chartGrid = `<div class="chart-grid scaling-charts">
+    ${scalingLineChart("Rich query latency", GLOSSARY.lat_facet, "warm p95 ms · log scale", sites, engines, (item) => richP95Of(item)?.p95_ms ?? null)}
+    ${scalingLineChart("Cold response bytes", GLOSSARY.cold_bytes, "MiB · log scale", sites, engines, (item) => divOrNull(coldOf(item)?.network_bytes, 1024 * 1024))}
+    ${scalingLineChart("Shipped artifact size", GLOSSARY.shipped, "MiB · log scale", sites, engines, (item) => divOrNull(item?.artifact?.shipped_bytes, 1024 * 1024))}
+    ${scalingLineChart("Warm tab memory", GLOSSARY.warm_mem, "MiB · log scale", sites, engines, (item) => divOrNull(warmOf(item)?.memory?.bytes, 1024 * 1024))}
+  </div>`;
   return `
 <section class="scaling" id="scaling">
   <h2>Cross-corpus scaling <span class="pages">engines × corpus size — lower is better</span></h2>
-  <p class="units">The whole thesis in four tables: how each engine scales from the smallest corpus to the largest. Best value per column is highlighted, worst de-emphasized.</p>
+  <p class="units">The whole thesis, visualized and tabulated: how each engine scales from the smallest corpus to the largest. Charts use a log scale on the value axis because the spread across corpora runs to several orders of magnitude — a linear axis would flatten every small-corpus line to the bottom. Below, best value per table column is highlighted, worst de-emphasized.</p>
+  ${engineLegend(engines)}
+  ${chartGrid}
+  ${metricTable("Index build time", GLOSSARY.build_s, "s", (item) => numCell(divOrNull(item?.build?.wall_ms, 1000), fmtNum(item?.build?.wall_ms, 1000)))}
+  ${metricTable("Shipped artifact size", GLOSSARY.shipped, "MiB", (item) => miBCell(item?.artifact?.shipped_bytes))}
   ${metricTable("Cold response bytes", GLOSSARY.cold_bytes, "MiB", (item) => miBCell(coldOf(item)?.network_bytes))}
   ${metricTable("Cold initialization", GLOSSARY.cold_init, "ms", (item) => numCell(coldOf(item)?.init_ms, fmtNum(coldOf(item)?.init_ms)))}
   ${metricTable("Rich query p95 — broad, all facets", GLOSSARY.lat_facet, "warm p95 ms", richP95, { ranking: true })}
@@ -750,22 +851,27 @@ export function renderHtml(report, engines) {
   <h2>${esc(siteReport.label ?? site)} <span class="pages">${esc(pages)} pages</span></h2>
   ${exampleSection(site, siteReport, engines)}
   <div class="view tables">
-    ${banner("Measured on the build machine", "Costs paid once when the site is built — not by a visitor. Index build time, indexer peak memory, and the deployable artifact size.")}
-    ${buildMachineSection(site, siteReport, engines)}
-    ${banner("Measured in the browser (Chromium, localhost)", "Costs a visitor pays: bytes over the wire, initialization, query latency, and tab memory. Localhost removes bandwidth, so latency is compute-bound and the Cold ↓ column is the network-cost proxy.")}
-    ${deliveryInitSection(site, siteReport, engines)}
-    ${latencySection("Rich query latency — exact total + all facet counts", GLOSSARY.lat_facet, site, siteReport, engines, { mode: "all", filtered: false })}
-    ${bm25.length ? latencySection("BM25-only rich query latency — exact total + all facet counts", GLOSSARY.lat_facet, site, siteReport, bm25, { mode: "all", filtered: false, bm25Only: true }) : ""}
-    ${filteredFacetSection(site, siteReport, engines)}
-    ${latencySection("Filtered query latency — no facet counts", GLOSSARY.lat_filtered, site, siteReport, engines, { mode: "none", filtered: true })}
-    ${facetScalingSection(site, siteReport, engines)}
-    ${sortedSection(site, siteReport, engines)}
-    ${browseSection(site, siteReport, engines)}
-    ${paginationSection(site, siteReport, engines)}
-    ${deepPaginationSection(site, siteReport, engines)}
-    ${latencySection("Plain query latency — diagnostic", GLOSSARY.lat_plain, site, siteReport, engines, { mode: "none", filtered: false })}
-    ${correctnessSection(site, siteReport, engines)}
-    ${multiTabSection(site, siteReport, engines)}
+    <details class="site-detail">
+      <summary>Full tables — build, delivery, latency, correctness, multi-tab</summary>
+      <div class="site-detail-inner">
+        ${banner("Measured on the build machine", "Costs paid once when the site is built — not by a visitor. Index build time, indexer peak memory, and the deployable artifact size.")}
+        ${buildMachineSection(site, siteReport, engines)}
+        ${banner("Measured in the browser (Chromium, localhost)", "Costs a visitor pays: bytes over the wire, initialization, query latency, and tab memory. Localhost removes bandwidth, so latency is compute-bound and the Cold ↓ column is the network-cost proxy.")}
+        ${deliveryInitSection(site, siteReport, engines)}
+        ${latencySection("Rich query latency — exact total + all facet counts", GLOSSARY.lat_facet, site, siteReport, engines, { mode: "all", filtered: false })}
+        ${bm25.length ? latencySection("BM25-only rich query latency — exact total + all facet counts", GLOSSARY.lat_facet, site, siteReport, bm25, { mode: "all", filtered: false, bm25Only: true }) : ""}
+        ${filteredFacetSection(site, siteReport, engines)}
+        ${latencySection("Filtered query latency — no facet counts", GLOSSARY.lat_filtered, site, siteReport, engines, { mode: "none", filtered: true })}
+        ${facetScalingSection(site, siteReport, engines)}
+        ${sortedSection(site, siteReport, engines)}
+        ${browseSection(site, siteReport, engines)}
+        ${paginationSection(site, siteReport, engines)}
+        ${deepPaginationSection(site, siteReport, engines)}
+        ${latencySection("Plain query latency — diagnostic", GLOSSARY.lat_plain, site, siteReport, engines, { mode: "none", filtered: false })}
+        ${correctnessSection(site, siteReport, engines)}
+        ${multiTabSection(site, siteReport, engines)}
+      </div>
+    </details>
   </div>
   <div class="view charts">
     ${chartsSection(site, siteReport, engines)}
@@ -791,27 +897,27 @@ export function renderHtml(report, engines) {
   --bg: #ffffff; --fg: #1a1a1c; --muted: #6b6b72; --line: #e6e6ea;
   --card: #fafafb; --accent: #3b5bdb; --accent-soft: #eef2ff;
   --tip-bg: #1f2937; --tip-fg: #f3f4f6; --ok: #1f9d55; --bad: #d64545;
-  --bar: #b9c2e8; --chart-1: #3b5bdb; --chart-2: #12b886; --chart-3: #e8963b; --chart-4: #ae3ec9;
+  --bar: #b9c2e8; --chart-1: #3b5bdb; --chart-2: #12b886; --chart-3: #e8963b; --chart-4: #ae3ec9; --chart-5: #d6336c;
 }
 @media (prefers-color-scheme: dark) {
   :root {
     --bg: #16161a; --fg: #e8e8ea; --muted: #9a9aa2; --line: #2b2b31;
     --card: #1d1d22; --accent: #8aa0ff; --accent-soft: #23273a;
     --tip-bg: #f3f4f6; --tip-fg: #1f2937; --ok: #4ade80; --bad: #f87171;
-    --bar: #3a4266; --chart-1: #8aa0ff; --chart-2: #38d9a9; --chart-3: #ffb454; --chart-4: #da77f2;
+    --bar: #3a4266; --chart-1: #8aa0ff; --chart-2: #38d9a9; --chart-3: #ffb454; --chart-4: #da77f2; --chart-5: #ff8fa3;
   }
 }
 :root[data-theme="dark"] {
   --bg: #16161a; --fg: #e8e8ea; --muted: #9a9aa2; --line: #2b2b31;
   --card: #1d1d22; --accent: #8aa0ff; --accent-soft: #23273a;
   --tip-bg: #f3f4f6; --tip-fg: #1f2937; --ok: #4ade80; --bad: #f87171;
-  --bar: #3a4266; --chart-1: #8aa0ff; --chart-2: #38d9a9; --chart-3: #ffb454; --chart-4: #da77f2;
+  --bar: #3a4266; --chart-1: #8aa0ff; --chart-2: #38d9a9; --chart-3: #ffb454; --chart-4: #da77f2; --chart-5: #ff8fa3;
 }
 :root[data-theme="light"] {
   --bg: #ffffff; --fg: #1a1a1c; --muted: #6b6b72; --line: #e6e6ea;
   --card: #fafafb; --accent: #3b5bdb; --accent-soft: #eef2ff;
   --tip-bg: #1f2937; --tip-fg: #f3f4f6; --ok: #1f9d55; --bad: #d64545;
-  --bar: #b9c2e8; --chart-1: #3b5bdb; --chart-2: #12b886; --chart-3: #e8963b; --chart-4: #ae3ec9;
+  --bar: #b9c2e8; --chart-1: #3b5bdb; --chart-2: #12b886; --chart-3: #e8963b; --chart-4: #ae3ec9; --chart-5: #d6336c;
 }
 * { box-sizing: border-box; }
 body {
@@ -827,6 +933,16 @@ details.howto { margin: 1.4rem 0 .5rem; border: 1px solid var(--line); border-ra
 details.howto > summary { cursor: pointer; padding: .7rem 1rem; font-weight: 600; }
 details.howto ul { margin: 0 0 1rem; padding: 0 1.4rem; }
 details.howto li { margin: .45rem 0; color: var(--fg); font-size: .88rem; }
+details.site-detail { margin: 1rem 0 .4rem; border: 1px solid var(--line); border-radius: 10px; background: var(--card); }
+details.site-detail > summary {
+  cursor: pointer; padding: .65rem 1rem; font-weight: 600; font-size: .88rem; color: var(--fg);
+  list-style: none;
+}
+details.site-detail > summary::-webkit-details-marker { display: none; }
+details.site-detail > summary::before { content: "▸ "; color: var(--muted); }
+details.site-detail[open] > summary::before { content: "▾ "; }
+details.site-detail[open] > summary { border-bottom: 1px solid var(--line); }
+.site-detail-inner { padding: .2rem 1rem 1rem; }
 section.site { margin-top: 2.4rem; }
 section.site > h2 {
   font-size: 1.25rem; margin: 0 0 .2rem; padding-bottom: .4rem;
@@ -903,6 +1019,10 @@ svg.chart { width: 100%; height: auto; display: block; margin-top: .3rem; overfl
 svg.chart .cl { fill: var(--fg); font-size: 12px; }
 svg.chart .cl.hl { font-weight: 700; fill: var(--accent); }
 svg.chart .cv { fill: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+svg.chart.linechart { overflow: visible; }
+svg.chart.linechart .gl { stroke: var(--line); stroke-width: 1; }
+svg.chart.linechart .ga { fill: var(--muted); font-size: 10px; font-variant-numeric: tabular-nums; }
+.scaling-charts { margin: .3rem 0 1.4rem; }
 .legend { display: flex; flex-wrap: wrap; gap: .1rem .9rem; margin: .2rem 0 .1rem; }
 .legend .lg { display: inline-flex; align-items: center; gap: .3rem; color: var(--muted); font-size: .76rem; }
 .legend .lg i { width: 11px; height: 11px; border-radius: 3px; display: inline-block; }
