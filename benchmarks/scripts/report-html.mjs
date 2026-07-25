@@ -1,3 +1,5 @@
+import { bm25Engines, rankingModelFor } from "./ranking-models.mjs";
+
 // Renders the benchmark `report` object into a single self-contained HTML page.
 // Every metric and test name is a "term": its verbose explanation lives in the
 // GLOSSARY below and is surfaced through one shared, position-fixed tooltip so
@@ -7,17 +9,17 @@
 const GLOSSARY = {
   build_s: "Wall-clock seconds to build the search index in an isolated process. Corpus extraction happens beforehand and is not counted.",
   build_rss: "Peak resident memory (RSS) of the indexer *process* during the build, via GNU time on Linux. This is a build-machine cost — not browser memory.",
-  raw: "Total size of the deployable artifact files on disk, uncompressed.",
-  brotli: "Sum of each artifact file compressed on its own at Brotli quality 5 — a proxy for what a CDN with Brotli would serve.",
-  cold_bytes: "Bytes actually transferred over the network on a first visit (empty HTTP cache and, for Dredge, empty OPFS). Counted at the server, so it includes fetches made inside a Web Worker — notably Dredge downloading its database and WASM.",
-  warm_bytes: "Bytes transferred on a repeat visit. The HTTP cache (and Dredge's persisted OPFS database) mean this is usually ~0.",
+  shipped: "Total size of the product-default deployable artifact files on disk. Compiler intermediates are excluded; Dredge's shipped database uses its default Brotli quality 11.",
+  normalized_brotli: "A format-compressibility comparison: every logical artifact file is compressed independently at Brotli quality 5. Dredge's raw database is used instead of its product-default quality-11 .db.br, so every engine is measured at the same compression quality.",
+  cold_bytes: "Encoded response-body bytes sent on a first visit (empty HTTP cache and, for Dredge, empty OPFS). HTTP headers and transport framing are excluded. The server applies negotiated Brotli quality 5 to ordinary compressible responses and passes intrinsic precompressed artifacts such as Dredge's .db.br through unchanged. Counted at the server, including Web Worker fetches.",
+  warm_bytes: "Encoded response-body bytes sent on a repeat visit, excluding HTTP headers and transport framing. The HTTP cache (and Dredge's persisted OPFS database) mean this is usually ~0.",
   cold_init: "Milliseconds from the adapter starting to the index being queryable, on a first visit. Page navigation and adapter download happen before this timer starts.",
   warm_init: "Initialization time on a repeat visit, reusing the HTTP cache and any persisted database.",
   warm_mem: "Total tab memory after querying — main thread, workers, and WASM heap together — via performance.measureUserAgentSpecificMemory(). This is the only fair cross-engine measure, because some engines keep their index in a worker's WASM heap rather than the JS heap.",
   p95: "95th-percentile query latency (ms) over the measured iterations, after three unrecorded warm-up queries, on a warm page.",
-  lat_plain: "A free-text query returning a page of results sorted by relevance and the exact total match count. No filter, no facet counts.",
+  lat_plain: "Diagnostic only: a free-text query returning a page of results and the exact total, but NO facet counting. Compare against the rich query table to see what always-accurate facet counts add.",
   lat_filtered: "The same query restricted to a single benchmark_group value — the engine's structured-filter path — still fully counted.",
-  lat_facet: "The same query, also returning per-value counts for every facet dimension across the WHOLE match set. Native for Dredge/Pagefind/Orama; FlexSearch and Lunr must enumerate every match and tally in JavaScript.",
+  lat_facet: "The headline scenario: a keyword query returning a page of results, the exact total match count, AND per-value counts for every facet dimension over the WHOLE match set — the full experience a rich search UI ships. Native for Dredge and Pagefind; FlexSearch, Lunr, and Orama enumerate every match and tally in JavaScript (the honest cost).",
   facet_scaling: "How query latency grows as more facet dimensions are counted on the broad query — no facets, one facet, then all available facets. Each per-value count is the 'number next to a facet value' users expect: how many results would remain if that value were applied.",
   facet_none: "Baseline: the query with a full result count but no facet counting.",
   facet_one: "Counting per-value totals for a single facet dimension.",
@@ -26,25 +28,34 @@ const GLOSSARY = {
   deep: "The broad query read at increasing offsets: page one, the middle page, and the last page, all at a fixed page size with all facet counts. Exposes deep-offset cost — an in-memory engine slices an array, while a database must skip rows.",
   browse: "The no-keyword landing state: every document returned, sorted alphabetically by title, with an exact total count and (optionally) every facet count. This is the faceted-browse entry point before any search term.",
   counted: "Whether every run returns the true total match count, never a page-capped one. A faceted UI needs the real total for its result count and pagination, so lazy top-k results are disqualified.",
-  sorted: "Whether the no-keyword browse page comes back in alphabetical title order — the defined sort when there is no relevance signal.",
-  disjunctive: "When a filter is active on a facet, whether the engine still counts that facet's OTHER values (so a user can switch values within it). ✓ is disjunctive/skip-self counting; ✗ is conjunctive (only the applied value survives, so its neighbours read as zero).",
+  sorted_browse: "Whether the no-keyword browse page comes back in alphabetical title order — the defined sort when there is no relevance signal.",
+  sorted_keyword: "A keyword query whose native relevance order is replaced by an explicit alphabetical title sort, with and without facet counts.",
+  sortable_keyword: "Whether the explicit alphabetical-sort keyword scenario returns titles in alphabetical order — the cost of letting a user re-sort keyword results away from relevance.",
+  disjunctive: "When a filter is active on a facet, whether the engine still counts that facet's OTHER values (so a user can switch values within it). Verified numerically: the filtered dimension's counts must reproduce the same query's UNFILTERED counts for that dimension. ✓ is disjunctive/skip-self counting; ✗ is conjunctive (only the applied value survives, so its neighbours read as zero).",
   facet_integrity: "Whether each facet dimension's own per-value counts sum to the engine's own total on unfiltered facet queries (facets partition the match set). Checked against each engine itself — cross-engine totals differ by design because stemming and prefix rules vary.",
+  filter_consistency: "Whether a filtered query's total equals that value's bucket in the same engine's own unfiltered facet counts. A native filter that silently drops matches (as FlexSearch's tag search does) fails here — its filtered total reads far below its own unfiltered bucket.",
   example: "A real query from this run and the exact facet counts it returned, to show the shape of what every engine computes on each search.",
   mt_tabs: "Number of browser tabs opened at once on the same origin.",
   mt_single: "Memory of a single tab running the full workload — the baseline instance.",
-  mt_all: "Sum of every tab's own memory when all N are open together.",
-  mt_leader: "Memory of the tab that owns the index. For Dredge this is the elected leader tab that holds the SQLite database; for other engines every tab is its own full instance, so this is just the largest.",
-  mt_follower: "Memory of a non-owning tab. For Dredge a follower holds no database — it relays searches to the leader over a BroadcastChannel and downloads nothing. For other engines it is another full independent copy.",
-  mt_ratio: "All-tabs memory divided by (tabs × leader memory), i.e. compared to N fully independent instances. ~1.0 means every tab pays full price; well under 1.0 means tabs share one index.",
-  mt_leader_p95: "Query latency on the index-owning (leader) tab.",
-  mt_follower_p95: "Query latency on a relaying (follower) tab — for Dredge this includes the round trip to the leader.",
+  mt_total: "Every tab's memory summed with all N open at once. Engines that load a full independent index per tab scale toward N× a single tab (the ~4× jump seen here for Orama, FlexSearch and Lunr). Dredge elects one leader tab to own the SQLite index while the rest relay to it over a BroadcastChannel and download nothing, so the index is held once however many tabs are open — each tab still pays a fixed runtime baseline, so Dredge's total climbs slowly, not with corpus size.",
+  mt_p95: "Query p95 on the slowest of the N tabs while all of them search at once — the worst latency a user sees under multi-tab contention.",
 };
 
+// Band tooltips for the six-query workload: two single-token endpoints and four
+// phrases mined from real corpus text. Phrases are sent unquoted and executed as
+// AND-of-terms, so the band's document frequency is an *adjacency* floor — each
+// engine's own result_count shows how far its stemming/prefix expansion diverges.
 const BAND_BASE = {
-  rare: "Rare band: a term matching roughly one document.",
-  selective: "Selective band: a term matching about 0.1% of the corpus.",
-  moderate: "Moderate band: a term matching about 2% of the corpus.",
-  broad: "Broad band: a term matching about 10% of the corpus — the widest, most expensive result set.",
+  rare: "Rare band: a single token matching roughly one document.",
+  broad: "Broad band: a single token matching about 10% of the corpus — the widest single-token result set.",
+  "phrase-selective":
+    "Selective phrase (two words), adjacency ~0.1% of the corpus. Sent unquoted and run as AND-of-terms; the band is an adjacency floor.",
+  "phrase-moderate":
+    "Moderate phrase (two words), adjacency ~2% of the corpus. Sent unquoted and run as AND-of-terms; the band is an adjacency floor.",
+  "phrase-broad":
+    "Broad phrase (two words), adjacency ~10% of the corpus. Sent unquoted and run as AND-of-terms; the band is an adjacency floor.",
+  phrase3:
+    "Three-word phrase, adjacency ~0.5% of the corpus. Sent unquoted and run as AND-of-terms; the band is an adjacency floor.",
 };
 
 function esc(value) {
@@ -63,6 +74,45 @@ const fmtMiB = (bytes) =>
   bytes === undefined || bytes === null ? "–" : (bytes / 1024 / 1024).toFixed(2);
 const fmtNum = (value, divisor = 1) =>
   value === undefined || value === null ? "–" : (value / divisor).toFixed(2);
+
+function timeoutSeconds(row) {
+  const match = /exceeded (\d+)ms/.exec(row?.error ?? "");
+  return match ? Math.round(Number(match[1]) / 1000) : null;
+}
+
+// A value-bearing cell: { value, text }. `value` is the comparable number (for
+// best/worst-in-column highlighting) or null when the cell is not comparable
+// (absent / failed). `text` is the rendered HTML.
+function numCell(value, text) {
+  return { value: Number.isFinite(value) ? value : null, text };
+}
+const miBCell = (bytes) => numCell(bytes == null ? null : bytes / 1024 / 1024, fmtMiB(bytes));
+
+// A latency cell: p95 for a measured row (a superscript discloses a thin sample
+// count), a ✗ failure cell whose reason is in its tooltip — rendered distinctly
+// from a "–" not-measured cell — and "–" when the row is absent. Failed/absent
+// cells carry value:null so they are excluded from best/worst highlighting.
+function cellHtml(row) {
+  if (!row) return numCell(null, "–");
+  if (row.error_kind) {
+    const seconds = timeoutSeconds(row);
+    const label =
+      row.error_kind === "skipped"
+        ? "✗ skipped"
+        : row.error_kind === "timeout"
+          ? seconds
+            ? `✗ >${seconds}s`
+            : "✗ timeout"
+          : "✗ error";
+    return numCell(null, `<span class="fail" title="${attr(row.error ?? row.error_kind)}">${esc(label)}</span>`);
+  }
+  if (row.p95_ms === undefined || row.p95_ms === null) return numCell(null, "–");
+  let text = fmtNum(row.p95_ms);
+  if (row.sample_count !== undefined && row.sample_count < 10) {
+    text += `<sup class="lown" title="p95 over ${row.sample_count} sample${row.sample_count === 1 ? "" : "s"}">${row.sample_count}</sup>`;
+  }
+  return numCell(row.p95_ms, text);
+}
 
 // A term: label with a dotted underline that reveals its glossary tip.
 function term(label, tip) {
@@ -97,35 +147,133 @@ function facetInventoryText(siteReport) {
   );
 }
 
+// Renders a table with generic best-in-column highlighting. A cell is either a
+// plain string (engine names, ✓/✗ marks — never highlighted) or a value-bearing
+// { value, text } object. For every column with at least two comparable values,
+// the minimum is marked `.best` and the maximum `.worst` (lower is better for
+// every metric in this report). Implemented once here so scaling and per-site
+// tables highlight identically.
 function tableHtml(headerCells, rows) {
+  const columnStats = headerCells.map((_, index) => {
+    const values = rows
+      .map((row) => row.cells[index])
+      .filter((cell) => cell && typeof cell === "object" && cell.value != null)
+      .map((cell) => cell.value);
+    if (values.length < 2) return null;
+    const min = Math.min(...values);
+    const max = Math.max(...values);
+    return min === max ? null : { min, max };
+  });
   const head = `<tr>${headerCells.map((cell) => `<th>${cell}</th>`).join("")}</tr>`;
   const body = rows
-    .map(
-      (row) =>
-        `<tr${row.dredge ? ' class="row-dredge"' : ""}>${row.cells
-          .map((cell, index) => `<td${index === 0 ? ' class="engine"' : ""}>${cell}</td>`)
-          .join("")}</tr>`,
-    )
+    .map((row) => {
+      const cells = row.cells
+        .map((cell, index) => {
+          const isObject = cell && typeof cell === "object";
+          const text = isObject ? cell.text : cell;
+          const classes = [];
+          if (index === 0) classes.push("engine");
+          const stats = columnStats[index];
+          if (isObject && stats && cell.value != null) {
+            if (cell.value === stats.min) classes.push("best");
+            else if (cell.value === stats.max) classes.push("worst");
+          }
+          const attr = classes.length ? ` class="${classes.join(" ")}"` : "";
+          return `<td${attr}>${text}</td>`;
+        })
+        .join("");
+      return `<tr${row.dredge ? ' class="row-dredge"' : ""}>${cells}</tr>`;
+    })
     .join("");
   return `<div class="scroll"><table>${head}${body}</table></div>`;
 }
 
-// Per-band column header whose tip names the actual query term and its frequency.
+// Per-band column header: the label (with a tooltip carrying the band detail)
+// plus the actual query text shown inline, so a reader never has to open a
+// tooltip to see what was searched.
 function bandHeader(band, query) {
   const base = BAND_BASE[band] ?? `${band} band.`;
   const detail = query
-    ? ` Here: “${query.query}”, matching ${query.document_frequency} of the corpus.`
+    ? ` Here: “${query.query}”, adjacency/document frequency ${query.document_frequency}.`
     : "";
-  return term(band, base + detail);
+  const queryText = query ? `<span class="qtext">${esc(query.query)}</span>` : "";
+  return `${term(band, base + detail)}${queryText}`;
 }
 
-function overviewSection(site, siteReport, engines) {
+// A labeled banner separating build-machine metrics from in-browser metrics.
+function banner(text, tip) {
+  return `<div class="banner">${tip ? term(text, tip) : esc(text)}</div>`;
+}
+
+function rankingNoteHtml(engines) {
+  const models = engines
+    .map((engine) => {
+      const model = rankingModelFor(engine);
+      return `${esc(engine)} ${term(model.label, model.detail)}`;
+    })
+    .join(" · ");
+  return `<p class="ranking-note"><strong>Ranking in this timing:</strong> ${models}. Relevance quality is not measured.</p>`;
+}
+
+function engineCellHtml(engine) {
+  const model = rankingModelFor(engine);
+  return `${esc(engine)}<span class="engine-ranking">${term(model.label, model.detail)}</span>`;
+}
+
+function bm25NoteHtml(engines) {
+  return `<p class="ranking-note bm25-note"><strong>BM25-only view:</strong> ${esc(engines.join(", "))}. Non-BM25 engines are not eligible for best-in-column highlighting here; that is a capability boundary, not a failure.</p>`;
+}
+
+function explicitOrderNoteHtml(noKeyword = false) {
+  const verb = noKeyword ? "is not used" : "is replaced by the requested sort";
+  return `<p class="ranking-note"><strong>Order in this timing:</strong> alphabetical title. Native relevance ranking ${verb}.</p>`;
+}
+
+function rankingOverviewHtml(engines) {
+  const headers = ["Engine", "Keyword ranking model", "BM25-only view"];
+  const rows = engines.map((engine) => {
+    const model = rankingModelFor(engine);
+    return {
+      dredge: engine === "dredge",
+      cells: [
+        esc(engine),
+        `${term(model.label, model.detail)}<span class="model-detail">${esc(model.detail)}</span>`,
+        model.bm25 ? '<span class="ok">eligible</span>' : '<span class="muted">not eligible</span>',
+      ],
+    };
+  });
+  return `<section class="ranking-overview"><h2>Ranking models</h2><p class="units">Keyword timings include each engine's native relevance work. Raw timings compare complete product behaviour, not equivalent relevance quality.</p>${tableHtml(headers, rows)}</section>`;
+}
+
+// Measured on the build machine: index build cost and artifact size.
+function buildMachineSection(site, siteReport, engines) {
   const headers = [
     "Engine",
     head("Build", GLOSSARY.build_s, "s"),
     head("Build RSS", GLOSSARY.build_rss, "MiB"),
-    head("Raw", GLOSSARY.raw, "MiB"),
-    head("Brotli", GLOSSARY.brotli, "MiB"),
+    head("Shipped", GLOSSARY.shipped, "MiB"),
+    head("Normalized br q5", GLOSSARY.normalized_brotli, "MiB"),
+  ];
+  const rows = engines.map((engine) => {
+    const item = siteReport.engines[engine];
+    return {
+      dredge: engine === "dredge",
+      cells: [
+        engineCellHtml(engine),
+        numCell(item?.build?.wall_ms, fmtNum(item?.build?.wall_ms, 1000)),
+        miBCell(item?.build?.max_rss_bytes),
+        miBCell(item?.artifact?.shipped_bytes),
+        miBCell(item?.artifact?.normalized_brotli_q5_bytes),
+      ],
+    };
+  });
+  return `<h3>Index build &amp; artifact size</h3>${tableHtml(headers, rows)}`;
+}
+
+// Measured in the browser: what a visitor downloads and how long init takes.
+function deliveryInitSection(site, siteReport, engines) {
+  const headers = [
+    "Engine",
     head("Cold ↓", GLOSSARY.cold_bytes, "MiB"),
     head("Warm ↓", GLOSSARY.warm_bytes, "MiB"),
     head("Cold init", GLOSSARY.cold_init, "ms"),
@@ -139,23 +287,19 @@ function overviewSection(site, siteReport, engines) {
     return {
       dredge: engine === "dredge",
       cells: [
-        esc(engine),
-        fmtNum(item?.build?.wall_ms, 1000),
-        `${fmtMiB(item?.build?.max_rss_bytes)}`,
-        `${fmtMiB(item?.artifact?.raw_bytes)}`,
-        `${fmtMiB(item?.artifact?.brotli_q5_bytes)}`,
-        `${fmtMiB(cold?.network_bytes)}`,
-        `${fmtMiB(warm?.network_bytes)}`,
-        fmtNum(cold?.init_ms),
-        fmtNum(warm?.init_ms),
-        `${fmtMiB(warm?.memory?.bytes)}`,
+        engineCellHtml(engine),
+        miBCell(cold?.network_bytes),
+        miBCell(warm?.network_bytes),
+        numCell(cold?.init_ms, fmtNum(cold?.init_ms)),
+        numCell(warm?.init_ms, fmtNum(warm?.init_ms)),
+        miBCell(warm?.memory?.bytes),
       ],
     };
   });
-  return `<h3>Sizes, load &amp; memory</h3>${tableHtml(headers, rows)}`;
+  return `<h3>Delivery &amp; initialization</h3>${tableHtml(headers, rows)}`;
 }
 
-function latencySection(title, tip, site, siteReport, engines, { mode, filtered }) {
+function latencySection(title, tip, site, siteReport, engines, { mode, filtered, bm25Only = false }) {
   const workload = filtered ? siteReport.filtered_queries : siteReport.queries;
   const byLabelQuery = Object.fromEntries(workload.map((q) => [q.label, q]));
   const headers = [
@@ -166,10 +310,11 @@ function latencySection(title, tip, site, siteReport, engines, { mode, filtered 
     const slice = sliceByLabel(siteReport.engines[engine], { mode, filtered });
     return {
       dredge: engine === "dredge",
-      cells: [esc(engine), ...workload.map((q) => fmtNum(slice[q.label]?.p95_ms))],
+      cells: [engineCellHtml(engine), ...workload.map((q) => cellHtml(slice[q.label]))],
     };
   });
-  return `<h3>${term(title, tip)} <span class="sub">${term("warm p95 ms", GLOSSARY.p95)}</span></h3>${tableHtml(headers, rows)}`;
+  const rankingNote = bm25Only ? bm25NoteHtml(engines) : rankingNoteHtml(engines);
+  return `<h3>${term(title, tip)} <span class="sub">${term("warm p95 ms", GLOSSARY.p95)}</span></h3>${rankingNote}${tableHtml(headers, rows)}`;
 }
 
 // How facet-count latency scales with the number of dimensions counted.
@@ -186,15 +331,15 @@ function facetScalingSection(site, siteReport, engines) {
       measurements.find(
         (row) =>
           row.label === "broad" && row.facet_mode === mode && !row.filtered && row.page_size === 10,
-      )?.p95_ms;
+      );
     return {
       dredge: engine === "dredge",
-      cells: [esc(engine), fmtNum(at("none")), fmtNum(at("one")), fmtNum(at("all"))],
+      cells: [engineCellHtml(engine), cellHtml(at("none")), cellHtml(at("one")), cellHtml(at("all"))],
     };
   });
   const inventory = facetInventoryText(siteReport);
   const note = inventory ? `<p class="units">${esc(inventory)}</p>` : "";
-  return `<h3>${term("Facet scaling — broad query", GLOSSARY.facet_scaling)} <span class="sub">${term("warm p95 ms", GLOSSARY.p95)}</span></h3>${note}${tableHtml(headers, rows)}`;
+  return `<h3>${term("Facet scaling — broad query", GLOSSARY.facet_scaling)} <span class="sub">${term("warm p95 ms", GLOSSARY.p95)}</span></h3>${rankingNoteHtml(engines)}${note}${tableHtml(headers, rows)}`;
 }
 
 function paginationSection(site, siteReport, engines) {
@@ -206,12 +351,12 @@ function paginationSection(site, siteReport, engines) {
       return {
         dredge: engine === "dredge",
         cells: [
-          esc(engine),
+          engineCellHtml(engine),
           ...pageSizes.map((size) => {
             const m = measurements.find(
               (row) => row.scenario === "pagination" && row.facet_mode === mode && row.page_size === size,
             );
-            return fmtNum(m?.p95_ms);
+            return cellHtml(m);
           }),
         ],
       };
@@ -220,6 +365,7 @@ function paginationSection(site, siteReport, engines) {
   };
   return (
     `<h3>${term("Pagination — broad query", GLOSSARY.pagination)} <span class="sub">${term("warm p95 ms", GLOSSARY.p95)}</span></h3>` +
+    rankingNoteHtml(engines) +
     tableFor("none") +
     tableFor("all")
   );
@@ -238,15 +384,32 @@ function deepPaginationSection(site, siteReport, engines) {
     return {
       dredge: engine === "dredge",
       cells: [
-        esc(engine),
+        engineCellHtml(engine),
         ...offsets.map((offset) => {
           const m = measurements.find((row) => row.scenario === "deep" && row.offset === offset);
-          return fmtNum(m?.p95_ms);
+          return cellHtml(m);
         }),
       ],
     };
   });
-  return `<h3>${term("Deep pagination — broad query", GLOSSARY.deep)} <span class="sub">${term("warm p95 ms", GLOSSARY.p95)}</span></h3>${tableHtml(headers, rows)}`;
+  return `<h3>${term("Deep pagination — broad query", GLOSSARY.deep)} <span class="sub">${term("warm p95 ms", GLOSSARY.p95)}</span></h3>${rankingNoteHtml(engines)}${tableHtml(headers, rows)}`;
+}
+
+// Sorted keyword: the broad query re-sorted alphabetically, with and without
+// facet counts — the cost of letting a user change result ordering.
+function sortedSection(site, siteReport, engines) {
+  const headers = [
+    "Engine",
+    head("no facets", GLOSSARY.facet_none, "ms"),
+    head("all facets", GLOSSARY.facet_all, "ms"),
+  ];
+  const rows = engines.map((engine) => {
+    const measurements = warmOf(siteReport.engines[engine])?.measurements ?? [];
+    const at = (mode) =>
+      measurements.find((row) => row.scenario === "sorted" && row.facet_mode === mode);
+    return { dredge: engine === "dredge", cells: [engineCellHtml(engine), cellHtml(at("none")), cellHtml(at("all"))] };
+  });
+  return `<h3>${term("Sorted keyword — broad + alphabetical title", GLOSSARY.sorted_keyword)} <span class="sub">${term("warm p95 ms", GLOSSARY.p95)}</span></h3>${explicitOrderNoteHtml()}${tableHtml(headers, rows)}`;
 }
 
 // No-keyword alphabetical browse, with and without facet counts.
@@ -259,10 +422,10 @@ function browseSection(site, siteReport, engines) {
   const rows = engines.map((engine) => {
     const measurements = warmOf(siteReport.engines[engine])?.measurements ?? [];
     const at = (mode) =>
-      measurements.find((row) => row.scenario === "browse" && row.facet_mode === mode)?.p95_ms;
-    return { dredge: engine === "dredge", cells: [esc(engine), fmtNum(at("none")), fmtNum(at("all"))] };
+      measurements.find((row) => row.scenario === "browse" && row.facet_mode === mode);
+    return { dredge: engine === "dredge", cells: [engineCellHtml(engine), cellHtml(at("none")), cellHtml(at("all"))] };
   });
-  return `<h3>${term("Browse — no keyword, alphabetical", GLOSSARY.browse)} <span class="sub">${term("warm p95 ms", GLOSSARY.p95)}</span></h3>${tableHtml(headers, rows)}`;
+  return `<h3>${term("Browse — no keyword, alphabetical", GLOSSARY.browse)} <span class="sub">${term("warm p95 ms", GLOSSARY.p95)}</span></h3>${explicitOrderNoteHtml(true)}${tableHtml(headers, rows)}`;
 }
 
 // Facet-count latency when a structured filter is already active (gap 3).
@@ -276,17 +439,17 @@ function filteredFacetSection(site, siteReport, engines) {
     return {
       dredge: engine === "dredge",
       cells: [
-        esc(engine),
+        engineCellHtml(engine),
         ...workload.map((q) => {
           const m = measurements.find(
             (row) => row.scenario === "filtered" && row.facet_mode === "all" && row.label === q.label,
           );
-          return fmtNum(m?.p95_ms);
+          return cellHtml(m);
         }),
       ],
     };
   });
-  return `<h3>${term("Facet counts under an active filter", GLOSSARY.lat_facet)} <span class="sub">${term("warm p95 ms", GLOSSARY.p95)}</span></h3>${tableHtml(headers, rows)}`;
+  return `<h3>${term("Facet counts under an active filter", GLOSSARY.lat_facet)} <span class="sub">${term("warm p95 ms", GLOSSARY.p95)}</span></h3>${rankingNoteHtml(engines)}${tableHtml(headers, rows)}`;
 }
 
 // A worked example: a real query from this run and the actual facet counts it
@@ -307,7 +470,7 @@ function exampleSection(site, siteReport, engines) {
   if (!example) return "";
   const { engine, row } = example;
   const lines = [
-    `query: “${row.query}”  →  ${row.result_count} results (sorted by relevance)`,
+    `query: “${row.query}”  →  ${row.result_count} results (sorted by ${rankingModelFor(engine).label})`,
     "",
     "facet counts returned — “how many results if I pick this value”:",
   ];
@@ -323,58 +486,34 @@ function exampleSection(site, siteReport, engines) {
   return `<p class="example">${term("See a real search and its facet counts", tip)} <span class="sub">(from ${esc(engine)}, this run)</span></p>`;
 }
 
+// Result correctness reads the stored `correctness` block verbatim — the shared
+// module (scripts/correctness.mjs) is the sole evaluator, so this table can
+// never disagree with the Markdown report or the gate.
+const CORRECTNESS_COLUMNS = [
+  ["counted", "Counted", GLOSSARY.counted],
+  ["sorted_browse", "Sorted-browse", GLOSSARY.sorted_browse],
+  ["sortable_keyword", "Sortable-keyword", GLOSSARY.sortable_keyword],
+  ["facet_integrity", "Facet integrity", GLOSSARY.facet_integrity],
+  ["disjunctive", "Disjunctive", GLOSSARY.disjunctive],
+  ["filter_consistency", "Filter consistency", GLOSSARY.filter_consistency],
+];
+
 function correctnessSection(site, siteReport, engines) {
-  const headers = [
-    "Engine",
-    term("Counted", GLOSSARY.counted),
-    term("Sorted", GLOSSARY.sorted),
-    term("Facet integrity", GLOSSARY.facet_integrity),
-    term("Disjunctive", GLOSSARY.disjunctive),
-  ];
+  const headers = ["Engine", ...CORRECTNESS_COLUMNS.map(([, label, tip]) => term(label, tip))];
   const mark = (value) =>
-    value === null ? "–" : value ? '<span class="ok">✓</span>' : '<span class="bad">✗</span>';
+    value === null || value === undefined
+      ? "–"
+      : value
+        ? '<span class="ok">✓</span>'
+        : '<span class="bad">✗</span>';
   const rows = engines.map((engine) => {
-    const measurements = warmOf(siteReport.engines[engine])?.measurements ?? [];
-    const counted = measurements.length ? measurements.every((m) => m.count_exact !== false) : null;
-
-    const browseRows = measurements.filter((m) => m.scenario === "browse" && m.first_titles);
-    const sorted = browseRows.length
-      ? browseRows.every((m) =>
-          (m.first_titles ?? []).every(
-            (title, i, all) =>
-              i === 0 || String(all[i - 1]).toLowerCase() <= String(title).toLowerCase(),
-          ),
-        )
-      : null;
-
-    const facetRows = measurements.filter(
-      (m) => m.facet_mode && m.facet_mode !== "none" && !m.filtered,
-    );
-    let integrity = null;
-    if (facetRows.length) {
-      integrity = facetRows.every((m) => {
-        const fields = Object.values(m.facet_counts ?? {});
-        if (!fields.length) return false;
-        return fields.every((buckets) => {
-          const sum = Object.values(buckets ?? {}).reduce((total, n) => total + Number(n), 0);
-          return Object.keys(buckets ?? {}).length > 0 && sum === m.result_count;
-        });
-      });
-    }
-
-    const filteredAll = measurements.filter(
-      (m) => m.scenario === "filtered" && m.facet_mode === "all" && m.filter,
-    );
-    const disjunctive = filteredAll.length
-      ? filteredAll.some((m) => Object.keys(m.facet_counts?.[m.filter.field] ?? {}).length > 1)
-      : null;
-
+    const correctness = siteReport.engines[engine]?.correctness ?? {};
     return {
       dredge: engine === "dredge",
-      cells: [esc(engine), mark(counted), mark(sorted), mark(integrity), mark(disjunctive)],
+      cells: [engineCellHtml(engine), ...CORRECTNESS_COLUMNS.map(([key]) => mark(correctness[key]))],
     };
   });
-  return `<h3>Result correctness</h3>${tableHtml(headers, rows)}`;
+  return `<h3>Result correctness</h3><p class="ranking-note"><strong>Ranking:</strong> these checks validate totals, facets, filters, and explicit sorts; they do not evaluate relevance ordering or quality.</p>${tableHtml(headers, rows)}`;
 }
 
 function multiTabSection(site, siteReport, engines) {
@@ -382,53 +521,44 @@ function multiTabSection(site, siteReport, engines) {
     "Engine",
     head("Tabs", GLOSSARY.mt_tabs, "n"),
     head("Single", GLOSSARY.mt_single, "MiB"),
-    head("All-tabs", GLOSSARY.mt_all, "MiB"),
-    head("Leader", GLOSSARY.mt_leader, "MiB"),
-    head("Follower", GLOSSARY.mt_follower, "MiB"),
-    head("vs N×", GLOSSARY.mt_ratio, "ratio"),
-    head("Leader p95", GLOSSARY.mt_leader_p95, "ms"),
-    head("Follower p95", GLOSSARY.mt_follower_p95, "ms"),
+    head("Total", GLOSSARY.mt_total, "MiB"),
+    head("p95", GLOSSARY.mt_p95, "ms"),
   ];
   const rows = engines.map((engine) => {
     const item = siteReport.engines[engine];
     const multitab = item?.browser?.multitab;
     const single = warmOf(item)?.memory?.bytes;
     if (!multitab?.pages?.length) {
-      return { dredge: engine === "dredge", cells: [esc(engine), "–", fmtMiB(single), "–", "–", "–", "–", "–", "–"] };
+      return { dredge: engine === "dredge", cells: [engineCellHtml(engine), "–", miBCell(single), "–", "–"] };
     }
     const pages = multitab.pages;
     const mems = pages.map((page) => page.memory?.bytes).filter((v) => v != null);
-    const total = mems.reduce((t, v) => t + v, 0);
-    const leaderMem = mems.length ? Math.max(...mems) : null;
-    const followerMem = mems.length ? Math.min(...mems) : null;
-    const byMem = [...pages].sort((a, b) => (b.memory?.bytes ?? 0) - (a.memory?.bytes ?? 0));
-    const p95Of = (page) => page?.measurements?.[0]?.p95_ms ?? null;
-    const ratio = leaderMem && mems.length ? (total / (multitab.tabs * leaderMem)).toFixed(2) : "–";
+    const total = mems.length ? mems.reduce((t, v) => t + v, 0) : null;
+    const p95s = pages.map((page) => page?.measurements?.[0]?.p95_ms).filter((v) => v != null);
+    const worstP95 = p95s.length ? Math.max(...p95s) : null;
     return {
       dredge: engine === "dredge",
       cells: [
-        esc(engine),
+        engineCellHtml(engine),
         String(multitab.tabs),
-        fmtMiB(single),
-        fmtMiB(total),
-        fmtMiB(leaderMem),
-        fmtMiB(followerMem),
-        ratio,
-        fmtNum(p95Of(byMem[0])),
-        fmtNum(p95Of(byMem[byMem.length - 1])),
+        miBCell(single),
+        miBCell(total),
+        numCell(worstP95, fmtNum(worstP95)),
       ],
     };
   });
-  return `<h3>${term("Multi-tab", "N tabs open at once on the same origin. Dredge elects one leader tab to own the database; the rest relay to it. Other engines load a full independent index per tab.")} memory &amp; latency</h3>${tableHtml(headers, rows)}`;
+  return `<h3>${term("Multi-tab", "N tabs open at once on the same origin. The total is every tab's memory summed. Engines that load a full independent index per tab scale toward N× a single tab; Dredge elects one leader tab to own the SQLite index and the rest relay to it, downloading nothing, so the index is held once no matter how many tabs are open. p95 is the slowest tab with all N searching at once.")} memory &amp; latency</h3>${rankingNoteHtml(engines)}${tableHtml(headers, rows)}`;
 }
 
 const CAVEATS = [
-  "Ranking scores are not comparable across engines; this is a product benchmark, not a claim of identical retrieval models.",
-  "Match sets differ by design: Dredge uses ANDed FTS prefix terms, Pagefind applies its own stemming, Orama runs without typo tolerance, FlexSearch uses forward tokenization, Lunr uses its English pipeline. So two engines can legitimately return different totals for the same query.",
-  "Latency is measured on localhost, so it is compute-bound; the Cold ↓ / Warm ↓ columns are the network-cost proxy. Bytes are served uncompressed, so a raw-JSON engine is compared against its own on-disk artifact while Dredge ships an already-compressed database.",
-  "Every engine is measured doing the full faceted-search work: an exact total count, a fully sorted result set, and (where facets are counted) every facet's per-value counts. FlexSearch and Lunr have no native count/facet/browse, so they enumerate the whole match set and tally in JavaScript — the cost of matching product behaviour, not a handicap.",
-  "Facet counts under an active filter differ by model: Dredge returns disjunctive (skip-self) counts, so the filtered facet still shows its other values; the JavaScript engines return conjunctive counts. See the Disjunctive column under Result correctness.",
-  "Browser memory uses performance.measureUserAgentSpecificMemory(), which the browser deliberately rate-limits (a randomized delay up to ~20s), so it is sampled once per page.",
+  "Relevance *quality* is not measured or compared. Ranking scores differ across engines (this is a product benchmark, not a claim of identical retrieval models); notably FlexSearch's ordering is not BM25, which is part of why some of its operations are cheap.",
+  "Multi-word queries are normalized to AND on every engine so they answer the same question: Lunr with a required (+) clause per token; native AND on Dredge, Pagefind, and FlexSearch; and Orama by intersecting per-token result sets in adapter JS, because its threshold:0 does NOT enforce AND across prefix-expanded tokens in the pinned version (a single token that expands to several indexed words would otherwise satisfy the multi-token gate). Phrases are sent unquoted and executed as AND-of-terms — no engine here runs true quoted-phrase (adjacency) queries — so each band's document frequency is an adjacency floor and every engine's own result_count shows its divergence.",
+  "Match sets still differ by design: Dredge uses ANDed FTS prefix terms, Pagefind and Lunr apply their own stemming, Orama intersects prefix-expanded per-token matches, FlexSearch uses forward tokenization. Two engines can legitimately return different totals for the same query — so every correctness check judges an engine against itself.",
+  "Every engine is measured doing the full faceted-search work: an exact total, a fully sorted result set, and (where facets are counted) every facet's per-value counts. FlexSearch, Lunr, and Orama enumerate the whole match set and tally facets in JavaScript — FlexSearch and Lunr because they have no native count/facet/browse, and Orama because enforcing correct multi-token AND requires materializing the match set. FlexSearch's active filter is also applied in JavaScript because its native tag search verifiably drops matches (a 400-doc/50-expected probe returned 25). This is the honest cost of matching product behaviour, not a handicap.",
+  "Facet counts under an active filter are disjunctive (skip-self) on every engine, computed differently per engine: Dredge natively in one round trip; FlexSearch, Lunr, and Orama as a second tally over the already-enumerated unfiltered match set; Pagefind from result.totalFilters (empirically verified to equal the unfiltered search's counts). All of that work happens inside the timed search call.",
+  "Latency is measured on localhost, so it is compute-bound; the Cold ↓ / Warm ↓ columns are the network-cost proxy. The server negotiates Brotli quality 5 for ordinary compressible files and preserves product-provided compressed artifacts such as Dredge's quality-11 .db.br.",
+  "Warm p95 is taken over a time-budgeted number of samples; a cell annotated with a small superscript (or a `*n` suffix in Markdown) had fewer than 10 samples and should be weighed accordingly. A ✗ cell is a scenario that timed out, errored, or was skipped by the circuit breaker (reason in its tooltip) — distinct from a – cell, which was not measured.",
+  "Browser memory uses performance.measureUserAgentSpecificMemory(), which the browser deliberately rate-limits (a randomized delay up to ~20s), so it is sampled once per page; a slow sample that exceeds the operation timeout is recorded as unavailable rather than failing the run.",
 ];
 
 // --- Charts (inline SVG, no external libraries) ------------------------------
@@ -513,9 +643,11 @@ function chartsSection(site, siteReport, engines) {
     )?.p95_ms ?? null;
 
   const scalingGroups = engines.map((engine) => {
+    // none/all live on the broad keyword rows; the `one` facet mode lives on the
+    // separate scaling scenario. Match on label + facet_mode across both.
     const at = (mode) =>
       measurementsOf(engine).find(
-        (r) => r.scenario === "keyword" && r.label === "broad" && r.facet_mode === mode,
+        (r) => r.label === "broad" && !r.filtered && r.page_size === 10 && r.facet_mode === mode,
       )?.p95_ms ?? null;
     return { label: engine, highlight: engine === "dredge", values: { none: at("none"), one: at("one"), all: at("all") } };
   });
@@ -531,17 +663,79 @@ function chartsSection(site, siteReport, engines) {
     };
   });
 
-  const card = (title, tip, unit, body) =>
-    `<div class="chart-card"><h4 class="pane">${term(title, tip)} <span class="u">${esc(unit)}</span></h4>${body}</div>`;
+  const card = (title, tip, unit, body, ranking = false) =>
+    `<div class="chart-card"><h4 class="pane">${term(title, tip)} <span class="u">${esc(unit)}</span></h4>${ranking ? rankingNoteHtml(engines) : ""}${body}</div>`;
 
   return `<div class="chart-grid">
-    ${card("Faceted query latency", GLOSSARY.lat_facet, "warm p95 ms · lower is better", svgBars(series(broadAll)))}
+    ${card("Faceted query latency", GLOSSARY.lat_facet, "warm p95 ms · lower is better", svgBars(series(broadAll)), true)}
     ${card("Browser memory", GLOSSARY.warm_mem, "MiB · lower is better", svgBars(series((i) => mib(warmOf(i)?.memory?.bytes))))}
-    ${card("Cold bytes over the wire", GLOSSARY.cold_bytes, "MiB · lower is better", svgBars(series((i) => mib(coldOf(i)?.network_bytes))))}
-    ${card("Index size (Brotli)", GLOSSARY.brotli, "MiB · lower is better", svgBars(series((i) => mib(i?.artifact?.brotli_q5_bytes))))}
-    ${card("Facet scaling", GLOSSARY.facet_scaling, "warm p95 ms", legend(["none", "one", "all"]) + svgGroupedBars(scalingGroups, ["none", "one", "all"]))}
-    ${card("Pagination (all facets)", GLOSSARY.pagination, "warm p95 ms", legend(["10", "50", "100", "200"], "n=") + svgGroupedBars(pageGroups, ["10", "50", "100", "200"]))}
+    ${card("Cold encoded response bytes", GLOSSARY.cold_bytes, "MiB · lower is better", svgBars(series((i) => mib(coldOf(i)?.network_bytes))))}
+    ${card("Normalized index size (br q5)", GLOSSARY.normalized_brotli, "MiB · lower is better", svgBars(series((i) => mib(i?.artifact?.normalized_brotli_q5_bytes))))}
+    ${card("Facet scaling", GLOSSARY.facet_scaling, "warm p95 ms", legend(["none", "one", "all"]) + svgGroupedBars(scalingGroups, ["none", "one", "all"]), true)}
+    ${card("Pagination (all facets)", GLOSSARY.pagination, "warm p95 ms", legend(["10", "50", "100", "200"], "n=") + svgGroupedBars(pageGroups, ["10", "50", "100", "200"]), true)}
   </div>`;
+}
+
+// The cross-corpus scaling story — the thesis of the benchmark — leads the page:
+// engines as rows, corpora as columns ordered by page count, one compact table
+// per headline metric. Best-in-column highlighting (via tableHtml) surfaces the
+// transfer-size crossover and large-corpus latency at a glance. Failed/missing
+// cells render ✗/– inline.
+function scalingSection(report, engines) {
+  const sites = Object.entries(report.sites).sort(
+    (a, b) => (a[1].page_count ?? 0) - (b[1].page_count ?? 0),
+  );
+  if (!sites.length) return "";
+  const headers = [
+    "Engine",
+    ...sites.map(([site, sr]) =>
+      head(sr.label ?? site, `The ${sr.label ?? site} corpus.`, `${(sr.page_count ?? 0).toLocaleString()} pages`),
+    ),
+  ];
+  const metricTable = (
+    title,
+    tip,
+    unit,
+    cellFor,
+    { ranking = false, bm25Only = false, onlyEngines = engines } = {},
+  ) => {
+    const rows = onlyEngines.map((engine) => ({
+      dredge: engine === "dredge",
+      cells: [engineCellHtml(engine), ...sites.map(([, sr]) => cellFor(sr.engines[engine]))],
+    }));
+    const note = bm25Only
+      ? bm25NoteHtml(onlyEngines)
+      : ranking
+        ? rankingNoteHtml(onlyEngines)
+        : "";
+    return `<h3>${term(title, tip)} <span class="sub">${esc(unit)}</span></h3>${note}${tableHtml(headers, rows)}`;
+  };
+  const richP95 = (item) =>
+    cellHtml(
+      (warmOf(item)?.measurements ?? []).find(
+        (r) => r.scenario === "keyword" && r.label === "broad" && r.facet_mode === "all",
+      ),
+    );
+  const bm25 = bm25Engines(engines);
+  return `
+<section class="scaling" id="scaling">
+  <h2>Cross-corpus scaling <span class="pages">engines × corpus size — lower is better</span></h2>
+  <p class="units">The whole thesis in four tables: how each engine scales from the smallest corpus to the largest. Best value per column is highlighted, worst de-emphasized.</p>
+  ${metricTable("Cold response bytes", GLOSSARY.cold_bytes, "MiB", (item) => miBCell(coldOf(item)?.network_bytes))}
+  ${metricTable("Cold initialization", GLOSSARY.cold_init, "ms", (item) => numCell(coldOf(item)?.init_ms, fmtNum(coldOf(item)?.init_ms)))}
+  ${metricTable("Rich query p95 — broad, all facets", GLOSSARY.lat_facet, "warm p95 ms", richP95, { ranking: true })}
+  ${bm25.length ? metricTable("BM25-only rich query p95 — broad, all facets", GLOSSARY.lat_facet, "warm p95 ms", richP95, { bm25Only: true, onlyEngines: bm25 }) : ""}
+  ${metricTable("Warm tab memory", GLOSSARY.warm_mem, "MiB", (item) => miBCell(warmOf(item)?.memory?.bytes))}
+</section>`;
+}
+
+// Sticky in-page navigation: the scaling section plus one link per site.
+function navHtml(report) {
+  const links = [`<a href="#scaling">Scaling</a>`];
+  for (const [site, sr] of Object.entries(report.sites)) {
+    links.push(`<a href="#site-${esc(site)}">${esc(sr.label ?? site)}</a>`);
+  }
+  return `<nav class="sitenav">${links.join("")}</nav>`;
 }
 
 export function renderHtml(report, engines) {
@@ -550,20 +744,26 @@ export function renderHtml(report, engines) {
   const sections = sites
     .map(([site, siteReport]) => {
       const pages = siteReport.page_count?.toLocaleString?.() ?? siteReport.page_count;
+      const bm25 = bm25Engines(engines);
       return `
-<section class="site">
+<section class="site" id="site-${esc(site)}">
   <h2>${esc(siteReport.label ?? site)} <span class="pages">${esc(pages)} pages</span></h2>
   ${exampleSection(site, siteReport, engines)}
   <div class="view tables">
-    ${overviewSection(site, siteReport, engines)}
-    ${latencySection("Query latency", GLOSSARY.lat_plain, site, siteReport, engines, { mode: "none", filtered: false })}
-    ${latencySection("Query latency — active filter", GLOSSARY.lat_filtered, site, siteReport, engines, { mode: "none", filtered: true })}
-    ${latencySection("Facet-count latency — all facets", GLOSSARY.lat_facet, site, siteReport, engines, { mode: "all", filtered: false })}
+    ${banner("Measured on the build machine", "Costs paid once when the site is built — not by a visitor. Index build time, indexer peak memory, and the deployable artifact size.")}
+    ${buildMachineSection(site, siteReport, engines)}
+    ${banner("Measured in the browser (Chromium, localhost)", "Costs a visitor pays: bytes over the wire, initialization, query latency, and tab memory. Localhost removes bandwidth, so latency is compute-bound and the Cold ↓ column is the network-cost proxy.")}
+    ${deliveryInitSection(site, siteReport, engines)}
+    ${latencySection("Rich query latency — exact total + all facet counts", GLOSSARY.lat_facet, site, siteReport, engines, { mode: "all", filtered: false })}
+    ${bm25.length ? latencySection("BM25-only rich query latency — exact total + all facet counts", GLOSSARY.lat_facet, site, siteReport, bm25, { mode: "all", filtered: false, bm25Only: true }) : ""}
+    ${filteredFacetSection(site, siteReport, engines)}
+    ${latencySection("Filtered query latency — no facet counts", GLOSSARY.lat_filtered, site, siteReport, engines, { mode: "none", filtered: true })}
     ${facetScalingSection(site, siteReport, engines)}
+    ${sortedSection(site, siteReport, engines)}
+    ${browseSection(site, siteReport, engines)}
     ${paginationSection(site, siteReport, engines)}
     ${deepPaginationSection(site, siteReport, engines)}
-    ${browseSection(site, siteReport, engines)}
-    ${filteredFacetSection(site, siteReport, engines)}
+    ${latencySection("Plain query latency — diagnostic", GLOSSARY.lat_plain, site, siteReport, engines, { mode: "none", filtered: false })}
     ${correctnessSection(site, siteReport, engines)}
     ${multiTabSection(site, siteReport, engines)}
   </div>
@@ -635,7 +835,27 @@ section.site > h2 {
 section.site > h2 .pages { color: var(--muted); font-weight: 400; font-size: .9rem; }
 h3 { font-size: .98rem; margin: 1.5rem 0 .2rem; }
 h3 .sub { color: var(--muted); font-weight: 400; font-size: .82rem; }
+.banner {
+  margin: 1.8rem 0 .2rem; padding: .35rem .7rem; border-radius: 8px;
+  font-size: .8rem; font-weight: 700; letter-spacing: .04em; text-transform: uppercase;
+  background: var(--accent-soft); color: var(--accent); border: 1px solid var(--line);
+}
+.qtext {
+  display: block; color: var(--muted); font-weight: 400; font-size: .74rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; margin-top: .15rem;
+  max-width: 12ch; overflow: hidden; text-overflow: ellipsis;
+}
 .units { color: var(--muted); font-size: .76rem; margin: .1rem 0 .5rem; }
+.ranking-note {
+  margin: .25rem 0 .55rem; padding: .45rem .65rem; border-left: 3px solid var(--accent);
+  background: var(--accent-soft); color: var(--fg); font-size: .78rem;
+}
+.ranking-note .term { white-space: nowrap; }
+.engine-ranking { display: block; color: var(--muted); font-size: .7rem; font-weight: 400; }
+.model-detail { display: block; max-width: 48rem; color: var(--muted); font-size: .74rem; white-space: normal; }
+.ranking-overview { margin-top: 1.4rem; }
+.ranking-overview > h2 { font-size: 1.1rem; margin: 0 0 .2rem; }
+.muted { color: var(--muted); }
 .u { color: var(--muted); font-weight: 400; font-size: .74rem; }
 .scroll { overflow-x: auto; border: 1px solid var(--line); border-radius: 10px; }
 table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
@@ -648,6 +868,12 @@ tr.row-dredge td { background: var(--accent-soft); }
 tr.row-dredge td.engine { box-shadow: inset 3px 0 0 var(--accent); }
 .ok { color: var(--ok); font-weight: 700; }
 .bad { color: var(--bad); font-weight: 700; }
+/* Failure cell (timeout/error/skipped): distinct from a "–" not-measured cell. */
+.fail { color: var(--bad); font-weight: 600; cursor: help; }
+sup.lown { color: var(--muted); font-size: .7em; margin-left: 1px; cursor: help; }
+/* Best-in-column (lowest, since lower is better) highlighted; worst de-emphasized. */
+td.best { font-weight: 700; color: var(--ok); }
+td.worst { color: var(--muted); }
 .term {
   border-bottom: 1px dotted var(--muted); cursor: help; outline: none;
 }
@@ -680,6 +906,24 @@ svg.chart .cv { fill: var(--muted); font-size: 11px; font-variant-numeric: tabul
 .legend { display: flex; flex-wrap: wrap; gap: .1rem .9rem; margin: .2rem 0 .1rem; }
 .legend .lg { display: inline-flex; align-items: center; gap: .3rem; color: var(--muted); font-size: .76rem; }
 .legend .lg i { width: 11px; height: 11px; border-radius: 3px; display: inline-block; }
+.legend-key { font-size: .8rem; color: var(--muted); margin: .5rem 0 0; }
+.legend-key .muted { color: var(--muted); }
+/* Sticky in-page navigation. */
+.sitenav {
+  position: sticky; top: 0; z-index: 50; display: flex; flex-wrap: wrap; gap: .35rem .4rem;
+  padding: .5rem .2rem; margin: 1rem -.2rem 0; background: var(--bg); border-bottom: 1px solid var(--line);
+}
+.sitenav a {
+  color: var(--muted); text-decoration: none; font-size: .78rem; padding: .2rem .55rem;
+  border-radius: 999px; border: 1px solid var(--line);
+}
+.sitenav a:hover, .sitenav a:focus { color: var(--accent); border-color: var(--accent); outline: none; }
+/* Cross-corpus scaling section (leads the page). */
+section.scaling { margin-top: 1.6rem; }
+section.scaling > h2 {
+  font-size: 1.25rem; margin: 0 0 .2rem; padding-bottom: .4rem; border-bottom: 2px solid var(--accent-soft);
+}
+section.scaling > h2 .pages { color: var(--muted); font-weight: 400; font-size: .9rem; }
 </style>
 </head>
 <body>
@@ -691,13 +935,24 @@ svg.chart .cv { fill: var(--muted); font-size: 11px; font-variant-numeric: tabul
   <p class="meta">Generated ${esc(report.generated_at ?? "")}${env.cpu ? " · " + esc(env.cpu) : ""}${env.node ? " · Node " + esc(env.node) : ""}</p>
   ${versions ? `<p class="versions">${versions}</p>` : ""}
   <p class="meta">Hover, tap, or focus any <span class="term" tabindex="0" data-tip="Underlined terms carry a definition. Hover or focus to preview it; click to pin it open.">underlined term</span> for its definition. The Dredge row is highlighted.</p>
+  <p class="legend-key">
+    <span class="ok">✓</span> pass ·
+    <span class="bad">✗</span> failed (timeout/error/skipped — reason in tooltip) ·
+    – not measured ·
+    <span class="ok">best</span> / <span class="muted">worst</span> per column (lower is better)
+  </p>
 </header>
+
+${navHtml(report)}
+
+${rankingOverviewHtml(engines)}
 
 <details class="howto">
   <summary>How to read this &amp; caveats</summary>
   <ul>${caveatsHtml}</ul>
 </details>
 
+${scalingSection(report, engines)}
 ${sections}
 </div>
 

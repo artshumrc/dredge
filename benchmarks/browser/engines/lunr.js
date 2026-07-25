@@ -14,22 +14,36 @@ export async function initialize({ artifactBase }) {
   const index = lunr.Index.load(serialized);
   const allDocuments = Object.values(documents);
   return async (term, { filter, limit = 10, offset = 0, facets = [], sort } = {}) => {
-    let records;
+    // Enumerate the full UNFILTERED match set first. lunr has no top-k, so it
+    // always returns the whole scored set — the enumeration cost is already paid.
+    // lunr *can* filter with a required `+benchmark_group:groupN` clause (validated
+    // in test/adapters.test.mjs), but the adapter filters in JS instead so the
+    // unfiltered set stays in memory for disjunctive (skip-self) facet counts:
+    // that makes disjunctive a second *tally*, not a second query.
+    let unfiltered;
     if (term && term.trim()) {
-      const query = filter ? `+${term} +${filter.field}:${filter.value}` : term;
-      // lunr always returns the full scored result set, so the count is exact and
-      // the enumeration cost is already paid.
-      records = index.search(query).map((hit) => documents[hit.ref]);
+      // AND semantics: lunr is OR by default, so every whitespace token becomes a
+      // required (`+`) clause.
+      const clauses = term.trim().split(/\s+/).map((token) => `+${token}`);
+      unfiltered = index.search(clauses.join(" ")).map((hit) => documents[hit.ref]);
     } else {
       // Browse: lunr has no match-all, so enumerate every stored document.
-      records = filter ? allDocuments.filter((doc) => doc[filter.field] === filter.value) : allDocuments;
+      unfiltered = allDocuments;
     }
+    const filtered = filter
+      ? unfiltered.filter((doc) => doc?.[filter.field] === filter.value)
+      : unfiltered;
+    let records = filtered;
     if (sort) records = [...records].sort(byField(sort.field, sort.direction));
     let facetCounts = null;
     if (facets.length) {
       facetCounts = Object.fromEntries(facets.map((name) => [name, {}]));
-      for (const record of records) {
-        for (const name of facets) {
+      for (const name of facets) {
+        // Disjunctive/skip-self: the actively-filtered dimension is tallied over
+        // the unfiltered set (so its other values still show); every other
+        // dimension over the filtered set.
+        const source = filter && name === filter.field ? unfiltered : filtered;
+        for (const record of source) {
           const value = record?.[name];
           if (value != null) facetCounts[name][value] = (facetCounts[name][value] ?? 0) + 1;
         }

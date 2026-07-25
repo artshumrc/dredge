@@ -23,27 +23,36 @@ export async function initialize({ artifactBase }) {
   const index = new FlexSearch.Document(configuration);
   for (const [key, value] of Object.entries(parts)) await index.import(key, value);
   return async (term, { filter, limit = 10, offset = 0, facets = [], sort } = {}) => {
-    let hits;
+    // Enumerate the full UNFILTERED match set first, then apply the active filter
+    // in JavaScript. Filtering in JS (rather than with FlexSearch's own `tag`
+    // option) is required for two reasons: the tag intersection verifiably drops
+    // matches (a 400-doc/50-expected test returns 25), so its counts would be
+    // wrong; and keeping the unfiltered set lets us compute disjunctive facet
+    // counts as a second tally rather than a second query.
+    let unfiltered;
     if (term && term.trim()) {
-      // Multi-token queries intersect (AND) natively. The active filter is
-      // applied in JavaScript over the enumerated match set rather than with
-      // FlexSearch's own `tag` option: the tag intersection verifiably drops
-      // matches (a 400-doc/50-expected test returns 25), so its counts and
-      // facet tallies would be wrong.
+      // Multi-token queries intersect (AND) natively.
       const result = await index.search(term, { limit: ENUMERATE_LIMIT, merge: true, enrich: true });
       const rows = Array.isArray(result) ? result : result.result ?? [];
-      hits = rows.map((hit) => hit.doc ?? hit);
-      if (filter) hits = hits.filter((doc) => doc?.[filter.field] === filter.value);
+      unfiltered = rows.map((hit) => hit.doc ?? hit);
     } else {
-      // Browse: no keyword, so start from every document and apply the filter.
-      hits = filter ? documents.filter((doc) => doc[filter.field] === filter.value) : documents;
+      // Browse: no keyword, so start from every document.
+      unfiltered = documents;
     }
+    const filtered = filter
+      ? unfiltered.filter((doc) => doc?.[filter.field] === filter.value)
+      : unfiltered;
+    let hits = filtered;
     if (sort) hits = [...hits].sort(byField(sort.field, sort.direction));
     let facetCounts = null;
     if (facets.length) {
       facetCounts = Object.fromEntries(facets.map((name) => [name, {}]));
-      for (const hit of hits) {
-        for (const name of facets) {
+      for (const name of facets) {
+        // Disjunctive/skip-self: the actively-filtered dimension is tallied over
+        // the unfiltered set (so its other values still show); every other
+        // dimension over the filtered set.
+        const source = filter && name === filter.field ? unfiltered : filtered;
+        for (const hit of source) {
           const value = hit?.[name];
           if (value != null) facetCounts[name][value] = (facetCounts[name][value] ?? 0) + 1;
         }
@@ -51,7 +60,7 @@ export async function initialize({ artifactBase }) {
     }
     const page = hits.slice(offset, offset + limit);
     return {
-      count: hits.length,
+      count: filtered.length,
       countExact: true,
       checksum: page.map((hit) => hit.id).join(","),
       titles: page.map((hit) => hit.title),

@@ -15,6 +15,8 @@ export async function initialize({ artifactBase, cold }) {
   return async (query, { filter, limit = 10, offset = 0, facets = [], sort } = {}) => {
     const filters = filter ? { [filter.field]: filter.value } : undefined;
     const result = await client.search({
+      // Native AND: dredge requires every query token (ANDed FTS prefix terms),
+      // so multi-word phrases run as AND-of-terms with no query rewriting.
       query,
       filters,
       limit,

@@ -22,22 +22,26 @@ export function parseOptions(argv) {
     site: "all",
     engines: [...engines],
     iterations: 20,
+    sampleBudgetMs: 1500,
     limit: undefined,
     tabs: 4,
     operationTimeoutSeconds: 60,
     timeoutMinutes: 30,
+    skipPrepare: false,
   };
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
     if (argument === "--site") options.site = argv[++index];
     else if (argument === "--engines") options.engines = argv[++index].split(",");
     else if (argument === "--iterations") options.iterations = Number(argv[++index]);
+    else if (argument === "--sample-budget-ms") options.sampleBudgetMs = Number(argv[++index]);
     else if (argument === "--limit") options.limit = Number(argv[++index]);
     else if (argument === "--tabs") options.tabs = Number(argv[++index]);
     else if (argument === "--operation-timeout-seconds") {
       options.operationTimeoutSeconds = Number(argv[++index]);
     }
     else if (argument === "--timeout-minutes") options.timeoutMinutes = Number(argv[++index]);
+    else if (argument === "--skip-prepare") options.skipPrepare = true;
     else throw new Error(`unknown argument: ${argument}`);
   }
   if (options.site !== "all" && !sites.includes(options.site)) {
@@ -48,6 +52,9 @@ export function parseOptions(argv) {
   }
   if (!Number.isInteger(options.iterations) || options.iterations < 1) {
     throw new Error("--iterations must be a positive integer");
+  }
+  if (!Number.isFinite(options.sampleBudgetMs) || options.sampleBudgetMs <= 0) {
+    throw new Error("--sample-budget-ms must be a positive number");
   }
   if (!Number.isInteger(options.tabs) || options.tabs < 2) {
     throw new Error("--tabs must be an integer >= 2");

@@ -1,11 +1,20 @@
 /// <reference lib="webworker" />
 
 import { browserBootEnv, browserCoordinationEnv } from "./browser-boot-env";
-import { boot, closeDatabase, getExec, loadValidatedManifest, WorkerError, toDredgeError } from "./db";
-import type { StatusFn } from "./db";
+import {
+  boot,
+  closeDatabase,
+  getExec,
+  loadValidatedManifest,
+  setConnectionCacheClearer,
+  setSessionCacheClearer,
+  WorkerError,
+  toDredgeError,
+} from "./db";
+import type { Exec, StatusFn } from "./db";
 import { startCoordinatedSession } from "./coordination";
 import type { CoordinatedSession, LocalBackend } from "./coordination";
-import { introspectSchema, search } from "./search";
+import { createSearchSession, introspectSchema } from "./search";
 import type { DredgeSearchRequest, DredgeSearchResponse } from "./search";
 import type { DredgeError, DredgeStatus } from "./protocol";
 
@@ -42,12 +51,22 @@ async function bootLocal(onStatus: StatusFn): Promise<LocalBackend> {
   const useReset = reset;
   reset = false;
   await boot(manifestUrl, useReset, onStatus, browserBootEnv);
-  // The worker opens the database exactly once per session, so the handle and
-  // its schema are stable — introspect once and reuse.
-  const exec = getExec();
-  const schema = introspectSchema(exec);
+  // The schema is stable for the life of the session (one database, content-hash
+  // named), so introspect it once off the boot connection and reuse it. The
+  // session executes through an indirect exec that always reads the *live*
+  // connection: the cold-boot background persist swaps the connection from the
+  // in-memory copy to the OPFS handle (see db.ts), and this indirection makes
+  // that swap invisible to the session. Its caches are registered behind both
+  // clearer seams — the full clearer for close/reset (drops the browse map too),
+  // the connection-only clearer for the swap (keeps the browse map: same
+  // database).
+  const schema = introspectSchema(getExec());
+  const exec: Exec = (sql, bind) => getExec()(sql, bind);
+  const searchSession = createSearchSession(exec, schema);
+  setSessionCacheClearer(() => searchSession.clear());
+  setConnectionCacheClearer(() => searchSession.clearConnectionCaches());
   return {
-    search: (request) => search(exec, schema, request),
+    search: (request) => searchSession.search(request),
   };
 }
 

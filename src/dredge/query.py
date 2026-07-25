@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from collections.abc import Callable
 from dataclasses import dataclass
 
 TOKEN_RE = re.compile(r"[^\W_]+", re.UNICODE)
@@ -42,7 +43,11 @@ def escape_fts_query(query: str | None) -> str | None:
     terms = _query_terms(text)
     if not terms:
         return None
-    return " AND ".join(_fts_term_expression(term) for term in terms)
+    last_index = len(terms) - 1
+    return " AND ".join(
+        _fts_term_expression(term, index == last_index)
+        for index, term in enumerate(terms)
+    )
 
 
 def _query_tokens(text: str) -> list[_QueryToken]:
@@ -128,23 +133,26 @@ def _has_letters_and_digits(subterms: tuple[str, ...] | list[str]) -> bool:
     )
 
 
-def _fts_term_expression(term: _QueryTerm) -> str:
+def _fts_term_expression(term: _QueryTerm, is_final: bool) -> str:
+    # `is_final` selects prefix vs exact matching: only the final term of a query
+    # is prefix-expanded (typeahead -- the word still being typed), every earlier
+    # term matches exactly. A single-character final non-identifier term still
+    # stays exact: '"a"*' would scan the entire term dictionary. Identical to
+    # buildMatchExpression in the runtime; pinned by the shared vectors
+    # (SPEC.md -> prefix policy).
+    term_expr = _fts_prefix_term if is_final else _fts_exact_term
     if not term.identifier:
-        # A standalone single-character non-identifier term is emitted as an
-        # exact token, not a prefix: '"a"*' would scan the entire term
-        # dictionary. Identical to buildMatchExpression in the runtime; pinned
-        # by the shared vectors (SPEC.md -> "Query execution", prefix gating).
         subterm = term.subterms[0]
-        if len(subterm) == 1:
-            return _fts_exact_term(subterm)
-        return _fts_prefix_term(subterm)
+        if is_final and len(subterm) > 1:
+            return _fts_prefix_term(subterm)
+        return _fts_exact_term(subterm)
 
-    expressions = [_fts_prefix_term("".join(term.subterms))]
+    expressions = [term_expr("".join(term.subterms))]
     if len(term.subterms) > 1:
-        expressions.append(_fts_phrase(term.subterms))
+        expressions.append(_fts_phrase(term.subterms, term_expr))
     token_parts = _split_token_parts(term.subterms)
     if len(token_parts) > 1 and token_parts != term.subterms:
-        expressions.append(_fts_phrase(token_parts))
+        expressions.append(_fts_phrase(token_parts, term_expr))
 
     deduped = list(dict.fromkeys(expressions))
     if len(deduped) == 1:
@@ -159,8 +167,8 @@ def _split_token_parts(subterms: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(parts)
 
 
-def _fts_phrase(subterms: tuple[str, ...]) -> str:
-    return " + ".join(_fts_prefix_term(subterm) for subterm in subterms)
+def _fts_phrase(subterms: tuple[str, ...], term_expr: Callable[[str], str]) -> str:
+    return " + ".join(term_expr(subterm) for subterm in subterms)
 
 
 def _fts_exact_term(token: str) -> str:

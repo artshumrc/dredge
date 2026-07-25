@@ -1,22 +1,14 @@
-import { createReadStream } from "node:fs";
-import { access, readFile, stat, writeFile } from "node:fs/promises";
-import { createServer } from "node:http";
-import { extname, resolve, sep } from "node:path";
+import { access, readFile, writeFile } from "node:fs/promises";
+import { resolve } from "node:path";
 import { spawn } from "node:child_process";
 
 import { chromium } from "playwright";
 
 import { benchmarkRoot, distRoot, parseOptions, selectedSites } from "./lib.mjs";
+import { startStaticServer } from "./static-server.mjs";
 
 const options = parseOptions(process.argv.slice(2));
-const mimeTypes = {
-  ".html": "text/html; charset=utf-8",
-  ".js": "text/javascript; charset=utf-8",
-  ".json": "application/json",
-  ".wasm": "application/wasm",
-  ".br": "application/octet-stream",
-};
-
+const sites = selectedSites(options.site);
 async function buildBrowser() {
   const code = await new Promise((resolveExit, reject) => {
     const child = spawn(process.execPath, ["scripts/build-browser.mjs"], {
@@ -35,46 +27,17 @@ async function buildBrowser() {
 // worker traffic entirely. Every fetch — main thread or worker — hits this
 // server, and the browser's HTTP cache means a warm repeat visit re-requests
 // only what it must, which is exactly the transfer we want to measure.
-function startServer() {
-  const state = { bytesServed: 0 };
-  const server = createServer(async (request, response) => {
-    try {
-      const url = new URL(request.url, "http://127.0.0.1");
-      let relative = decodeURIComponent(url.pathname).replace(/^\/+/, "");
-      if (!relative || relative === "runner") relative = "runner/index.html";
-      if (relative.endsWith("/")) relative += "index.html";
-      const path = resolve(distRoot, relative);
-      if (!path.startsWith(`${distRoot}${sep}`)) throw new Error("invalid path");
-      const metadata = await stat(path);
-      if (!metadata.isFile()) throw new Error("not a file");
-      state.bytesServed += metadata.size;
-      response.writeHead(200, {
-        "content-type": mimeTypes[extname(path)] ?? "application/octet-stream",
-        "content-length": metadata.size,
-        "cache-control": "public, max-age=3600",
-        "cross-origin-opener-policy": "same-origin",
-        "cross-origin-embedder-policy": "require-corp",
-      });
-      createReadStream(path).pipe(response);
-    } catch {
-      response.writeHead(404).end("not found");
-    }
-  });
-  return new Promise((resolveStarted) => {
-    server.listen(0, "127.0.0.1", () => {
-      const address = server.address();
-      resolveStarted({ server, origin: `http://127.0.0.1:${address.port}`, state });
-    });
-  });
-}
-
-function runnerUrl(origin, engine, site, { cold, light, mem }) {
+function runnerUrl(origin, engine, site, { cold, light, mem, once }) {
   const url = new URL("/runner/", origin);
   url.searchParams.set("engine", engine);
   url.searchParams.set("site", site);
   url.searchParams.set("cold", cold ? "1" : "0");
   url.searchParams.set("iterations", String(options.iterations));
   url.searchParams.set("operation_timeout_ms", String(options.operationTimeoutSeconds * 1_000));
+  url.searchParams.set("budget_ms", String(options.sampleBudgetMs));
+  // The cold single-tab page runs each config exactly once (no warmups): its job
+  // is cold init and honest first-visit bytes, not the warm latency matrix.
+  if (once) url.searchParams.set("once", "1");
   if (light) url.searchParams.set("light", "1");
   // The single-tab cold page skips the (slow) memory sample; warm + every
   // multi-tab page measure it.
@@ -85,14 +48,16 @@ function runnerUrl(origin, engine, site, { cold, light, mem }) {
 // Load the runner in one page, wait for it to finish, and return its result
 // plus the bytes the server sent while it ran.
 async function runPage(state, page, origin, engine, site, mode) {
-  const before = state.bytesServed;
+  const before = mode.measureNetwork === false ? undefined : state.bytesServed;
   await page.goto(runnerUrl(origin, engine, site, mode), { waitUntil: "load" });
   await page.waitForFunction(() => window.__benchmark?.done, undefined, {
     timeout: options.timeoutMinutes * 60_000,
   });
   const outcome = await page.evaluate(() => window.__benchmark);
   if (outcome.error) throw new Error(outcome.error);
-  return { ...outcome.result, network_bytes: state.bytesServed - before };
+  return before === undefined
+    ? outcome.result
+    : { ...outcome.result, network_bytes: state.bytesServed - before };
 }
 
 // Single-tab run: a fresh context (empty OPFS + HTTP cache), cold page then warm
@@ -101,7 +66,7 @@ async function runSingleTab(browser, origin, state, engine, site) {
   const context = await browser.newContext();
   try {
     const coldPage = await context.newPage();
-    const cold = await runPage(state, coldPage, origin, engine, site, { cold: true, mem: false });
+    const cold = await runPage(state, coldPage, origin, engine, site, { cold: true, mem: false, once: true });
     await coldPage.close();
     const warmPage = await context.newPage();
     const warm = await runPage(state, warmPage, origin, engine, site, { cold: false, mem: true });
@@ -120,27 +85,46 @@ async function runSingleTab(browser, origin, state, engine, site) {
 async function runMultiTab(browser, origin, state, engine, site, tabs) {
   const context = await browser.newContext();
   try {
+    const before = state.bytesServed;
     const pages = await Promise.all(Array.from({ length: tabs }, () => context.newPage()));
     const results = await Promise.all(
       pages.map((page) =>
-        runPage(state, page, origin, engine, site, { cold: true, light: true, mem: true }),
+        runPage(state, page, origin, engine, site, {
+          cold: true,
+          light: true,
+          mem: true,
+          measureNetwork: false,
+        }),
       ),
     );
     for (const page of pages) await page.close();
-    return { tabs, pages: results };
+    return { tabs, network_bytes: state.bytesServed - before, pages: results };
   } finally {
     await context.close();
   }
 }
 
 await buildBrowser();
-const { server, origin, state } = await startServer();
+const precompressPaths = [
+  resolve(distRoot, "runner"),
+  ...sites.flatMap((site) => [
+    resolve(distRoot, site, "workload.json"),
+    ...options.engines.map((engine) => resolve(distRoot, site, "artifacts", engine)),
+  ]),
+];
+console.log("Preparing production-like HTTP Brotli representations");
+const { server, origin, state } = await startStaticServer(distRoot, { precompressPaths });
+const assertPrecompressed = () => {
+  if (state.dynamicCompressions !== 0) {
+    throw new Error(`${state.dynamicCompressions} HTTP responses were compressed during browser timing`);
+  }
+};
 // The full Chromium ("chromium" channel, new headless) is required for
 // performance.measureUserAgentSpecificMemory(); the default chrome-headless-shell
 // does not expose it.
 const browser = await chromium.launch({ channel: "chromium" });
 try {
-  for (const site of selectedSites(options.site)) {
+  for (const site of sites) {
     for (const engine of options.engines) {
       const artifact = resolve(distRoot, site, "artifacts", engine);
       const buildResultPath = resolve(distRoot, site, "results", `${engine}-build.json`);
@@ -154,8 +138,10 @@ try {
         await access(artifact);
         console.log(`Running ${engine}/${site} in Chromium (single-tab)`);
         const { cold, warm } = await runSingleTab(browser, origin, state, engine, site);
+        assertPrecompressed();
         console.log(`Running ${engine}/${site} in Chromium (${options.tabs} tabs)`);
         const multitab = await runMultiTab(browser, origin, state, engine, site, options.tabs);
+        assertPrecompressed();
         await writeFile(
           browserResultPath,
           JSON.stringify({ browser_version: browser.version(), cold, warm, multitab }, null, 2) + "\n",

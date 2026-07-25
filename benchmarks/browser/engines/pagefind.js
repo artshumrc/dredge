@@ -12,7 +12,9 @@ export async function initialize({ artifactBase }) {
     // Alphabetical browse uses the indexed `title` sort key; a keyword search
     // uses pagefind's relevance order (no sort option).
     if (sort) options.sort = { [sort.field]: sort.direction };
-    // A null query is pagefind's match-all browse.
+    // Native AND: pagefind requires every query term by default, so a multi-word
+    // phrase runs as AND-of-terms with no query rewriting. A null query is
+    // pagefind's match-all browse.
     const query = term && term.trim() ? term : null;
     const result = await pagefind.search(query, Object.keys(options).length ? options : undefined);
     const slice = result.results.slice(offset, offset + limit);
@@ -24,10 +26,25 @@ export async function initialize({ artifactBase }) {
       countExact: true,
       checksum: hits.map((hit) => hit.url).join(","),
       titles: hits.map((hit) => hit.meta?.title),
-      // pagefind computes per-value counts for *all* filters as part of every
-      // search, so requesting one facet or all of them costs the same.
+      // pagefind computes per-value counts for *all* filters on every search, so
+      // requesting one facet or all of them costs the same — and both `filters`
+      // and `totalFilters` come back with no extra query.
+      //
+      // Disjunctive/skip-self (verified empirically against pagefind 1.5.2 on the
+      // small site): under an active filter, `result.filters[field]` is
+      // conjunctive (only the applied value keeps a non-zero count), while
+      // `result.totalFilters[field]` gives counts as if that filter were not
+      // applied — the same numbers as the unfiltered search's `filters[field]`.
+      // So the actively-filtered dimension reads from `totalFilters` (skip-self);
+      // every other dimension reads from `filters` (counted over the filtered
+      // set). No second search is needed.
       facets: facets.length
-        ? Object.fromEntries(facets.map((name) => [name, result.filters?.[name] ?? {}]))
+        ? Object.fromEntries(
+            facets.map((name) => {
+              const source = filter && name === filter.field ? result.totalFilters : result.filters;
+              return [name, source?.[name] ?? {}];
+            }),
+          )
         : null,
     };
   };

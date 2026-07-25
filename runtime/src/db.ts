@@ -90,6 +90,60 @@ let poolUtil: any;
 let opened: OpenDatabase | undefined;
 let backend: StorageBackend = "opfs";
 
+// Monotonic boot counter. Each boot() call takes the next value; the deferred
+// background persist captures the value it was started under and refuses to
+// import or swap once a newer boot (a reset re-boot) has superseded it, so a
+// stale database is never written to OPFS or swapped into a live session.
+let bootGeneration = 0;
+
+// The single seam for dropping session-scoped query caches (match table,
+// aggregates, whole responses). The worker registers its search session's
+// clearer here; close/reset and — in a later ticket — a database swap call
+// clearSessionCaches() so no cache ever spans a database change. Absent (or in
+// non-worker callers) it is a no-op.
+let sessionCacheClearer: (() => void) | undefined;
+
+// Finalizer for the active connection's prepared-statement cache (installed by
+// installDatabase alongside the exec that owns the cache). Cached statements are
+// WASM handles scoped to the open connection, so clearSessionCaches() finalizes
+// them on the same triggers as the query caches — close/reset, and ticket 04's
+// connection swap — after the session clearer has run its last exec (dropping
+// the match temp table), so nothing is finalized out from under an in-flight
+// clear. The exec closure rebuilds the cache lazily, so finalizing on a still-
+// open connection simply drops the cache and costs one re-prepare per shape.
+let statementCacheFinalizer: (() => void) | undefined;
+
+// The seam for dropping only the connection-scoped caches — the match temp table
+// and prepared statements — while keeping data caches that describe the database
+// itself (the browse facet-totals map). Ticket 04's memory→OPFS swap registers a
+// connection-only clearer here; it changes the connection, not the database, so
+// the browse map survives. Absent (or in non-worker callers) it is a no-op.
+let connectionCacheClearer: (() => void) | undefined;
+
+export function setSessionCacheClearer(clear: (() => void) | undefined): void {
+  sessionCacheClearer = clear;
+}
+
+export function setConnectionCacheClearer(clear: (() => void) | undefined): void {
+  connectionCacheClearer = clear;
+}
+
+export function clearSessionCaches(): void {
+  sessionCacheClearer?.();
+  statementCacheFinalizer?.();
+}
+
+// Clear only the connection-scoped caches without touching the data caches
+// (browse facet totals). Used by the background persist's memory→OPFS swap,
+// which replaces the connection but keeps the same database, so the corpus-
+// constant browse totals stay valid. The session clearer runs first (dropping
+// the match temp table on the still-open connection) before the statement
+// finalizer reclaims that connection's prepared statements.
+export function clearConnectionCaches(): void {
+  connectionCacheClearer?.();
+  statementCacheFinalizer?.();
+}
+
 // Test-only: clear the cached sqlite module, pool, backend and open handle so a
 // fresh boot can be driven with a new injected environment. Production never
 // calls this — a worker boots once (reset re-boots reuse the cached module).
@@ -98,6 +152,10 @@ export function resetBootStateForTests(): void {
   poolUtil = undefined;
   opened = undefined;
   backend = "opfs";
+  bootGeneration = 0;
+  sessionCacheClearer = undefined;
+  connectionCacheClearer = undefined;
+  statementCacheFinalizer = undefined;
 }
 
 async function ensureSqlite(env: BootEnv, status: StatusFn): Promise<void> {
@@ -237,6 +295,15 @@ async function downloadCompressed(
 }
 
 async function decompress(compressed: Uint8Array, expectedBytes: number): Promise<Uint8Array> {
+  // Buffered, whole-buffer decode. brotli-dec-wasm does expose a chunked stream
+  // decoder (`DecompressStream`/`BrotliDecStream`), but overlapping it with the
+  // download is not adopted here: it is incompatible with the host-decoded fast
+  // path below (which recognizes already-decoded content by comparing the whole
+  // received length to the expected length, unknowable mid-stream) and with the
+  // one-shot hash over the assembled raw bytes. Deferring the OPFS persist is the
+  // larger cold-boot win and is what this epic ships; streaming decode is left
+  // out by decision, not by API limitation.
+  //
   // If the host transparently decoded Content-Encoding: br, the bytes will
   // already match the expected length and we skip the in-worker decode.
   if (compressed.byteLength === expectedBytes) {
@@ -366,13 +433,107 @@ function openInMemoryDatabase(bytes: Uint8Array): unknown {
   }
 }
 
-function makeExec(db: any): Exec {
-  return (sql: string, bind: unknown[] = []) => {
-    return db.exec({ sql, bind, returnValue: "resultRows", rowMode: "array" }) as unknown[][];
+// Bound on the per-connection prepared-statement cache. After ticket 01's match-
+// table reuse the distinct SQL shapes per session are few (the match CREATE
+// recurs only on a match change; count/hits/facet SQL recur per shape), so this
+// cap is not approached in practice — it only guarantees a pathological session
+// cannot accumulate unbounded WASM statement handles.
+const STATEMENT_CACHE_SIZE = 64;
+
+export interface CachedExec {
+  exec: Exec;
+  // Finalize every cached statement and empty the cache. Statements are WASM
+  // handles scoped to the connection `db`; clearSessionCaches() invokes this so
+  // none outlives its connection (close/reset, and ticket 04's swap).
+  finalize: () => void;
+}
+
+// The worker's exec layer. Instead of re-parsing SQL on every call through
+// db.exec(), it prepares each distinct SQL string once and thereafter binds →
+// steps → collects array rows → resets (clearing bindings) the cached statement.
+// Row semantics are identical to db.exec({ rowMode: "array" }): step()/get([])
+// read the same sqlite3_column_* values with the same type mapping (TEXT→string,
+// INTEGER→number, REAL→number, NULL→null, BLOB→Uint8Array), and a statement
+// returning no rows yields []. An SQL error never poisons the cache — the
+// offending statement is finalized and dropped, so the next call re-prepares.
+export function makeExec(db: any): CachedExec {
+  // Insertion-ordered so the oldest entry is the eviction victim.
+  const cache = new Map<string, any>();
+
+  const finalizeStatement = (stmt: any): void => {
+    try {
+      stmt.finalize();
+    } catch {
+      // Already finalized, or the connection is gone — nothing to reclaim.
+    }
   };
+
+  const acquire = (sql: string): any => {
+    const cached = cache.get(sql);
+    if (cached !== undefined) {
+      // Refresh recency so a hot statement is never the eviction victim.
+      cache.delete(sql);
+      cache.set(sql, cached);
+      return cached;
+    }
+    const stmt = db.prepare(sql);
+    cache.set(sql, stmt);
+    if (cache.size > STATEMENT_CACHE_SIZE) {
+      const oldest = cache.keys().next().value as string | undefined;
+      if (oldest !== undefined && oldest !== sql) {
+        const victim = cache.get(oldest);
+        cache.delete(oldest);
+        finalizeStatement(victim);
+      }
+    }
+    return stmt;
+  };
+
+  const exec: Exec = (sql: string, bind: unknown[] = []) => {
+    const stmt = acquire(sql);
+    try {
+      if (bind.length > 0) {
+        stmt.bind(bind);
+      }
+      const rows: unknown[][] = [];
+      while (stmt.step()) {
+        rows.push(stmt.get([]) as unknown[]);
+      }
+      return rows;
+    } catch (error) {
+      // A failed statement is left in an undefined state; finalize and drop it so
+      // it never poisons a later call, which re-prepares cleanly.
+      cache.delete(sql);
+      finalizeStatement(stmt);
+      throw error;
+    } finally {
+      // reset(true) rewinds the statement for reuse and clears its bindings so no
+      // value leaks into the next use. A statement dropped on error above is no
+      // longer cached and must not be touched.
+      if (cache.has(sql)) {
+        try {
+          stmt.reset(true);
+        } catch {
+          // A reset failure surfaces on the next use, which re-prepares.
+        }
+      }
+    }
+  };
+
+  const finalize = (): void => {
+    for (const stmt of cache.values()) {
+      finalizeStatement(stmt);
+    }
+    cache.clear();
+  };
+
+  return { exec, finalize };
 }
 
 export function closeDatabase(): void {
+  // Clear caches before closing so the session can drop its match table on the
+  // still-open connection; the caches must never outlive the database.
+  clearSessionCaches();
   if (opened) {
     try {
       (opened.db as any).close();
@@ -397,7 +558,9 @@ export function getManifest(): DredgeManifest | undefined {
 // Install a freshly opened handle as the active database. No prior handle is
 // closed — a worker boots the database exactly once per session.
 function installDatabase(db: unknown, manifest: DredgeManifest): void {
-  opened = { db, manifest, exec: makeExec(db) };
+  const { exec, finalize } = makeExec(db);
+  statementCacheFinalizer = finalize;
+  opened = { db, manifest, exec };
 }
 
 // OPFS quota preflight. Returns true when it is safe to persist the database to
@@ -427,6 +590,99 @@ export interface BootSession {
   timings: BootTimings;
   // Whether the database was opened from the OPFS cache (a warm visit).
   fromCache: boolean;
+  // Present only on a cold OPFS visit: the deferred background persist (write to
+  // OPFS, then swap the live connection onto the persisted handle). It resolves
+  // when persistence has settled — whether it succeeded, was skipped for lack of
+  // quota, or failed and left the memory session serving — and it never rejects,
+  // so callers may leave it detached (the search worker) or await it to observe
+  // the completed `timings.writeOpfsMs` (the benchmark harness and tests). Absent
+  // on warm visits and memory-only backends, which never persist in background.
+  persistence?: Promise<void>;
+}
+
+// Deferred OPFS persistence for a cold visit. Runs after `ready` so time-to-
+// ready never waits on the OPFS write. On a successful write it swaps the live
+// connection from the in-memory copy onto the persisted OPFS handle so steady-
+// state memory returns to the OPFS-backed level. Every failure path — quota
+// preflight short, importDb error, or a swap that cannot reopen the handle —
+// leaves the working in-memory session untouched and emits only a status
+// detail: a persistence problem never fails a serving session. A newer boot
+// (reset) or a teardown (close/destroy) supersedes an in-flight persist via the
+// boot generation and the live `opened` handle, so no stale database is ever
+// imported or swapped in.
+async function persistInBackground(
+  generation: number,
+  env: BootEnv,
+  status: StatusFn,
+  dbPath: string,
+  raw: Uint8Array,
+  manifest: DredgeManifest,
+  timings: BootTimings,
+): Promise<void> {
+  if (generation !== bootGeneration || !opened) {
+    return;
+  }
+  if (!(await hasStorageHeadroom(env, manifest.db_bytes))) {
+    status(
+      "checking_storage",
+      "insufficient storage quota to persist the database; keeping it in memory for this session.",
+    );
+    return;
+  }
+  // Re-check after the (async) preflight: a reset re-boot or a teardown may have
+  // superseded this persist while it awaited the storage estimate.
+  if (generation !== bootGeneration || !opened) {
+    return;
+  }
+  // From here the work is synchronous. Worker message handling and search
+  // execution are synchronous, so the import and the subsequent swap cannot
+  // interleave with an in-flight search.
+  status("writing_opfs");
+  const writeStart = performance.now();
+  try {
+    poolUtil.importDb(dbPath, raw);
+  } catch (error) {
+    status(
+      "checking_storage",
+      `failed to persist the database to OPFS (${(error as Error).message}); keeping it in memory for this session.`,
+    );
+    return;
+  }
+  cleanupStaleDatabases(dbPath);
+  timings.writeOpfsMs = performance.now() - writeStart;
+  if (generation === bootGeneration) {
+    swapToOpfs(dbPath, manifest);
+  }
+}
+
+// Swap the live connection from the in-memory database onto the persisted OPFS
+// handle. Opens the new handle FIRST so a failure to open leaves the working
+// in-memory connection untouched; only once the OPFS handle is in hand does it
+// clear the connection-scoped caches (match table + prepared statements) on the
+// old connection, install the new handle, and close the old one. The browse
+// facet-totals map is data about the same database, so `clearConnectionCaches`
+// deliberately keeps it. Called only from the synchronous tail of the background
+// persist, so it never races a search.
+function swapToOpfs(dbPath: string, manifest: DredgeManifest): void {
+  if (!opened) {
+    return;
+  }
+  let opfsDb: unknown;
+  try {
+    opfsDb = openDatabaseHandle(dbPath);
+  } catch {
+    // The persisted copy would not open; keep serving from memory. The OPFS file
+    // remains for the next visit, which takes the warm path.
+    return;
+  }
+  const previous = opened.db;
+  clearConnectionCaches();
+  installDatabase(opfsDb, manifest);
+  try {
+    (previous as any).close();
+  } catch {
+    // Best effort — the in-memory handle is being discarded regardless.
+  }
 }
 
 export async function boot(
@@ -437,6 +693,10 @@ export async function boot(
 ): Promise<BootSession> {
   status("checking_support");
   await ensureSqlite(env, status);
+
+  // Claim a boot generation up front so any background persist still in flight
+  // from a previous boot is superseded and cannot import or swap over this one.
+  const generation = ++bootGeneration;
 
   const t0 = performance.now();
   status("fetching_manifest");
@@ -488,9 +748,10 @@ export async function boot(
     };
   }
 
-  // Cold visit: download + verify the database, persist it to OPFS (or fall back
-  // to memory), and open it. An integrity failure is fatal — it propagates and
-  // fails boot.
+  // Cold visit: download + verify the database, open it in memory immediately so
+  // search is ready before OPFS is touched, then persist to OPFS in the
+  // background (and swap the live connection onto it). An integrity failure is
+  // fatal — it propagates, failing boot, and gates both open and persist.
   status("downloading_db");
   const downloadStart = performance.now();
   const compressed = await downloadCompressed(env, manifest.db_file, manifestBase);
@@ -502,59 +763,36 @@ export async function boot(
   await verifyDatabaseHash(raw, manifest.db_sha256);
   const decompressMs = performance.now() - decompressStart;
 
-  // Persist to OPFS unless there is no pool (memory backend) or the quota
-  // preflight reports insufficient headroom — either way, open it in memory.
-  let persist = useOpfs;
-  if (persist && !(await hasStorageHeadroom(env, manifest.db_bytes))) {
-    persist = false;
-    status(
-      "checking_storage",
-      "insufficient storage quota to persist the database; opening it in memory for this session.",
-    );
-  }
-
+  // Open the verified bytes in memory and report ready. Time-to-ready (`totalMs`)
+  // ends here; the OPFS write is deferred to the background so it never sits on
+  // the critical path to the first search.
   closeDatabase();
-  let writeOpfsMs = 0;
-  let openMs = 0;
-  let db: unknown;
-  if (persist) {
-    status("writing_opfs");
-    const writeStart = performance.now();
-    try {
-      poolUtil.importDb(dbPath, raw);
-    } catch (error) {
-      throw new WorkerError({
-        code: "QUOTA_EXCEEDED",
-        message: `Failed to store database in OPFS: ${(error as Error).message}`,
-      });
-    }
-    cleanupStaleDatabases(dbPath);
-    writeOpfsMs = performance.now() - writeStart;
-    status("opening_db");
-    const openStart = performance.now();
-    db = openDatabaseHandle(dbPath);
-    openMs = performance.now() - openStart;
-  } else {
-    status("opening_db");
-    const openStart = performance.now();
-    db = openInMemoryDatabase(raw);
-    openMs = performance.now() - openStart;
-  }
-  installDatabase(db, manifest);
+  status("opening_db");
+  const openStart = performance.now();
+  const memoryDb = openInMemoryDatabase(raw);
+  const openMs = performance.now() - openStart;
+  installDatabase(memoryDb, manifest);
   status("ready");
 
-  return {
-    timings: {
-      fromCache: false,
-      manifestMs: manifestDone - t0,
-      downloadMs,
-      decompressMs,
-      writeOpfsMs,
-      openMs,
-      totalMs: performance.now() - t0,
-      compressedBytes: compressed.byteLength,
-      decompressedBytes: raw.byteLength,
-    },
+  const timings: BootTimings = {
     fromCache: false,
+    manifestMs: manifestDone - t0,
+    downloadMs,
+    decompressMs,
+    // Filled in by the background persist when (and if) it writes to OPFS.
+    writeOpfsMs: 0,
+    openMs,
+    totalMs: performance.now() - t0,
+    compressedBytes: compressed.byteLength,
+    decompressedBytes: raw.byteLength,
   };
+
+  // Only an OPFS-capable session persists. A memory-only backend (no pool, or a
+  // failed pool install) keeps the in-memory database for the session as before,
+  // with no background work and no swap.
+  const persistence = useOpfs
+    ? persistInBackground(generation, env, status, dbPath, raw, manifest, timings)
+    : undefined;
+
+  return { timings, fromCache: false, persistence };
 }

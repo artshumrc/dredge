@@ -48,9 +48,11 @@ function flexConfiguration() {
     document: {
       id: "id",
       index: ["title", "body"],
-      // Every facet dimension is a tag (filterable) and stored, so the adapter
-      // can both filter on and tally each one over the full match set.
-      tag: facetNames,
+      // Facet values are stored (so the adapter can tally them over the full
+      // match set) but NOT declared as `tag`: FlexSearch's native tag search
+      // verifiably drops matches (a 400-doc/50-expected probe returns 25), so
+      // the adapter filters in JavaScript instead. Declaring the tags would only
+      // inflate FlexSearch's artifact for an index nothing reads.
       store: ["id", "url", "title", ...facetNames],
     },
   };

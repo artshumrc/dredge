@@ -16,11 +16,23 @@ test("parses a scoped benchmark", () => {
     site: "small",
     engines: ["dredge", "orama"],
     iterations: 5,
+    sampleBudgetMs: 1500,
     limit: undefined,
     tabs: 4,
     operationTimeoutSeconds: 60,
     timeoutMinutes: 30,
+    skipPrepare: false,
   });
+});
+
+test("parses --skip-prepare as a boolean flag", () => {
+  assert.equal(parseOptions([]).skipPrepare, false);
+  assert.equal(parseOptions(["--skip-prepare"]).skipPrepare, true);
+});
+
+test("parses a custom sample budget", () => {
+  assert.equal(parseOptions(["--sample-budget-ms", "800"]).sampleBudgetMs, 800);
+  assert.throws(() => parseOptions(["--sample-budget-ms", "0"]), /positive number/);
 });
 
 test("parses a custom browser page timeout", () => {

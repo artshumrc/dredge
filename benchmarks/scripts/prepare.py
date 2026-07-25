@@ -112,8 +112,11 @@ def write_html(document: dict[str, str], destination: Path) -> None:
         f"<meta charset=\"utf-8\"><title>{title}</title>"
         f"{facet_metas}"
         # Sort key so pagefind can return an alphabetical no-keyword browse, the
-        # same ordering the other engines use when there is no query.
-        f"<meta data-pagefind-sort=\"title[content]\" content=\"{title}\">"
+        # same ordering the other engines use when there is no query. Lowercased
+        # because pagefind sorts its key case-sensitively (uppercase before
+        # lowercase); the other engines sort case-insensitively, so a lowercased
+        # key gives every engine the same case-insensitive alphabetical browse.
+        f"<meta data-pagefind-sort=\"title[content]\" content=\"{html.escape(document['title'].lower())}\">"
         "</head>"
         f"<body><main data-pagefind-body><h1>{title}</h1><p>{body}</p></main></body></html>\n",
         encoding="utf-8",

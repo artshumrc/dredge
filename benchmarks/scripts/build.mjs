@@ -77,11 +77,9 @@ for (const site of selectedSites(options.site)) {
           resolve(siteRoot, "dredge.config.json"),
           "--metrics-json",
           resolve(results, "dredge-compiler.json"),
-          "--jobs",
-          "1",
-          "--brotli-quality",
-          "5",
-        ],
+           "--jobs",
+           "1",
+         ],
         repoRoot,
       );
       if (result.exit_code === 0 && runtime) await cp(runtime, artifact, { recursive: true });
