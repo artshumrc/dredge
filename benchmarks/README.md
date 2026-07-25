@@ -102,6 +102,23 @@ artifacts are `dist/report.json` (machine-readable, with a structured
 keep a durable snapshot, deliberately copy `dist/report.md` to a dated file;
 there is no floating results file in the repo.
 
+### Publishing the report
+
+`dist/` is gitignored and can't be regenerated in CI — the corpora it depends
+on live in sibling repos, not in this one. To publish a run's `report.html` to
+GitHub Pages, copy it into the tracked snapshot and push:
+
+```sh
+pnpm report:publish   # copies dist/report.html -> benchmarks/report/index.html
+git add benchmarks/report/index.html
+git commit -m "Update benchmark report"
+git push
+```
+
+Pushing to `main` with a change under `benchmarks/report/` triggers
+`.github/workflows/pages.yml`, which deploys that directory to GitHub Pages
+(published at `https://artshumrc.github.io/dredge/`).
+
 ## Measurements
 
 ### On the build machine
