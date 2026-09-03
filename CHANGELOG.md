@@ -18,6 +18,9 @@ those notes and the built wheel and sdist.
 - `runtime_min_version` in the Manifest is a hand-maintained constant rather than
   the compiler's own version, so a release no longer declares every deployed
   Runtime out of date. It moves only when a format change actually breaks one.
+- `runtime/package.json` pins `packageManager`, which `pnpm/action-setup`
+  needs to pick a pnpm version; without it every CI run failed before it
+  reached a test.
 - `scripts/changelog.py` reads and stamps `CHANGELOG.md`. Tests cover the file's
   shape, the version agreeing between `pyproject.toml` and the package, and
   `runtime/src/db.ts` declaring the same Manifest and schema versions as

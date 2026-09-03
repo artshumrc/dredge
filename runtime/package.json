@@ -1,6 +1,7 @@
 {
   "name": "dredge-runtime",
   "private": true,
+  "packageManager": "pnpm@11.18.0",
   "type": "module",
   "description": "Dredge runtime worker + Milestone 4 browser validation harness",
   "scripts": {
