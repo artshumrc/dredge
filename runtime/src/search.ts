@@ -1,9 +1,12 @@
 import type { Exec } from "./db";
+import type { DredgeMarks, MarkForms } from "./highlight";
+import { foldTerm, markFields, markForms } from "./highlight";
 import type { VariantLookup } from "./query";
 import { emitMatchExpression, parseQuery } from "./query";
 
 export { buildMatchExpression, emitMatchExpression, parseQuery } from "./query";
 export type { QueryNode, VariantLookup } from "./query";
+export type { DredgeMark, DredgeMarks } from "./highlight";
 
 export interface DredgeRange<T> {
   min?: T;
@@ -45,7 +48,11 @@ export interface DredgeFacetBucket {
 }
 
 export interface DredgeHit {
-  [field: string]: string | number | boolean | null;
+  [field: string]: string | number | boolean | null | DredgeMarks | undefined;
+  // Where the reader's terms — including the variants that actually matched —
+  // fall in this hit's text fields. Absent when nothing matched, and never
+  // markup: the consumer renders the spans into its own DOM.
+  marks?: DredgeMarks;
 }
 
 export interface DredgeSearchResponse {
@@ -291,13 +298,8 @@ const FTS_BODY_WEIGHT = 1.0;
 // such table, and a runtime opening one widens nothing.
 const TERM_VARIANTS_TABLE = "dredge_term_variants";
 
-// The index folds case and strips diacritics (`unicode61 remove_diacritics 2`)
-// and the variant table is keyed on the terms it holds, so a lookup key has to
-// be folded the same way before it can hit.
-function foldTerm(term: string): string {
-  return term.normalize("NFD").replace(/\p{Diacritic}/gu, "").toLowerCase();
-}
-
+// The variant table is keyed on the terms the index holds, so a lookup key has
+// to be folded the index's way (`foldTerm`) before it can hit.
 function variantLookup(exec: Exec): VariantLookup {
   return (term) => {
     const rows = exec(`SELECT variants FROM ${TERM_VARIANTS_TABLE} WHERE term = ?`, [
@@ -315,6 +317,9 @@ function variantLookup(exec: Exec): VariantLookup {
 interface MatchPlan {
   matchExpr: string;
   exactExpr: string | null;
+  // The surface forms to mark on each hit — the reader's own terms plus whatever
+  // widening added, so the marking cannot contradict the match set.
+  markForms: MarkForms;
 }
 
 function planMatch(exec: Exec, schema: SchemaInfo, query: string): MatchPlan | null {
@@ -324,10 +329,15 @@ function planMatch(exec: Exec, schema: SchemaInfo, query: string): MatchPlan | n
   }
   const exactExpr = emitMatchExpression(node);
   if (!schema.hasTermVariants) {
-    return { matchExpr: exactExpr, exactExpr: null };
+    return { matchExpr: exactExpr, exactExpr: null, markForms: markForms(node) };
   }
-  const matchExpr = emitMatchExpression(node, variantLookup(exec));
-  return { matchExpr, exactExpr: matchExpr === exactExpr ? null : exactExpr };
+  const widen = variantLookup(exec);
+  const matchExpr = emitMatchExpression(node, widen);
+  return {
+    matchExpr,
+    exactExpr: matchExpr === exactExpr ? null : exactExpr,
+    markForms: markForms(node, widen),
+  };
 }
 
 // Name of the fixed temp table holding the FTS match: one row per matching
@@ -478,6 +488,7 @@ function computeHits(
   schema: SchemaInfo,
   request: DredgeSearchRequest,
   usesFts: boolean,
+  forms: MarkForms,
 ): DredgeHit[] {
   const filters = request.filters ?? {};
   const limit = Math.max(0, request.limit ?? 20);
@@ -529,6 +540,12 @@ function computeHits(
     // 0 is both "matched the reader's own words" and "no banding ran" — the same
     // convention `score` already uses for a page that was never ranked.
     hit.band = usesRank ? Number(row[columns.length + 1]) : 0;
+    // Marking is independent of ranking: an explicitly sorted page carries the
+    // same marks as a relevance-ordered one.
+    const marks = markFields(hit, forms);
+    if (Object.keys(marks).length > 0) {
+      hit.marks = marks;
+    }
     return hit;
   });
 }
@@ -549,7 +566,7 @@ export function search(
     // Browse: no text query, so no FTS evaluation and no temp table — read
     // directly from the documents table as before.
     const { total, facets } = computeAggregate(exec, schema, request, false);
-    const hits = computeHits(exec, schema, request, false);
+    const hits = computeHits(exec, schema, request, false, []);
     return { total, hits, facets, elapsedMs: performance.now() - started };
   }
 
@@ -558,7 +575,7 @@ export function search(
   createMatchTable(exec, schema, plan.matchExpr, !request.sort, plan.exactExpr);
   try {
     const { total, facets } = computeAggregate(exec, schema, request, true);
-    const hits = computeHits(exec, schema, request, true);
+    const hits = computeHits(exec, schema, request, true, plan.markForms);
     return { total, hits, facets, elapsedMs: performance.now() - started };
   } finally {
     exec(`DROP TABLE IF EXISTS temp.${MATCH_TABLE}`);
@@ -706,7 +723,7 @@ export class SearchSession {
     }
 
     // The hits page is the only per-request work when the aggregate is cached.
-    const hits = computeHits(this.exec, this.schema, request, usesFts);
+    const hits = computeHits(this.exec, this.schema, request, usesFts, plan?.markForms ?? []);
     const response: DredgeSearchResponse = {
       total: aggregate.total,
       hits,

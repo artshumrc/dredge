@@ -69,6 +69,17 @@ const VARIANT_PAGES = [
   },
 ];
 
+// Pages the highlighting tests mark. The diacritic is the point: the index folds
+// it away, so a mark computed on the folded text has to be reported back in the
+// offsets of the title as returned.
+const HIGHLIGHT_PAGES = [
+  {
+    slug: "cafe-ostraka",
+    title: "Café Notes on Ostraka",
+    body: "Notes taken beside the café.",
+  },
+];
+
 // Declared synonym groups: neither pair shares a stem, so only config can put
 // them in one group. They are also the two groups whose members need no corpus
 // presence — `ramses` and `khufu` are on no page in the fixture.
@@ -77,7 +88,7 @@ const SYNONYM_GROUPS = [
   ["khufu", "cheops"],
 ];
 
-function variantPage({ title, body }) {
+function fixturePage({ title, body }) {
   return `<!doctype html>
 <html lang="en">
   <head>
@@ -103,11 +114,16 @@ function variantPage({ title, body }) {
 `;
 }
 
-async function addVariantFixture() {
-  const pageDir = resolve(fixtureRoot, "site", "variants");
-  await mkdir(pageDir, { recursive: true });
-  for (const page of VARIANT_PAGES) {
-    await writeFile(resolve(pageDir, `${page.slug}.html`), variantPage(page), "utf8");
+async function addFixturePages() {
+  for (const [dir, pages] of [
+    ["variants", VARIANT_PAGES],
+    ["highlight", HIGHLIGHT_PAGES],
+  ]) {
+    const pageDir = resolve(fixtureRoot, "site", dir);
+    await mkdir(pageDir, { recursive: true });
+    for (const page of pages) {
+      await writeFile(resolve(pageDir, `${page.slug}.html`), fixturePage(page), "utf8");
+    }
   }
   const config = JSON.parse(await readFile(configPath, "utf8"));
   config.synonym_groups = SYNONYM_GROUPS;
@@ -116,7 +132,7 @@ async function addVariantFixture() {
 
 await rm(fixtureRoot, { recursive: true, force: true });
 run("uv", ["run", "dredge", "synth", fixtureRoot, "--count", "50", "--seed", "7"]);
-await addVariantFixture();
+await addFixturePages();
 run("uv", [
   "run",
   "dredge",

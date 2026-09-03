@@ -15,7 +15,12 @@ import {
   validateManifest,
   verifyDatabaseHash,
 } from "../src/db";
-import type { DredgeSearchRequest, DredgeSearchResponse, SchemaInfo } from "../src/search";
+import type {
+  DredgeHit,
+  DredgeSearchRequest,
+  DredgeSearchResponse,
+  SchemaInfo,
+} from "../src/search";
 import { createSearchSession, introspectSchema, search } from "../src/search";
 import { makeNodeSqliteExec } from "./node-sqlite-exec";
 
@@ -895,6 +900,93 @@ describe("term variant widening", () => {
         elapsedMs: expect.any(Number),
       });
     });
+  });
+});
+
+// Highlighting is a function over the response, never over the index: `snippet()`
+// and `highlight()` return NULL against a contentless index, so a hit's own title
+// and description are the whole of the text there is to mark. The marks are
+// asserted by slicing the field they came back with, because a span that does not
+// line up with the returned string is worse than no span.
+describe("marked terms on a hit", () => {
+  const hitsFor = (query: string): DredgeHit[] => {
+    let hits: DredgeHit[] = [];
+    withFixture((exec, schema) => {
+      hits = search(exec, schema, { query, limit: 1000 }).hits;
+    });
+    return hits;
+  };
+
+  const hitFor = (query: string, title: string): DredgeHit => {
+    const hit = hitsFor(query).find((candidate) => candidate.title === title);
+    if (!hit) {
+      throw new Error(`No hit titled ${JSON.stringify(title)} for ${JSON.stringify(query)}`);
+    }
+    return hit;
+  };
+
+  const marked = (hit: DredgeHit, field: "title" | "description"): string[] =>
+    (hit.marks?.[field] ?? []).map((mark) =>
+      String(hit[field]).slice(mark.start, mark.start + mark.length),
+    );
+
+  it("marks the reader's terms in the title and the description", () => {
+    const hit = hitFor("chamber survey", "Chamber Survey Notes");
+
+    expect(marked(hit, "title")).toEqual(["Chamber", "Survey"]);
+    expect(marked(hit, "description")).toEqual(["Chamber", "Survey"]);
+    // Spans, not markup: the fields come back exactly as they were indexed.
+    expect(hit.title).toBe("Chamber Survey Notes");
+    expect(hit.description).toBe("Chamber Survey Notes.");
+  });
+
+  it("marks the variant that matched rather than the form the reader typed", () => {
+    // `khufu` is on no page in the fixture, so the only reason this hit exists is
+    // its synonym group's other member — which is the word that has to be marked.
+    expect(marked(hitFor("khufu", "Cheops Plateau"), "title")).toEqual(["Cheops"]);
+    // The same for a generated group: the reader typed the plural, the page
+    // holds the past participle twice.
+    expect(
+      marked(hitFor("photographs", "Photographed Chambers Photographed Again"), "title"),
+    ).toEqual(["Photographed", "Photographed"]);
+  });
+
+  it("leaves a term that did not match this hit unmarked", () => {
+    // This page is in the union for `plateau` alone; nothing in the widened
+    // `photographs` group is on it.
+    expect(marked(hitFor("photographs OR plateau", "Cheops Plateau"), "title")).toEqual([
+      "Plateau",
+    ]);
+  });
+
+  it("returns no spans for a field nothing matched in", () => {
+    // This page holds `photographs` only in its body, and the body is not in the
+    // artifact: neither returned field has anything to mark.
+    const hit = hitFor("photographs OR plateau", "Chamber Survey Notes");
+
+    expect(hit.marks).toBeUndefined();
+  });
+
+  it("marks a diacritic-folded match at the returned text's own offsets", () => {
+    const hit = hitFor("cafe", "Café Notes on Ostraka");
+
+    // The index folded the diacritic away to match; the mark is reported back in
+    // the coordinates of the title as returned, where the é is one character.
+    expect(hit.marks?.title).toEqual([{ start: 0, length: 4 }]);
+    expect(marked(hit, "title")).toEqual(["Café"]);
+    expect(marked(hit, "description")).toEqual(["Café"]);
+  });
+
+  it("marks only as far as a prefix term matched", () => {
+    // The final term is prefix-expanded, so marking the whole word would make the
+    // highlight flicker over it between keystrokes.
+    const hit = hitFor("photog", "Photographed Chambers Photographed Again");
+
+    expect(hit.marks?.title).toEqual([
+      { start: 0, length: 6 },
+      { start: 22, length: 6 },
+    ]);
+    expect(marked(hit, "title")).toEqual(["Photog", "Photog"]);
   });
 });
 

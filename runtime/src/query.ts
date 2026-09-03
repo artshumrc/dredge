@@ -350,8 +350,26 @@ function phraseNode(text: string): QueryNode {
   return { kind: "phrase", terms, wideable: false };
 }
 
+// Where the index's tokenizer sees a term: a run of letters and digits, with
+// everything else a separator (`unicode61`). Reported as spans so highlighting
+// can locate a match in the text it is marking rather than re-deriving the
+// boundaries and disagreeing about them.
+export interface TokenSpan {
+  value: string;
+  start: number;
+  end: number;
+}
+
+export function tokenSpans(text: string): TokenSpan[] {
+  return [...text.matchAll(TOKEN_RE)].map((match) => ({
+    value: match[0],
+    start: match.index,
+    end: match.index + match[0].length,
+  }));
+}
+
 function tokenSubterms(text: string): string[] {
-  return text.match(TOKEN_RE) ?? [];
+  return tokenSpans(text).map((token) => token.value);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -463,7 +481,9 @@ function hasLettersAndDigits(values: string[]): boolean {
   return /[A-Za-z]/.test(text) && /\d/.test(text);
 }
 
-function splitTokenParts(subterms: string[]): string[] {
+// A term's separate letter and digit runs, which is the third spelling an
+// identifier matches on (`G7510` -> `G` `7510`).
+export function splitTokenParts(subterms: string[]): string[] {
   return subterms.flatMap((subterm) => subterm.match(TOKEN_PART_RE) ?? []);
 }
 

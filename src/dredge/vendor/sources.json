@@ -9,6 +9,7 @@
     "src/client.ts",
     "src/coordination.ts",
     "src/db.ts",
+    "src/highlight.ts",
     "src/main.ts",
     "src/protocol.ts",
     "src/query.ts",
@@ -16,5 +17,5 @@
     "src/search.ts",
     "src/worker.ts"
   ],
-  "hash": "65d1646512b1f32da47a50224e4876e2320c15242b1954b5cf978fca084e83be"
+  "hash": "c83edec738dc9c3cea4920c5b3c18319ddec21d898a52f98a07152f00f0680dc"
 }
