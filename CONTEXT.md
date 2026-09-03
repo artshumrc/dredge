@@ -33,3 +33,7 @@ The browser-side library: worker (SQLite WASM + OPFS) plus the thin client that 
 
 **Compiler**:
 The Python CLI (`dredge compile`) that extracts, ingests, indexes, and packages a site into the database artifact.
+
+**Term Variant**:
+A compiled equivalence between two surface forms in the corpus, so that a query for one matches the other. A **Variant Group** is the full set a term belongs to. Groups are derived at build time from the index's own terms and written to `dredge_term_variants`, keyed on the surface form so no stemmer ships to the browser.
+_Avoid_: stem, synonym — both are *sources* of term variants, not the thing itself.

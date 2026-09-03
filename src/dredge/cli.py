@@ -52,6 +52,14 @@ def main(argv: list[str] | None = None) -> int:
                 help="Write compiler timing and progress metrics to this JSON file",
             )
             command_parser.add_argument(
+                "--variants-json",
+                type=Path,
+                help=(
+                    "Write the term variant pairings this build produced to "
+                    "this JSON file, for auditing what search will do"
+                ),
+            )
+            command_parser.add_argument(
                 "--brotli-quality",
                 type=int,
                 choices=range(BROTLI_MIN_QUALITY, BROTLI_MAX_QUALITY + 1),
@@ -143,6 +151,7 @@ def main(argv: list[str] | None = None) -> int:
         result = compile_site(
             config_path,
             metrics_json_path=args.metrics_json,
+            variants_json_path=args.variants_json,
             progress_stream=sys.stderr,
             brotli_quality=args.brotli_quality,
             jobs=args.jobs,
@@ -157,6 +166,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"manifest: {result.manifest_path}")
         if args.metrics_json is not None:
             print(f"metrics: {args.metrics_json}")
+        if args.variants_json is not None:
+            print(f"term variants: {args.variants_json}")
         if result.client_path is not None:
             print(f"client: {result.client_path}")
         if result.asset_paths:

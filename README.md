@@ -111,6 +111,9 @@ Keys:
 - `composite_indices`: optional Facet combinations to index together for common filters.
 - `client`: optional generated TypeScript client destination and worker URL.
 - `allow_output_in_source`: set to `true` only when `output_dir` must live inside `source_dir`.
+- `variant_generation`: set to `false` to stop deriving Term Variants from the corpus's own terms. Defaults to `true`; turn it off for a corpus in a language the English stemmer does not serve.
+- `synonym_groups`: arrays of terms declared equivalent, merged into the generated groups. Members need not share a stem, so `["khufu", "cheops"]` works.
+- `suppressed_variants`: term pairs removed from the merged result, so an over-eager stem like `["statue", "status"]` never ships.
 
 Every field has an explicit **role**. A Facet is indexed, filterable, and countable. A Store Field is carried into results but never indexed, filtered, or counted — use it for display-only data (image URLs, thumbnails) so it stops costing index bytes. Facets and Store Fields share one namespace; a name may not be both, and `result_fields` may reference either role. Filtering or counting on a Store Field fails loudly (`FILTER_INVALID`) rather than scanning the whole table.
 
@@ -132,6 +135,12 @@ Compile with optional metrics and Brotli quality controls:
 
 ```sh
 dredge compile --config dredge.config.json --metrics-json metrics.json --brotli-quality 5
+```
+
+Audit the Term Variant pairings a build produced:
+
+```sh
+dredge compile --config dredge.config.json --variants-json variants.json
 ```
 
 Generate only the configured TypeScript client:

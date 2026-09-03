@@ -3,7 +3,7 @@
 import type { BootTimings, DredgeError, DredgeManifest, DredgeStatus } from "./protocol";
 
 const MANIFEST_VERSION = 1;
-const DB_SCHEMA_VERSION = 2;
+const DB_SCHEMA_VERSION = 3;
 
 export type StatusFn = (status: DredgeStatus, detail?: string) => void;
 

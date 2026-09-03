@@ -135,7 +135,7 @@ const FULL_PATH = `/dredge/${FULL_SHA}.db`;
 function makeManifest(overrides: Partial<DredgeManifest> = {}): DredgeManifest {
   return {
     manifest_version: 1,
-    db_schema_version: 2,
+    db_schema_version: 3,
     db_file: "full.db",
     db_sha256: FULL_SHA,
     // Served length equals db_bytes so decompress takes the host-decoded path

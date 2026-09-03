@@ -26,7 +26,7 @@ import brotli
 
 from .progress import CompileProgress
 
-DB_SCHEMA_VERSION = 2
+DB_SCHEMA_VERSION = 3
 MANIFEST_VERSION = 1
 # Oldest Runtime that can read what this compiler emits. Bump only when a
 # format change actually breaks older Runtimes, not on every release.
@@ -44,6 +44,14 @@ METRICS_VERSION = 1
 MAX_WARNING_SAMPLES = 3
 PAYLOAD_HIGH_CARDINALITY_THRESHOLD = 1000
 PAYLOAD_DUPLICATE_COLUMN_RATIO = 0.9
+
+# The tokenizer the shipped index is built with. Declared variant terms are
+# folded through it so a config's ``Ramessès`` keys the row the index stores.
+FTS_TOKENIZER = "unicode61 remove_diacritics 2"
+# Stemming tokenizer used only at build time, to group surface forms. No
+# stemmer ever ships to the browser: the variant table is keyed on surface
+# forms precisely so the Runtime never has to reproduce this.
+VARIANT_STEM_TOKENIZER = f"porter {FTS_TOKENIZER}"
 
 IDENTIFIER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 ATTRIBUTE_RE = re.compile(r"^[A-Za-z_:][-A-Za-z0-9_:.]*$")
@@ -64,6 +72,9 @@ TOP_LEVEL_KEYS = {
     "composite_indices",
     "client",
     "allow_output_in_source",
+    "variant_generation",
+    "synonym_groups",
+    "suppressed_variants",
 }
 SELECTOR_KEYS = {"title", "body", "description"}
 FACET_KEYS = {"type", "source", "required"}
@@ -279,6 +290,9 @@ class DredgeConfig:
     composite_indices: tuple[tuple[str, ...], ...]
     client: dict[str, str]
     allow_output_in_source: bool
+    variant_generation: bool
+    synonym_groups: tuple[tuple[str, ...], ...]
+    suppressed_variants: tuple[tuple[str, str], ...]
     config_hash: str
 
     @property
@@ -551,6 +565,9 @@ def load_config(config_path: Path) -> DredgeConfig:
     _validate_result_fields(result_fields, field_map)
     composite_indices = tuple(_load_composite_indices(raw, facet_map, store_field_map))
     client = _load_client(raw)
+    variant_generation = _optional_bool(raw, "variant_generation", True)
+    synonym_groups = _load_synonym_groups(raw)
+    suppressed_variants = _load_suppressed_variants(raw)
 
     effective_config = {
         "$schema": raw.get("$schema"),
@@ -581,6 +598,9 @@ def load_config(config_path: Path) -> DredgeConfig:
         "composite_indices": [list(index) for index in composite_indices],
         "client": client,
         "allow_output_in_source": allow_output_in_source,
+        "variant_generation": variant_generation,
+        "synonym_groups": [list(group) for group in synonym_groups],
+        "suppressed_variants": [list(pair) for pair in suppressed_variants],
     }
     config_hash = _sha256_text(
         json.dumps(
@@ -604,6 +624,9 @@ def load_config(config_path: Path) -> DredgeConfig:
         composite_indices=composite_indices,
         client=client,
         allow_output_in_source=allow_output_in_source,
+        variant_generation=variant_generation,
+        synonym_groups=synonym_groups,
+        suppressed_variants=suppressed_variants,
         config_hash=config_hash,
     )
 
@@ -714,6 +737,7 @@ def compile_site(
     config_path: Path,
     *,
     metrics_json_path: Path | None = None,
+    variants_json_path: Path | None = None,
     progress_stream: TextIO | None = None,
     brotli_quality: int = BROTLI_QUALITY,
     jobs: int | None = None,
@@ -730,6 +754,7 @@ def compile_site(
         return _compile_site(
             config_path,
             metrics_json_path=metrics_json_path,
+            variants_json_path=variants_json_path,
             progress_stream=progress_stream,
             ui=ui,
             brotli_quality=brotli_quality,
@@ -743,6 +768,7 @@ def _compile_site(
     config_path: Path,
     *,
     metrics_json_path: Path | None,
+    variants_json_path: Path | None,
     progress_stream: TextIO | None,
     ui: CompileProgress,
     brotli_quality: int,
@@ -861,6 +887,9 @@ def _compile_site(
             with metrics.phase("index_creation"):
                 ui.set_phase("index_creation")
                 _create_indexes(connection, config)
+            with metrics.phase("term_variants"):
+                ui.set_phase("term_variants")
+                variant_rows = _build_term_variants(connection, config)
             connection.commit()
             _finalize_database(connection, compact_db_path, metrics, ui)
         except Exception:
@@ -868,6 +897,9 @@ def _compile_site(
             raise
         finally:
             connection.close()
+
+        if variants_json_path is not None:
+            _write_variants_json(variants_json_path, variant_rows)
 
         with metrics.phase("hashing"):
             ui.set_phase("hashing")
@@ -1174,6 +1206,97 @@ def _load_client(raw: dict[str, Any]) -> dict[str, str]:
     return client
 
 
+def _load_synonym_groups(raw: dict[str, Any]) -> tuple[tuple[str, ...], ...]:
+    value = raw.get("synonym_groups", [])
+    if not isinstance(value, list):
+        raise BuildError(
+            "CONFIG_INVALID", "synonym_groups must be an array of term arrays"
+        )
+    groups: list[tuple[str, ...]] = []
+    for group in value:
+        if (
+            not isinstance(group, list)
+            or len(group) < 2
+            or not all(isinstance(term, str) and term.strip() for term in group)
+        ):
+            raise BuildError(
+                "CONFIG_INVALID",
+                "each synonym_groups entry must be an array of at least two "
+                "non-empty terms",
+            )
+        groups.append(
+            _normalize_variant_terms(
+                [term.strip() for term in group], key="synonym_groups"
+            )
+        )
+    return tuple(groups)
+
+
+def _load_suppressed_variants(raw: dict[str, Any]) -> tuple[tuple[str, str], ...]:
+    value = raw.get("suppressed_variants", [])
+    if not isinstance(value, list):
+        raise BuildError(
+            "CONFIG_INVALID", "suppressed_variants must be an array of term pairs"
+        )
+    pairs: list[tuple[str, str]] = []
+    for pair in value:
+        if (
+            not isinstance(pair, list)
+            or len(pair) != 2
+            or not all(isinstance(term, str) and term.strip() for term in pair)
+        ):
+            raise BuildError(
+                "CONFIG_INVALID",
+                "each suppressed_variants entry must be an array of exactly two "
+                "non-empty terms",
+            )
+        left, right = _normalize_variant_terms(
+            [term.strip() for term in pair], key="suppressed_variants"
+        )
+        pairs.append((left, right))
+    return tuple(pairs)
+
+
+def _normalize_variant_terms(terms: Sequence[str], *, key: str) -> tuple[str, ...]:
+    """Fold declared terms to the surface forms the index actually stores.
+
+    Runs each term through the index's own tokenizer, so a config naming
+    ``Ramessès`` keys the ``ramesses`` row a reader's query will look up. A
+    term that does not tokenize to exactly one token cannot key a row at all.
+    """
+    connection = sqlite3.connect(":memory:")
+    try:
+        connection.execute(
+            f"CREATE VIRTUAL TABLE terms USING fts5(term, tokenize='{FTS_TOKENIZER}')"
+        )
+        connection.executemany(
+            "INSERT INTO terms(rowid, term) VALUES (?, ?)",
+            list(enumerate(terms, start=1)),
+        )
+        connection.execute(
+            "CREATE VIRTUAL TABLE vocab USING fts5vocab(terms, 'instance')"
+        )
+        tokens: dict[int, list[str]] = {}
+        for doc, token in connection.execute(
+            "SELECT doc, term FROM vocab ORDER BY doc, offset"
+        ):
+            tokens.setdefault(int(doc), []).append(token)
+    finally:
+        connection.close()
+
+    normalized: list[str] = []
+    for index, term in enumerate(terms, start=1):
+        found = tokens.get(index, [])
+        if len(found) != 1:
+            raise BuildError(
+                "CONFIG_INVALID",
+                f"{key} terms must each be a single searchable word: {term!r}",
+                value=term,
+            )
+        normalized.append(found[0])
+    return tuple(normalized)
+
+
 def _validate_result_fields(
     result_fields: tuple[str, ...], facets: dict[str, FacetConfig]
 ) -> None:
@@ -1258,7 +1381,16 @@ def _create_tables(connection: sqlite3.Connection, config: DredgeConfig) -> None
     _create_dredge_fields_table(connection, config)
     connection.execute(
         "CREATE VIRTUAL TABLE documents_fts USING fts5("
-        "title, body, content='', tokenize='unicode61 remove_diacritics 2')"
+        f"title, body, content='', tokenize='{FTS_TOKENIZER}')"
+    )
+    # Keyed on the surface form rather than a stem, so the Runtime looks up the
+    # word the reader typed and ships no stemmer of its own. Left empty when
+    # variants are configured off.
+    connection.execute(
+        "CREATE TABLE dredge_term_variants ("
+        "term TEXT PRIMARY KEY, "
+        "variants TEXT NOT NULL"
+        ") WITHOUT ROWID"
     )
     _create_array_facet_tables(connection, config)
 
@@ -1673,6 +1805,106 @@ def _coerce_scalar_facet(
     raise BuildError("CONFIG_INVALID", f"unsupported scalar facet type: {facet.type}")
 
 
+def _build_term_variants(
+    connection: sqlite3.Connection, config: DredgeConfig
+) -> list[tuple[str, str]]:
+    """Populate ``dredge_term_variants`` and return the rows written.
+
+    Groups are generated from the finished index, merged with the declared
+    synonym groups, then have the suppressed pairings removed — in that order,
+    so a suppression can break a generated group apart (``statue``/``status``).
+    """
+    adjacency: dict[str, set[str]] = {}
+    if config.variant_generation:
+        for group in _generated_variant_groups(connection):
+            _link_variant_group(adjacency, group)
+    for group in config.synonym_groups:
+        _link_variant_group(adjacency, group)
+    for left, right in config.suppressed_variants:
+        adjacency.get(left, set()).discard(right)
+        adjacency.get(right, set()).discard(left)
+
+    rows = sorted(
+        (term, " ".join(sorted(variants)))
+        for term, variants in adjacency.items()
+        if variants
+    )
+    connection.executemany(
+        "INSERT INTO dredge_term_variants(term, variants) VALUES (?, ?)", rows
+    )
+    return rows
+
+
+def _link_variant_group(adjacency: dict[str, set[str]], group: Sequence[str]) -> None:
+    members = set(group)
+    for term in members:
+        adjacency.setdefault(term, set()).update(members - {term})
+
+
+def _generated_variant_groups(
+    connection: sqlite3.Connection,
+) -> list[tuple[str, ...]]:
+    """Group the index's own surface terms by the stem SQLite's porter gives them.
+
+    Each surface term goes into a scratch porter-tokenized FTS table as its own
+    row; ``fts5vocab`` then reports which rows share a stem. The stems are a
+    build-time grouping key only and are never written anywhere.
+    """
+    connection.execute(
+        "CREATE VIRTUAL TABLE temp.dredge_surface_vocab USING "
+        "fts5vocab('main', 'documents_fts', 'row')"
+    )
+    try:
+        terms = [
+            row[0]
+            for row in connection.execute("SELECT term FROM temp.dredge_surface_vocab")
+        ]
+        connection.execute(
+            "CREATE VIRTUAL TABLE temp.dredge_stems USING "
+            f"fts5(term, tokenize='{VARIANT_STEM_TOKENIZER}')"
+        )
+        try:
+            connection.executemany(
+                "INSERT INTO temp.dredge_stems(rowid, term) VALUES (?, ?)",
+                list(enumerate(terms, start=1)),
+            )
+            connection.execute(
+                "CREATE VIRTUAL TABLE temp.dredge_stem_vocab USING "
+                "fts5vocab('temp', 'dredge_stems', 'instance')"
+            )
+            try:
+                by_stem: dict[str, set[str]] = {}
+                for stem, doc in connection.execute(
+                    "SELECT term, doc FROM temp.dredge_stem_vocab"
+                ):
+                    by_stem.setdefault(stem, set()).add(terms[int(doc) - 1])
+            finally:
+                connection.execute("DROP TABLE temp.dredge_stem_vocab")
+        finally:
+            connection.execute("DROP TABLE temp.dredge_stems")
+    finally:
+        connection.execute("DROP TABLE temp.dredge_surface_vocab")
+
+    return [tuple(members) for members in by_stem.values() if len(members) > 1]
+
+
+def _write_variants_json(
+    variants_json_path: Path, rows: Sequence[tuple[str, str]]
+) -> None:
+    path = _absolute_path(variants_json_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "row_count": len(rows),
+        "terms": {term: variants.split(" ") for term, variants in rows},
+    }
+    temporary_path = path.with_name(f"{path.name}.tmp")
+    temporary_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    temporary_path.replace(path)
+
+
 def _finalize_database(
     connection: sqlite3.Connection,
     compact_db_path: Path,
@@ -1708,6 +1940,14 @@ def format_payload_report(report: dict[str, Any]) -> str:
             )
     else:
         lines.append("  size by table/index: unavailable (dbstat not compiled in)")
+
+    variants = report["term_variants"]
+    variant_bytes = (
+        _format_bytes(variants["bytes"]) if variants["bytes"] is not None else "unknown"
+    )
+    lines.append(
+        f"  term variants: {variants['row_count']:,} rows, {variant_bytes}"
+    )
 
     lines.append(f"  documents columns ({report['row_count']:,} rows):")
     for column in report["columns"]:
@@ -1762,6 +2002,29 @@ def _build_payload_report(
         "row_count": row_count,
         "tables": tables,
         "columns": columns,
+        "term_variants": _payload_term_variant_stats(connection, tables),
+    }
+
+
+def _payload_term_variant_stats(
+    connection: sqlite3.Connection, tables: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """What the variant table costs, so its price is visible before publishing."""
+    variant_bytes = next(
+        (
+            entry["bytes"]
+            for entry in tables
+            if entry["name"] == "dredge_term_variants"
+        ),
+        None,
+    )
+    return {
+        "row_count": int(
+            connection.execute(
+                "SELECT COUNT(*) FROM dredge_term_variants"
+            ).fetchone()[0]
+        ),
+        "bytes": variant_bytes,
     }
 
 

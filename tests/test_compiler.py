@@ -34,7 +34,7 @@ def test_compile_fixture_site_and_query_results(tmp_path: Path) -> None:
     )
     assert "range_required" not in result.manifest
     assert "range_block_bytes" not in result.manifest
-    assert result.manifest["db_schema_version"] == 2
+    assert result.manifest["db_schema_version"] == 3
 
     decompressed = brotli.decompress(result.compressed_db_path.read_bytes())
     assert decompressed == result.db_path.read_bytes()
@@ -909,6 +909,191 @@ def test_generated_client_typechecks_fixture_app_with_pnpm(tmp_path: Path) -> No
         ],
         check=True,
     )
+
+
+def _write_variant_site(
+    tmp_path: Path,
+    *,
+    variant_generation: bool | None = None,
+    synonym_groups: list[list[str]] | None = None,
+    suppressed_variants: list[list[str]] | None = None,
+) -> tuple[Path, Path]:
+    """Write a site whose prose carries the variant cases worth guarding.
+
+    ``photograph``/``photographs``/``photographing`` share a porter stem;
+    ``statue``/``status`` share one they should not; ``khufu``/``cheops`` share
+    none and only pair through config.
+    """
+
+    source_dir = tmp_path / "site"
+    output_dir = tmp_path / "search"
+    source_dir.mkdir(parents=True)
+    (source_dir / "index.html").write_text(
+        """
+        <!doctype html>
+        <html>
+          <head><title>Photographs of Khufu</title></head>
+          <body>
+            <main data-dredge-category="plates">
+              <h1>Photographs of Khufu</h1>
+              <p>A photograph of a statue, photographing its status, and
+                 the name Cheops beside it.</p>
+            </main>
+          </body>
+        </html>
+        """,
+        encoding="utf-8",
+    )
+
+    config: dict[str, object] = {
+        "source_dir": str(source_dir),
+        "output_dir": str(output_dir),
+        "base_url": "/",
+        "selectors": {"title": "title, h1", "body": "main"},
+        "facets": {"category": {"type": "string", "source": "data-dredge-category"}},
+        "result_fields": ["title", "url"],
+    }
+    if variant_generation is not None:
+        config["variant_generation"] = variant_generation
+    if synonym_groups is not None:
+        config["synonym_groups"] = synonym_groups
+    if suppressed_variants is not None:
+        config["suppressed_variants"] = suppressed_variants
+    config_path = tmp_path / "dredge.config.json"
+    config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
+    return config_path, output_dir
+
+
+def _term_variants(db_path: Path) -> dict[str, list[str]]:
+    connection = sqlite3.connect(f"file:{db_path}?mode=ro&immutable=1", uri=True)
+    try:
+        return {
+            term: variants.split(" ")
+            for term, variants in connection.execute(
+                "SELECT term, variants FROM dredge_term_variants"
+            )
+        }
+    finally:
+        connection.close()
+
+
+def test_term_variants_group_surface_forms_sharing_a_stem(tmp_path: Path) -> None:
+    config_path, _ = _write_variant_site(tmp_path)
+
+    result = compile_site(config_path)
+
+    variants = _term_variants(result.db_path)
+    assert set(variants["photograph"]) == {"photographing", "photographs"}
+    assert set(variants["photographs"]) == {"photograph", "photographing"}
+    # One row per surface form, not one per group: the Runtime looks up the word
+    # the reader typed and never stems it.
+    assert "photograp" not in variants
+    # Single-form groups are not written.
+    assert "cheops" not in variants
+
+
+def test_declared_synonym_group_ships_without_a_shared_stem(tmp_path: Path) -> None:
+    config_path, _ = _write_variant_site(
+        tmp_path, synonym_groups=[["Khufu", "Cheops"]]
+    )
+
+    result = compile_site(config_path)
+
+    variants = _term_variants(result.db_path)
+    assert variants["khufu"] == ["cheops"]
+    assert variants["cheops"] == ["khufu"]
+
+
+def test_suppressed_pairing_breaks_a_generated_group_apart(tmp_path: Path) -> None:
+    unsuppressed_path, _ = _write_variant_site(tmp_path / "unsuppressed")
+    assert _term_variants(compile_site(unsuppressed_path).db_path)["statue"] == [
+        "status"
+    ]
+
+    config_path, _ = _write_variant_site(
+        tmp_path / "suppressed", suppressed_variants=[["statue", "status"]]
+    )
+
+    variants = _term_variants(compile_site(config_path).db_path)
+
+    # A two-member group loses its only pairing, so neither form is written.
+    assert "statue" not in variants
+    assert "status" not in variants
+    # Suppressing one pairing leaves the rest of the table alone.
+    assert set(variants["photograph"]) == {"photographing", "photographs"}
+
+
+def test_variant_generation_disabled_writes_no_rows(tmp_path: Path) -> None:
+    config_path, _ = _write_variant_site(tmp_path, variant_generation=False)
+
+    result = compile_site(config_path)
+
+    assert _term_variants(result.db_path) == {}
+    assert result.metrics["payload_report"]["term_variants"]["row_count"] == 0
+
+
+def test_variant_generation_disabled_still_ships_declared_synonyms(
+    tmp_path: Path,
+) -> None:
+    config_path, _ = _write_variant_site(
+        tmp_path, variant_generation=False, synonym_groups=[["khufu", "cheops"]]
+    )
+
+    variants = _term_variants(compile_site(config_path).db_path)
+
+    assert variants == {"cheops": ["khufu"], "khufu": ["cheops"]}
+
+
+def test_compiled_artifact_stamps_the_current_schema_version(tmp_path: Path) -> None:
+    config_path, _ = _write_variant_site(tmp_path)
+
+    result = compile_site(config_path)
+
+    connection = sqlite3.connect(f"file:{result.db_path}?mode=ro&immutable=1", uri=True)
+    try:
+        assert connection.execute("PRAGMA user_version").fetchone() == (
+            compiler.DB_SCHEMA_VERSION,
+        )
+    finally:
+        connection.close()
+    assert result.manifest["db_schema_version"] == compiler.DB_SCHEMA_VERSION
+
+
+def test_payload_report_carries_variant_table_cost(tmp_path: Path) -> None:
+    config_path, _ = _write_variant_site(tmp_path)
+
+    result = compile_site(config_path)
+
+    stats = result.metrics["payload_report"]["term_variants"]
+    assert stats["row_count"] == len(_term_variants(result.db_path))
+    assert stats["row_count"] > 0
+    assert stats["bytes"] > 0
+    assert f"term variants: {stats['row_count']:,} rows" in compiler.format_payload_report(
+        result.metrics["payload_report"]
+    )
+
+
+def test_variants_json_records_the_pairings_a_build_produced(tmp_path: Path) -> None:
+    config_path, _ = _write_variant_site(tmp_path)
+    variants_json_path = tmp_path / "variants.json"
+
+    result = compile_site(config_path, variants_json_path=variants_json_path)
+
+    audit = json.loads(variants_json_path.read_text(encoding="utf-8"))
+    assert audit["terms"] == _term_variants(result.db_path)
+    assert audit["row_count"] == len(audit["terms"])
+
+
+def test_declared_variant_terms_must_be_single_words(tmp_path: Path) -> None:
+    config_path, _ = _write_variant_site(
+        tmp_path, synonym_groups=[["great pyramid", "khufu"]]
+    )
+
+    with pytest.raises(BuildError) as excinfo:
+        load_config(config_path)
+
+    assert excinfo.value.code == "CONFIG_INVALID"
+    assert "single searchable word" in str(excinfo.value)
 
 
 def _write_multi_page_site(

@@ -37,6 +37,7 @@ _PHASES: tuple[tuple[str, str], ...] = (
     ("table_creation", "Creating tables"),
     ("extraction_ingest", "Processing HTML files"),
     ("index_creation", "Building indexes"),
+    ("term_variants", "Deriving term variants"),
     ("fts_optimize", "Optimizing full-text index"),
     ("vacuum_into", "Compacting database"),
     ("hashing", "Hashing database"),
