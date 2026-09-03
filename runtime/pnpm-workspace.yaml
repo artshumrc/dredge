@@ -1,0 +1,3 @@
+# pnpm 11 reads build approvals here rather than from package.json.
+allowBuilds:
+  esbuild: true

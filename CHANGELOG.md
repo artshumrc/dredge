@@ -6,6 +6,53 @@ All notable changes to Dredge are documented here. This project adheres to
 
 ## Unreleased
 
+### The CLI now ships the Runtime
+
+`pip install dredge` carries the browser Runtime — the client and worker bundles
+plus the SQLite and Brotli WASM payloads — inside the wheel, and `dredge compile`
+installs them into `output_dir` next to the database and Manifest. Indexing a
+site now produces everything that site serves under `/search/`; cloning the
+repository and running a Node build to collect the assets is no longer part of
+setup.
+
+- The assets are minified and stored Brotli-compressed inside the wheel (1.25 MB
+  of assets in 454 kB). `--precompress` writes `.br`/`.gz` sidecars beside each
+  installed asset for hosts that serve precompressed files from disk (nginx
+  `brotli_static`, Caddy); it is off by default because the common static hosts
+  compress on the fly and ignore sidecars. `--no-runtime-assets` skips the
+  Runtime entirely.
+- The worker bundle no longer pulls in `@sqlite.org/sqlite-wasm`'s worker1
+  promiser, which had been dragging an unused second copy of `sqlite3.wasm` and
+  its ~196 kB loader into every site: 2.3 MB of installed assets down to 1.25 MB.
+- `dredge codegen` reads its client template from the package instead of from a
+  sibling `runtime/` checkout, so it works from an installed wheel.
+- New `dredge install`, which installs the Runtime into `output_dir` on its own
+  so upgrading Dredge does not mean recompiling the site.
+- Installed assets are all named `dredge-*`, and installing retires `dredge-*`
+  files it did not write. Content-hashed payloads from a previous version no
+  longer accumulate in a site, and sidecars are cleared when `--precompress` is
+  turned off. Nothing else in `output_dir` is touched.
+- `pnpm run vendor` records the runtime sources it built from in
+  `src/dredge/vendor/sources.json`, and a test fails when the vendored assets
+  are stale for the checkout — so an edit under `runtime/src/` cannot silently
+  ship a mismatched Runtime.
+- `runtime/scripts/install-into-site.mjs` is gone; `pnpm run vendor` rebuilds the
+  assets and vendors them into the Python package.
+- Added a test workflow (`.github/workflows/ci.yml`) running the compiler and
+  runtime suites plus a wheel build; the repository previously had CI only for
+  the benchmark report deploy.
+
+#### Upgrading
+
+A site that installed the Runtime by hand from a Dredge checkout has assets
+under the old, unprefixed names (`sqlite3-*.wasm`, `brotli_dec_wasm*`, an
+`assets/` subdirectory). Retirement only sweeps `dredge-*`, so clear the search
+directory once before recompiling:
+
+```sh
+rm -rf <output_dir> && dredge compile --config dredge.config.json
+```
+
 ### Removed the Hot Tier — Dredge now ships a single database (breaking)
 
 The Hot Tier (a small title-plus-opted-in-fields database served first on a cold

@@ -333,6 +333,7 @@ class CompileResult:
     manifest: dict[str, Any]
     page_count: int
     client_path: Path | None = None
+    asset_paths: tuple[Path, ...] = dataclass_field(default_factory=tuple)
     warnings: tuple[BuildWarning, ...] = dataclass_field(default_factory=tuple)
     skipped: tuple[SkippedFile, ...] = dataclass_field(default_factory=tuple)
     metrics: dict[str, Any] = dataclass_field(default_factory=dict)
@@ -714,6 +715,8 @@ def compile_site(
     progress_stream: TextIO | None = None,
     brotli_quality: int = BROTLI_QUALITY,
     jobs: int | None = None,
+    runtime_assets: bool = True,
+    precompress_assets: bool = False,
 ) -> CompileResult:
     if not BROTLI_MIN_QUALITY <= brotli_quality <= BROTLI_MAX_QUALITY:
         raise ValueError(
@@ -729,6 +732,8 @@ def compile_site(
             ui=ui,
             brotli_quality=brotli_quality,
             jobs=jobs,
+            runtime_assets=runtime_assets,
+            precompress_assets=precompress_assets,
         )
 
 
@@ -740,6 +745,8 @@ def _compile_site(
     ui: CompileProgress,
     brotli_quality: int,
     jobs: int | None,
+    runtime_assets: bool,
+    precompress_assets: bool,
 ) -> CompileResult:
     metrics = _MetricsRecorder(config_path)
     with metrics.phase("validation"):
@@ -909,6 +916,14 @@ def _compile_site(
             ui.set_phase("client_write")
             client_path = _write_generated_client(config)
 
+        with metrics.phase("runtime_assets"):
+            ui.set_phase("runtime_assets")
+            asset_paths = (
+                _install_runtime_assets(config.output_dir, precompress_assets)
+                if runtime_assets
+                else ()
+            )
+
         ui.finish()
         warning_tuple = warnings.to_warnings()
         metrics_payload = metrics.to_payload(
@@ -934,6 +949,7 @@ def _compile_site(
             manifest=manifest,
             page_count=len(candidates),
             client_path=client_path,
+            asset_paths=asset_paths,
             warnings=warning_tuple,
             skipped=skipped,
             metrics=metrics_payload,
@@ -1845,6 +1861,12 @@ def _write_generated_client(config: DredgeConfig) -> Path | None:
     from .codegen import write_client
 
     return write_client(config)
+
+
+def _install_runtime_assets(output_dir: Path, precompress: bool) -> tuple[Path, ...]:
+    from .runtime_assets import install_runtime_assets
+
+    return install_runtime_assets(output_dir, precompress=precompress)
 
 
 def _run_smoke_queries(

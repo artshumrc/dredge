@@ -1,0 +1,41 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request: {}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: runtime/package.json
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: runtime/pnpm-lock.yaml
+
+      - run: pnpm install --frozen-lockfile
+        working-directory: runtime
+
+      # Compiler tests include the guards that the vendored browser assets in
+      # src/dredge/vendor are not stale for this checkout.
+      - run: uv run pytest
+
+      # The runtime suite queries a real compiled database, so build the fixture
+      # with the CLI first.
+      - run: node scripts/build-fixture.mjs
+        working-directory: runtime
+      - run: pnpm exec vitest run
+        working-directory: runtime
+
+      - run: uv build --wheel

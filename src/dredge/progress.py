@@ -44,6 +44,7 @@ _PHASES: tuple[tuple[str, str], ...] = (
     ("compression", "Compressing database"),
     ("manifest_write", "Writing manifest"),
     ("client_write", "Writing client"),
+    ("runtime_assets", "Installing runtime assets"),
 )
 _PHASE_INDEX = {key: index for index, (key, _) in enumerate(_PHASES)}
 

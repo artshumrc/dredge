@@ -14,20 +14,37 @@ from .compiler import (
     format_payload_report,
     validate_config,
 )
+from .runtime_assets import install_runtime_assets
+
+_COMMAND_HELP = {
+    "install": "Install the browser runtime into output_dir without recompiling",
+}
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="dredge")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    for command in ("validate", "compile", "codegen"):
-        command_parser = subparsers.add_parser(command)
+    for command in ("validate", "compile", "codegen", "install"):
+        command_parser = subparsers.add_parser(command, help=_COMMAND_HELP.get(command))
         command_parser.add_argument(
             "-c",
             "--config",
             default="dredge.config.json",
             help="Path to dredge.config.json",
         )
+        if command in {"compile", "install"}:
+            command_parser.add_argument(
+                "--precompress",
+                dest="precompress_assets",
+                action="store_true",
+                help=(
+                    "Write .br/.gz sidecars beside each runtime asset, for hosts "
+                    "that serve precompressed responses from disk (nginx "
+                    "brotli_static, Caddy); hosts that compress on the fly "
+                    "ignore them"
+                ),
+            )
         if command == "compile":
             command_parser.add_argument(
                 "--metrics-json",
@@ -43,6 +60,15 @@ def main(argv: list[str] | None = None) -> int:
                 help=(
                     "Brotli quality for the compressed search database "
                     f"(default: {BROTLI_QUALITY})"
+                ),
+            )
+            command_parser.add_argument(
+                "--no-runtime-assets",
+                dest="runtime_assets",
+                action="store_false",
+                help=(
+                    "Skip installing the browser runtime (worker, client, wasm) "
+                    "into output_dir"
                 ),
             )
             command_parser.add_argument(
@@ -100,6 +126,14 @@ def main(argv: list[str] | None = None) -> int:
             print(f"valid: {config.path}")
             return 0
 
+        if args.command == "install":
+            config = validate_config(config_path)
+            paths = install_runtime_assets(
+                config.output_dir, precompress=args.precompress_assets
+            )
+            print(f"runtime assets: {len(paths)} files in {config.output_dir}")
+            return 0
+
         if args.command == "codegen":
             config = validate_config(config_path)
             client_path = write_client(config, require_output=True)
@@ -112,6 +146,8 @@ def main(argv: list[str] | None = None) -> int:
             progress_stream=sys.stderr,
             brotli_quality=args.brotli_quality,
             jobs=args.jobs,
+            runtime_assets=args.runtime_assets,
+            precompress_assets=args.precompress_assets,
         )
         for warning in result.warnings:
             print(f"warning[{warning.code}]: {warning.message}", file=sys.stderr)
@@ -123,6 +159,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"metrics: {args.metrics_json}")
         if result.client_path is not None:
             print(f"client: {result.client_path}")
+        if result.asset_paths:
+            print(f"runtime assets: {len(result.asset_paths)} files")
         print(format_payload_report(result.metrics["payload_report"]))
         return 0
     except BuildError as error:

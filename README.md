@@ -10,31 +10,33 @@ The Runtime lives in the browser. Its worker owns SQLite-WASM and the database h
 
 Dredge ships a single database artifact. On a cold visit the Runtime downloads it, verifies its integrity, persists it to OPFS, and opens it; warm visitors reopen the OPFS copy directly without re-downloading.
 
+## Installation
+
+The wheel carries the Runtime assets (worker, client, and the SQLite/Brotli WASM payloads), so an install is all a site needs — there is no separate Node toolchain step:
+
+```sh
+pip install git+https://github.com/artshumrc/dredge
+```
+
+Working inside this repository, run the CLI through `uv run dredge` instead.
+
 ## Quick start
 
-Indexing a static site and wiring search into its pages is four steps:
+Indexing a static site and wiring search into its pages is three steps:
 
-1. **Compile the artifact.** From a `dredge.config.json` (see [Configuration](#configuration)), extract pages and write the database, compressed database, and Manifest into `output_dir`:
+1. **Compile the artifact.** From a `dredge.config.json` (see [Configuration](#configuration)), extract pages and write the database, compressed database, Manifest, and the Runtime assets into `output_dir`:
 
    ```sh
-   uv run dredge compile --config dredge.config.json
+   dredge compile --config dredge.config.json
    ```
 
 2. **Generate the typed client.** This writes the TypeScript client to the `client.out` path in your config:
 
    ```sh
-   uv run dredge codegen --config dredge.config.json
+   dredge codegen --config dredge.config.json
    ```
 
-3. **Install the Runtime assets** (worker, wasm payloads, chunks) into your site's `/search/` directory, alongside the compiled artifact from step 1:
-
-   ```sh
-   cd runtime
-   pnpm install
-   node scripts/install-into-site.mjs --out ../path/to/site
-   ```
-
-4. **Use the client on the page.** Import the generated client, call `search`, and render the hits:
+3. **Use the client on the page.** Import the generated client, call `search`, and render the hits:
 
    ```ts
    import { DredgeSearchClient } from "./dredge-client";
@@ -117,31 +119,64 @@ Every field has an explicit **role**. A Facet is indexed, filterable, and counta
 Validate a config without writing artifacts:
 
 ```sh
-uv run dredge validate --config dredge.config.json
+dredge validate --config dredge.config.json
 ```
 
 Compile a site into the search artifact and Manifest:
 
 ```sh
-uv run dredge compile --config dredge.config.json
+dredge compile --config dredge.config.json
 ```
 
 Compile with optional metrics and Brotli quality controls:
 
 ```sh
-uv run dredge compile --config dredge.config.json --metrics-json metrics.json --brotli-quality 5
+dredge compile --config dredge.config.json --metrics-json metrics.json --brotli-quality 5
 ```
 
 Generate only the configured TypeScript client:
 
 ```sh
-uv run dredge codegen --config dredge.config.json
+dredge codegen --config dredge.config.json
+```
+
+Install the browser Runtime into `output_dir` without recompiling:
+
+```sh
+dredge install --config dredge.config.json
 ```
 
 Generate a deterministic synthetic site for stress testing:
 
 ```sh
-uv run dredge synth /tmp/dredge-synthetic --count 1000 --seed 1 --shard-size 1000
+dredge synth /tmp/dredge-synthetic --count 1000 --seed 1 --shard-size 1000
+```
+
+## Runtime assets
+
+`dredge compile` installs the Runtime into `output_dir` alongside the database and Manifest, so the compiled directory is the whole of what a site serves under `/search/`:
+
+- `dredge-client.js` — the ESM client bundle the page imports (the generated TypeScript client wraps this API).
+- `dredge-worker.js` — the search Worker, plus its content-hashed SQLite and Brotli WASM payloads and the OPFS proxy chunk.
+
+Every asset is minified, and content-hashed names make them safe to serve immutable.
+
+Compression is left to the host, because a browser only decompresses a response its server marked `Content-Encoding`. Hosts that compress on the fly — GitHub Pages, Netlify, Cloudflare, Vercel — need nothing from Dredge; GitHub Pages gzips these assets including the `.wasm`. On a host configured to serve precompressed files from disk (nginx `brotli_static`/`gzip_static`, Caddy `precompressed`), `--precompress` writes a `.br` (Brotli quality 11) and `.gz` beside each asset, which takes the 1,277 kB of Runtime from 551 kB gzipped on the fly down to 454 kB. Hosts without that mechanism never request the sidecars, so leave them off.
+
+Every installed file is named `dredge-*`. That is what lets a reinstall retire the previous version's content-hashed payloads instead of leaving them to accumulate; nothing else in `output_dir` — the `search.*` database artifacts included — is ever touched.
+
+Pass `--no-runtime-assets` to leave the Runtime out entirely and install it yourself. To refresh the Runtime after upgrading Dredge without recompiling the site, install it on its own:
+
+```sh
+dredge install --config dredge.config.json
+```
+
+The assets are built from `runtime/` and vendored into the Python package, which is what lets the wheel ship them. After changing anything under `runtime/src/`, rebuild them:
+
+```sh
+cd runtime
+pnpm install
+pnpm run vendor
 ```
 
 ## Vocabulary

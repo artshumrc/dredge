@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from importlib.resources import files
 from pathlib import Path
 
 from .compiler import BuildError, DredgeConfig, FacetConfig
@@ -10,13 +11,12 @@ DEFAULT_WORKER_URL = "/search/dredge-worker.js"
 DEFAULT_MANIFEST_URL = "/search/search-manifest.json"
 
 # The generated client is a real, typechecked TypeScript file in the runtime
-# workspace. Codegen reads it and replaces the marked regions with per-site
-# content; everything else passes through verbatim. Keeping the client as .ts
-# (not a Python string) means client changes are reviewed as TypeScript and are
-# covered by `pnpm build`'s tsc pass.
-CLIENT_TEMPLATE_PATH = (
-    Path(__file__).resolve().parents[2] / "runtime" / "src" / "client.template.ts"
-)
+# workspace (runtime/src/client.template.ts), vendored into the package by
+# `pnpm run vendor`. Codegen reads it and replaces the marked regions with
+# per-site content; everything else passes through verbatim. Keeping the client
+# as .ts (not a Python string) means client changes are reviewed as TypeScript
+# and are covered by `pnpm build`'s tsc pass.
+CLIENT_TEMPLATE_RESOURCE = files(__package__).joinpath("vendor", "client.template.ts")
 
 
 def write_client(config: DredgeConfig, *, require_output: bool = False) -> Path | None:
@@ -69,11 +69,12 @@ def generate_client_source(config: DredgeConfig) -> str:
 
 def _read_client_template() -> str:
     try:
-        return CLIENT_TEMPLATE_PATH.read_text(encoding="utf-8")
+        return CLIENT_TEMPLATE_RESOURCE.read_text(encoding="utf-8")
     except OSError as error:
         raise BuildError(
             "CLIENT_TEMPLATE_MISSING",
-            f"client template not found at {CLIENT_TEMPLATE_PATH}: {error}",
+            "this dredge installation ships no client template; rebuild it with"
+            f" `pnpm run vendor` in runtime/ ({error})",
         ) from error
 
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 import hashlib
 import json
 import shutil
@@ -11,7 +12,7 @@ import brotli
 import pytest
 
 from dredge import compiler
-from dredge.codegen import generate_client_source
+from dredge.codegen import CLIENT_TEMPLATE_RESOURCE, generate_client_source
 from dredge.cli import main
 from dredge.compiler import BuildError, compile_site, load_config
 from dredge.query import escape_fts_query
@@ -635,6 +636,108 @@ def test_generated_client_matches_golden(tmp_path: Path) -> None:
     assert source == expected, (
         "generated client drifted from the golden file. If this change is "
         "intended, regenerate tests/fixtures/generated-client.golden.ts."
+    )
+
+
+def test_compile_installs_runtime_assets(tmp_path: Path) -> None:
+    config_path, output_dir = _write_fixture_project(tmp_path)
+
+    result = compile_site(config_path)
+
+    worker = output_dir / "dredge-worker.js"
+    assert worker in result.asset_paths
+    assert (output_dir / "dredge-client.js").exists()
+    assert any(path.suffix == ".wasm" for path in result.asset_paths)
+    assert not (output_dir / "dredge-worker.js.br").exists()
+
+
+def test_compile_precompresses_runtime_assets_on_request(tmp_path: Path) -> None:
+    config_path, output_dir = _write_fixture_project(tmp_path)
+
+    compile_site(config_path, precompress_assets=True)
+
+    worker = (output_dir / "dredge-worker.js").read_bytes()
+    # The bytes stored in the package are reused verbatim as the .br sidecar, so
+    # it must decompress back to exactly the file served to clients without one.
+    assert (
+        brotli.decompress((output_dir / "dredge-worker.js.br").read_bytes()) == worker
+    )
+    assert gzip.decompress((output_dir / "dredge-worker.js.gz").read_bytes()) == worker
+
+
+def test_install_retires_superseded_runtime_assets(tmp_path: Path) -> None:
+    config_path, output_dir = _write_fixture_project(tmp_path)
+    result = compile_site(config_path, precompress_assets=True)
+
+    # A previous version's content-hashed payload, and its sidecars.
+    stale = output_dir / "dredge-sqlite3-0old0hash.wasm"
+    for path in (
+        stale,
+        output_dir / f"{stale.name}.br",
+        output_dir / f"{stale.name}.gz",
+    ):
+        path.write_bytes(b"stale")
+    unrelated = output_dir / "site-styles.css"
+    unrelated.write_bytes(b"not ours")
+
+    main(["install", "--config", str(config_path)])
+
+    assert not stale.exists()
+    assert not (output_dir / f"{stale.name}.br").exists()
+    # Turning precompression back off retires the sidecars from the earlier run.
+    assert not (output_dir / "dredge-worker.js.br").exists()
+    assert (output_dir / "dredge-worker.js").exists()
+    # Neither the database artifacts nor anything the site owns is touched.
+    assert result.compressed_db_path.exists()
+    assert result.manifest_path.exists()
+    assert unrelated.read_bytes() == b"not ours"
+
+
+def test_compile_can_skip_runtime_assets(tmp_path: Path) -> None:
+    config_path, output_dir = _write_fixture_project(tmp_path)
+
+    result = compile_site(config_path, runtime_assets=False)
+
+    assert result.asset_paths == ()
+    assert not (output_dir / "dredge-worker.js").exists()
+
+
+def test_vendored_assets_match_runtime_sources() -> None:
+    # `pnpm run vendor` stamps the sources it built from; if the working tree has
+    # moved on, the vendored assets in src/dredge/vendor/runtime are stale and
+    # the wheel would ship a runtime that does not match this checkout.
+    runtime = Path(__file__).parents[1] / "runtime"
+    if not (runtime / "src").is_dir():
+        pytest.skip("runtime workspace not present in this checkout")
+
+    stamp = json.loads(
+        (
+            Path(__file__).parents[1] / "src" / "dredge" / "vendor" / "sources.json"
+        ).read_text(encoding="utf-8")
+    )
+    digest = hashlib.sha256()
+    for relative_path in stamp["inputs"]:
+        content = hashlib.sha256((runtime / relative_path).read_bytes()).hexdigest()
+        digest.update(f"{relative_path}\0{content}\n".encode())
+
+    assert digest.hexdigest() == stamp["hash"], (
+        "vendored runtime assets are stale for this checkout; "
+        "re-run `pnpm run vendor` in runtime/."
+    )
+
+
+def test_vendored_client_template_matches_runtime_source() -> None:
+    # The template is authored (and typechecked) in the runtime workspace and
+    # vendored into the package; codegen only ever reads the vendored copy.
+    source = Path(__file__).parents[1] / "runtime" / "src" / "client.template.ts"
+    if not source.exists():
+        pytest.skip("runtime workspace not present in this checkout")
+
+    assert CLIENT_TEMPLATE_RESOURCE.read_text(encoding="utf-8") == source.read_text(
+        encoding="utf-8"
+    ), (
+        "vendored client template drifted from runtime/src/client.template.ts; "
+        "re-run `pnpm run vendor` in runtime/."
     )
 
 

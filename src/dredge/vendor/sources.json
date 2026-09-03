@@ -1,0 +1,19 @@
+{
+  "algorithm": "sha256-of-path-and-content",
+  "inputs": [
+    "package.json",
+    "pnpm-lock.yaml",
+    "scripts/build-prod.mjs",
+    "src/browser-boot-env.ts",
+    "src/client.template.ts",
+    "src/client.ts",
+    "src/coordination.ts",
+    "src/db.ts",
+    "src/main.ts",
+    "src/protocol.ts",
+    "src/search-worker.ts",
+    "src/search.ts",
+    "src/worker.ts"
+  ],
+  "hash": "894449ae6a60ee544f387767d1d137761c7df2441713f85b8e1d3d2a092e93a8"
+}
