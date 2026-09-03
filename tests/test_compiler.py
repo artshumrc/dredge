@@ -376,8 +376,8 @@ def test_config_naming_no_search_columns_keeps_the_two_column_index(
         assert [
             row[1] for row in connection.execute("PRAGMA table_info(documents_fts)")
         ] == ["title", "body"]
-        # The weights the runtime used to hold as constants now ship in the
-        # artifact, at the same values.
+        # The default weights ship in the artifact, so the Runtime reads them
+        # rather than holding ranking constants of its own.
         assert connection.execute(
             "SELECT name, position, weight FROM dredge_search_columns ORDER BY position"
         ).fetchall() == [("title", 0, 10.0), ("body", 1, 1.0)]
