@@ -44,6 +44,10 @@ const VARIANT_PAGES = [
   },
   {
     slug: "photographed-chambers",
+    // The boosted category, and the best bm25 of the three: even multiplied it
+    // must stay behind the exact-form page, so this is what proves a boost
+    // cannot reorder across a band.
+    category: "collection",
     title: "Photographed Chambers Photographed Again",
     body: "Photographed chambers are photographed once more each season.",
   },
@@ -87,6 +91,42 @@ const SEARCH_COLUMN_PAGES = [
   },
 ];
 
+// Pages the boost tests order, on two words the generator's vocabulary does not
+// hold so each query's match set is these pages alone. `canopic` sits in both
+// bodies of the first pair, more often and in less text on the unboosted page,
+// so bm25 alone puts that page first and only the category multiplier can
+// invert it. The second pair is word-for-word identical apart from its
+// `revised` date, so bm25 ties them and the recency curve is all that is left
+// to separate them. Their slugs order the older page first, so the document
+// id the unboosted tie falls to is the reverse of what the curve produces.
+const BOOST_PAGES = [
+  {
+    slug: "canopic-index",
+    title: "Register Index Alpha",
+    body: "The canopic canopic register lists each name.",
+  },
+  {
+    slug: "canopic-fragments",
+    category: "collection",
+    title: "Register Index Beta",
+    body:
+      "The fragment register notes a canopic jar cut in relief beside the " +
+      "northern wall and again along the southern corridor of the shaft.",
+  },
+  {
+    slug: "shabti-superseded",
+    revised: "2010-03-01",
+    title: "Shabti Notes Superseded",
+    body: "The shabti carries a scribal note.",
+  },
+  {
+    slug: "shabti-updated",
+    revised: "2024-03-01",
+    title: "Shabti Notes Updated",
+    body: "The shabti carries a scribal note.",
+  },
+];
+
 // Pages the highlighting tests mark. The diacritic is the point: the index folds
 // it away, so a mark computed on the folded text has to be reported back in the
 // offsets of the title as returned.
@@ -106,7 +146,13 @@ const SYNONYM_GROUPS = [
   ["khufu", "cheops"],
 ];
 
-function fixturePage({ title, body, catalog = "variantset" }) {
+function fixturePage({
+  title,
+  body,
+  catalog = "variantset",
+  category = "publication",
+  revised,
+}) {
   return `<!doctype html>
 <html lang="en">
   <head>
@@ -116,13 +162,14 @@ function fixturePage({ title, body, catalog = "variantset" }) {
   </head>
   <body>
     <main
-      data-dredge-category="publication"
+      data-dredge-category="${category}"
       data-dredge-year="2024"
       data-dredge-rating="1.00"
       data-dredge-featured="false"
       data-dredge-published="2024-01-01"
       data-dredge-image="/images/variant.jpg"
       data-dredge-catalog="${catalog}"
+      ${revised ? `data-dredge-revised="${revised}"` : ""}
     >
       <h1>${title}</h1>
       <p>${body}</p>
@@ -137,6 +184,7 @@ async function addFixturePages() {
     ["variants", VARIANT_PAGES],
     ["highlight", HIGHLIGHT_PAGES],
     ["search-columns", SEARCH_COLUMN_PAGES],
+    ["boosts", BOOST_PAGES],
   ]) {
     const pageDir = resolve(fixtureRoot, "site", dir);
     await mkdir(pageDir, { recursive: true });
@@ -151,6 +199,13 @@ async function addFixturePages() {
   // read back out of the artifact.
   config.search_fields = [{ source: "data-dredge-catalog", name: "catalog" }];
   config.search_weights = { catalog: 30.0 };
+  // A date Facet only the boost pages carry, so the recency curve below lifts
+  // those two pages and leaves every other test's ordering exactly as it was.
+  config.facets.revised = { type: "date", source: "data-dredge-revised" };
+  config.boosts = {
+    category: { values: { collection: 8.0 } },
+    revised: { recency: { max: 3.0, half_life_days: 730 } },
+  };
   await writeFile(configPath, `${JSON.stringify(config, null, 2)}\n`, "utf8");
 }
 

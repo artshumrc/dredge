@@ -83,6 +83,24 @@ export interface SearchColumn {
   weight: number;
 }
 
+// An ordering multiplier the maintainer declared over one scalar Facet. bm25
+// ranks are negative and sort ascending, so a multiplier above 1 moves a row
+// toward the front; boosts multiply, never add.
+export type Boost =
+  | {
+      shape: "value";
+      facet: string;
+      // The Facet value, in the type its column holds, and its multiplier.
+      values: Array<{ value: unknown; multiplier: number }>;
+    }
+  | {
+      shape: "recency";
+      facet: string;
+      // The lift a page dated today receives, halving every `halfLifeDays`.
+      maximum: number;
+      halfLifeDays: number;
+    };
+
 export interface SchemaInfo {
   // Scalar facet columns living directly on the documents table.
   scalarColumns: string[];
@@ -98,6 +116,10 @@ export interface SchemaInfo {
   // maintainer's config gave it. `bm25()` takes one weight per column in this
   // order, and a `field:` scope may name any of them.
   searchColumns: SearchColumn[];
+  // The ordering multipliers the artifact declares, empty for a site that
+  // declared none. Read unconditionally: the compiler writes the table into
+  // every artifact, and an older one is refused at Boot on its schema version.
+  boosts: Boost[];
 }
 
 function quoteIdentifier(name: string): string {
@@ -147,7 +169,40 @@ export function introspectSchema(exec: Exec): SchemaInfo {
     documentColumns,
     hasTermVariants: variantTable.length > 0,
     searchColumns,
+    boosts: readBoosts(exec),
   };
+}
+
+// Read the artifact's boost rows into one descriptor per boosted Facet. The
+// value rows of a Facet are collapsed into a single CASE, so their order here
+// is the order the compiler wrote them in.
+function readBoosts(exec: Exec): Boost[] {
+  const boosts: Boost[] = [];
+  const valueBoosts = new Map<string, Extract<Boost, { shape: "value" }>>();
+  const rows = exec(
+    `SELECT facet, shape, value, multiplier, half_life_days FROM ${BOOSTS_TABLE} ` +
+      `ORDER BY rowid`,
+  );
+  for (const row of rows) {
+    const facet = String(row[0]);
+    if (String(row[1]) === "recency") {
+      boosts.push({
+        shape: "recency",
+        facet,
+        maximum: Number(row[3]),
+        halfLifeDays: Number(row[4]),
+      });
+      continue;
+    }
+    let boost = valueBoosts.get(facet);
+    if (!boost) {
+      boost = { shape: "value", facet, values: [] };
+      valueBoosts.set(facet, boost);
+      boosts.push(boost);
+    }
+    boost.values.push({ value: row[2], multiplier: Number(row[3]) });
+  }
+  return boosts;
 }
 
 interface WhereClause {
@@ -287,6 +342,45 @@ function buildOrderClause(
   return usesFts ? `ORDER BY ${MATCH_TABLE}.rank, d.id` : "ORDER BY d.id";
 }
 
+// The product of every declared boost, as one SQL factor over `alias`'s
+// materialized scalar Facet columns. Multipliers and values are bound rather
+// than interpolated: they come out of the artifact, and nothing in an artifact
+// belongs in SQL text. `null` when the site declared no boost, so an unboosted
+// artifact orders by exactly the expression it did before boosts existed.
+//
+// Every factor falls back to 1.0 where the Facet is NULL or unmatched, so a
+// boost can only ever lift the rows it names.
+function boostFactor(
+  schema: SchemaInfo,
+  alias: string,
+): { sql: string; bind: unknown[] } | null {
+  if (schema.boosts.length === 0) {
+    return null;
+  }
+  const factors: string[] = [];
+  const bind: unknown[] = [];
+  for (const boost of schema.boosts) {
+    const column = `${alias}.${quoteIdentifier(boost.facet)}`;
+    if (boost.shape === "value") {
+      const whens = boost.values.map(() => "WHEN ? THEN ?").join(" ");
+      factors.push(`CASE ${column} ${whens} ELSE 1.0 END`);
+      for (const { value, multiplier } of boost.values) {
+        bind.push(value, multiplier);
+      }
+    } else {
+      // julianday() of a NULL or unparseable date is NULL, which COALESCE turns
+      // back into no lift. A date in the future is clamped to age zero rather
+      // than compounding past the declared maximum.
+      factors.push(
+        `COALESCE(1.0 + (? - 1.0) * ` +
+          `pow(2.0, -max(0.0, julianday('now') - julianday(${column})) / ?), 1.0)`,
+      );
+      bind.push(boost.maximum, boost.halfLifeDays);
+    }
+  }
+  return { sql: factors.join(" * "), bind };
+}
+
 function facetNamesToCount(schema: SchemaInfo, includeFacets: boolean | string[]): string[] {
   if (includeFacets === true) {
     return [...schema.scalarColumns, ...schema.arrayFacets.keys()];
@@ -311,6 +405,10 @@ const TERM_VARIANTS_TABLE = "dredge_term_variants";
 // bm25 weight the maintainer configured and the column's position in the index.
 // The compiler writes it into every artifact, so no ranking constant lives here.
 const SEARCH_COLUMNS_TABLE = "dredge_search_columns";
+
+// The artifact's boost table: one row per boosted Facet value, one per recency
+// curve. Empty when the site declared no boost, which is the common case.
+const BOOSTS_TABLE = "dredge_boosts";
 
 // The variant table is keyed on the terms the index holds, so a lookup key has
 // to be folded the index's way (`foldTerm`) before it can hit.
@@ -528,16 +626,21 @@ function computeHits(
     // filters via EXISTS keyed by `m.id` — the same clauses the count uses),
     // then joins `documents` for only that page's display columns instead of
     // probing it for every match. The outer ORDER BY re-asserts page order
-    // after the join. Band leads the ordering: exact matches first, bm25 within
-    // the band, document id beneath that.
+    // after the join, which is why the boosted ordering is materialized as its
+    // own column: only `mm` is in scope by then. Band leads the ordering, so a
+    // boost reorders within a band and can never lift a variant-only match
+    // above an exact one; `score` stays the raw bm25 rank, because boosting is
+    // ordering and not scoring.
     const countFilter = buildFilterClauses(schema, filters, MATCH_TABLE);
     const pageWhere = countFilter.sql.length ? `WHERE ${countFilter.sql.join(" AND ")}` : "";
+    const boost = boostFactor(schema, MATCH_TABLE);
+    const ordering = boost ? `rank * ${boost.sql}` : "rank";
     hitSql =
       `SELECT ${select}, mm.rank AS score, mm.band AS band ` +
-      `FROM (SELECT id, rank, band FROM ${MATCH_TABLE} ${pageWhere} ` +
-      `ORDER BY band, rank, id LIMIT ? OFFSET ?) mm ` +
-      `JOIN documents d ON d.id = mm.id ORDER BY mm.band, mm.rank, d.id`;
-    hitBind = [...countFilter.bind, limit, offset];
+      `FROM (SELECT id, rank, band, ${ordering} AS ordering FROM ${MATCH_TABLE} ${pageWhere} ` +
+      `ORDER BY band, ordering, id LIMIT ? OFFSET ?) mm ` +
+      `JOIN documents d ON d.id = mm.id ORDER BY mm.band, mm.ordering, d.id`;
+    hitBind = [...(boost?.bind ?? []), ...countFilter.bind, limit, offset];
   } else {
     // Explicit-sort keyword pages sort on a `documents` column, so the join must
     // precede the sort; browse pages read the documents table directly.

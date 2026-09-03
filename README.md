@@ -79,6 +79,10 @@ A config declares where the HTML lives, how to extract fields from it, and what 
     }
   ],
   "search_weights": { "title": 10.0, "catalog_id": 25.0 },
+  "boosts": {
+    "category": { "values": { "collection": 2.0 } },
+    "published": { "recency": { "max": 1.5, "half_life_days": 730 } }
+  },
   "facets": {
     "category": {
       "type": "string",
@@ -110,6 +114,7 @@ Keys:
 - `selectors`: extraction selectors for the built-in `title`, `body`, and `description` fields.
 - `search_fields`: extra fields indexed for full-text search. Each entry is either a selector string or a `{ "source": string, "name"?: string }` object. Without a `name` its text is folded into the body full-text index alongside the `body` selector. With one it becomes a **Search Column** of its own — separately weighted for ranking, and addressable as `name:term` in a reader's query.
 - `search_weights`: bm25 weight per Search Column. Keys are `title`, `body`, or any name declared in `search_fields`; values are finite non-negative numbers. Defaults are `title` 10.0, `body` 1.0, and 1.0 for a named Search Column. Every extra Search Column costs roughly 16–20 bytes per document in the shipped index, which the payload report prices per column.
+- `boosts`: optional relevance multipliers per scalar Facet. Each entry declares exactly one shape: `values`, mapping Facet values to multipliers, or `recency`, a curve over a `date` Facet (`max`, the lift a page dated today receives, default 2.0; `half_life_days`, how fast that lift halves, default 730). Multipliers are finite and positive, and multiply rather than add — bm25 ranks are negative, so above 1 moves a page toward the front. Boosting is **ordering only**: the total, every Facet count, and each hit's `score` are unaffected, exact matches still lead their variants, and an explicit `sort` ignores boosts entirely. Boosting a Store Field, an array Facet, or an unknown field fails the build (`CONFIG_INVALID`).
 - `facets`: named fields extracted per page, indexed, filterable, and countable at query time. Supported types are `string`, `string_array`, `integer`, `number`, `boolean`, and `date`.
 - `store_fields`: named fields carried into search results but never indexed, filtered, or counted. Scalar types only — `string_array` must stay a Facet.
 - `result_fields`: fields returned with each hit. May reference built-ins, Facets, and Store Fields.

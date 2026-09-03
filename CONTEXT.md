@@ -38,6 +38,10 @@ The Python CLI (`dredge compile`) that extracts, ingests, indexes, and packages 
 A named, independently weighted full-text column of the Database Artifact's index. `title` and `body` always exist; naming a `search_fields` entry adds another, lifting its text out of the shared body. The columns and their bm25 weights live in the artifact's `dredge_search_columns` table, so the runtime holds no ranking constants of its own.
 _Avoid_: search field, FTS field.
 
+**Boost**:
+A multiplier a site declares over one of its scalar Facets, applied to the relevance ordering of the pages that Facet's value names. Two shapes: a multiplier per value, or a recency curve over a `date` Facet. Boosts multiply rather than add — bm25 ranks are negative — and order pages within a Variant Group band, never across one. They ship in the artifact's `dredge_boosts` table.
+_Avoid_: score, ranking factor — a boost changes order, not what a hit reports as its `score`.
+
 **Term Variant**:
 A compiled equivalence between two surface forms in the corpus, so that a query for one matches the other. A **Variant Group** is the full set a term belongs to. Groups are derived at build time from the index's own terms and written to `dredge_term_variants`, keyed on the surface form so no stemmer ships to the browser.
 _Avoid_: stem, synonym — both are *sources* of term variants, not the thing itself.

@@ -67,6 +67,16 @@ RESERVED_SEARCH_COLUMNS = {*BUILTIN_SEARCH_COLUMNS, "rowid", "rank"}
 DEFAULT_SEARCH_WEIGHTS = {"title": 10.0, "body": 1.0}
 DEFAULT_SEARCH_COLUMN_WEIGHT = 1.0
 
+# The two shapes a boost may take, and the keys a recency curve accepts. Exactly
+# one shape per boosted Facet — the shapes are declarations, not an expression
+# language, so there is nothing to combine.
+BOOST_SHAPES = ("values", "recency")
+RECENCY_KEYS = {"max", "half_life_days"}
+# A recency curve left unparameterized: at most double the weight of a page
+# published today, halving that lift every two years.
+DEFAULT_RECENCY_MAX = 2.0
+DEFAULT_RECENCY_HALF_LIFE_DAYS = 730.0
+
 IDENTIFIER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 ATTRIBUTE_RE = re.compile(r"^[A-Za-z_:][-A-Za-z0-9_:.]*$")
 TOKEN_RE = re.compile(r"[\w]+", re.UNICODE)
@@ -83,6 +93,7 @@ TOP_LEVEL_KEYS = {
     "search_weights",
     "facets",
     "store_fields",
+    "boosts",
     "result_fields",
     "composite_indices",
     "client",
@@ -298,6 +309,24 @@ class SearchColumnConfig:
 
 
 @dataclass(frozen=True)
+class ValueBoostConfig:
+    """A multiplier per value of a scalar Facet."""
+
+    facet: str
+    values: tuple[tuple[str | int | float, float], ...]
+
+
+@dataclass(frozen=True)
+class RecencyBoostConfig:
+    """A curve over a ``date`` Facet: ``maximum`` at age zero, halving every
+    ``half_life_days`` toward no lift at all."""
+
+    facet: str
+    maximum: float
+    half_life_days: float
+
+
+@dataclass(frozen=True)
 class DredgeConfig:
     path: Path
     raw: dict[str, Any]
@@ -311,6 +340,7 @@ class DredgeConfig:
     search_columns: tuple[SearchColumnConfig, ...]
     facets: tuple[FacetConfig, ...]
     store_fields: tuple[FacetConfig, ...]
+    boosts: tuple[ValueBoostConfig | RecencyBoostConfig, ...]
     result_fields: tuple[str, ...]
     composite_indices: tuple[tuple[str, ...], ...]
     client: dict[str, str]
@@ -597,6 +627,7 @@ def load_config(config_path: Path) -> DredgeConfig:
             f"facets and store_fields share field name(s): {', '.join(collisions)}",
         )
     field_map = {**facet_map, **store_field_map}
+    boosts = _load_boosts(raw, facet_map, store_field_map)
     result_fields = tuple(
         _optional_string_list(raw, "result_fields", ["title", "url", "description"])
     )
@@ -635,6 +666,7 @@ def load_config(config_path: Path) -> DredgeConfig:
             }
             for field in store_fields
         },
+        "boosts": _boosts_as_config(boosts),
         "result_fields": list(result_fields),
         "composite_indices": [list(index) for index in composite_indices],
         "client": client,
@@ -662,6 +694,7 @@ def load_config(config_path: Path) -> DredgeConfig:
         search_columns=search_columns,
         facets=facets,
         store_fields=store_fields,
+        boosts=boosts,
         result_fields=result_fields,
         composite_indices=composite_indices,
         client=client,
@@ -1183,6 +1216,190 @@ def _load_search_weights(
     return weights
 
 
+def _load_boosts(
+    raw: dict[str, Any],
+    facets: dict[str, FacetConfig],
+    store_fields: dict[str, FacetConfig],
+) -> tuple[ValueBoostConfig | RecencyBoostConfig, ...]:
+    """Resolve the ordering multipliers a site declares over its own Facets.
+
+    A boost reaches SQLite as one factor of the ordering expression over the
+    match set's materialized scalar Facet columns, which is why only a scalar
+    Facet can carry one: an array Facet has no column there to read.
+    """
+    value = raw.get("boosts", {})
+    if not isinstance(value, dict):
+        raise BuildError("CONFIG_INVALID", "boosts must be an object")
+    boosts: list[ValueBoostConfig | RecencyBoostConfig] = []
+    for name in sorted(value):
+        facet = _boosted_facet(name, facets, store_fields)
+        declaration = value[name]
+        if not isinstance(declaration, dict):
+            raise BuildError(
+                "CONFIG_INVALID", f"boosts[{name}] must be an object"
+            )
+        unknown = sorted(set(declaration) - set(BOOST_SHAPES))
+        if unknown:
+            raise BuildError(
+                "CONFIG_INVALID",
+                f"unknown key(s) on boosts[{name}]: {', '.join(unknown)}",
+            )
+        shapes = [shape for shape in BOOST_SHAPES if shape in declaration]
+        if len(shapes) != 1:
+            raise BuildError(
+                "CONFIG_INVALID",
+                f"boosts[{name}] must declare exactly one of "
+                f"{', '.join(BOOST_SHAPES)}",
+            )
+        if shapes[0] == "values":
+            boosts.append(_load_value_boost(facet, declaration["values"]))
+        else:
+            boosts.append(_load_recency_boost(facet, declaration["recency"]))
+    return tuple(boosts)
+
+
+def _boosted_facet(
+    name: str,
+    facets: dict[str, FacetConfig],
+    store_fields: dict[str, FacetConfig],
+) -> FacetConfig:
+    if name in store_fields:
+        raise BuildError(
+            "CONFIG_INVALID",
+            f"boosts[{name}] names a store field; a store field is not indexed, "
+            "filtered, counted, or boostable",
+        )
+    facet = facets.get(name)
+    if facet is None:
+        raise BuildError(
+            "CONFIG_INVALID",
+            f"boosts[{name}] names unknown facet {name!r}; "
+            f"known facets are {', '.join(sorted(facets)) or '(none)'}",
+        )
+    if facet.is_array:
+        raise BuildError(
+            "CONFIG_INVALID",
+            f"boosts[{name}] names array facet {name!r}; only a scalar facet is "
+            "materialized beside a hit's rank",
+        )
+    return facet
+
+
+def _load_value_boost(facet: FacetConfig, raw: Any) -> ValueBoostConfig:
+    if not isinstance(raw, dict) or not raw:
+        raise BuildError(
+            "CONFIG_INVALID",
+            f"boosts[{facet.name}].values must be a non-empty object mapping "
+            "facet values to multipliers",
+        )
+    values = tuple(
+        (
+            _coerce_boost_value(facet, key),
+            _boost_multiplier(f"boosts[{facet.name}].values[{key}]", raw[key]),
+        )
+        for key in sorted(raw)
+    )
+    return ValueBoostConfig(facet=facet.name, values=values)
+
+
+def _load_recency_boost(facet: FacetConfig, raw: Any) -> RecencyBoostConfig:
+    if facet.type != "date":
+        raise BuildError(
+            "CONFIG_INVALID",
+            f"boosts[{facet.name}].recency needs a date facet, but "
+            f"{facet.name!r} is {facet.type}",
+        )
+    if not isinstance(raw, dict):
+        raise BuildError(
+            "CONFIG_INVALID", f"boosts[{facet.name}].recency must be an object"
+        )
+    unknown = sorted(set(raw) - RECENCY_KEYS)
+    if unknown:
+        raise BuildError(
+            "CONFIG_INVALID",
+            f"unknown key(s) on boosts[{facet.name}].recency: {', '.join(unknown)}",
+        )
+    maximum = _boost_multiplier(
+        f"boosts[{facet.name}].recency.max", raw.get("max", DEFAULT_RECENCY_MAX)
+    )
+    if maximum < 1.0:
+        raise BuildError(
+            "CONFIG_INVALID",
+            f"boosts[{facet.name}].recency.max must be at least 1.0 — the curve "
+            f"lifts recent pages and never demotes them, got {maximum!r}",
+        )
+    half_life = raw.get("half_life_days", DEFAULT_RECENCY_HALF_LIFE_DAYS)
+    if isinstance(half_life, bool) or not isinstance(half_life, (int, float)):
+        raise BuildError(
+            "CONFIG_INVALID",
+            f"boosts[{facet.name}].recency.half_life_days must be a number, "
+            f"got {half_life!r}",
+        )
+    if not math.isfinite(half_life) or half_life <= 0:
+        raise BuildError(
+            "CONFIG_INVALID",
+            f"boosts[{facet.name}].recency.half_life_days must be a finite "
+            f"positive number of days, got {half_life!r}",
+        )
+    return RecencyBoostConfig(
+        facet=facet.name, maximum=maximum, half_life_days=float(half_life)
+    )
+
+
+def _boost_multiplier(label: str, value: Any) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise BuildError(
+            "CONFIG_INVALID", f"{label} must be a number, got {value!r}"
+        )
+    if not math.isfinite(value) or value <= 0:
+        raise BuildError(
+            "CONFIG_INVALID",
+            f"{label} must be a finite positive multiplier, got {value!r}",
+        )
+    return float(value)
+
+
+# ``_coerce_scalar_facet`` reports a bad value against the page it was extracted
+# from; a boost's values come from config, so this stands in for that page and
+# the failure is re-raised as the config error it is.
+_BOOST_VALUE_SOURCE = Path("boosts")
+
+
+def _coerce_boost_value(facet: FacetConfig, key: str) -> str | int | float:
+    """A boost's JSON key in the type its Facet column holds.
+
+    JSON object keys are always strings, so a boost on an integer or boolean
+    Facet has to reach SQLite as that column's own type or its comparison never
+    matches anything.
+    """
+    try:
+        return _coerce_scalar_facet(facet, key, _BOOST_VALUE_SOURCE)
+    except BuildError as error:
+        raise BuildError(
+            "CONFIG_INVALID",
+            f"boosts[{facet.name}] value {key!r} is not a valid {facet.type}",
+        ) from error
+
+
+def _boosts_as_config(
+    boosts: Sequence[ValueBoostConfig | RecencyBoostConfig],
+) -> dict[str, Any]:
+    resolved: dict[str, Any] = {}
+    for boost in boosts:
+        if isinstance(boost, ValueBoostConfig):
+            resolved[boost.facet] = {
+                "values": {str(value): multiplier for value, multiplier in boost.values}
+            }
+        else:
+            resolved[boost.facet] = {
+                "recency": {
+                    "max": boost.maximum,
+                    "half_life_days": boost.half_life_days,
+                }
+            }
+    return resolved
+
+
 def _load_facets(raw: dict[str, Any]) -> tuple[FacetConfig, ...]:
     value = raw.get("facets", {})
     if not isinstance(value, dict):
@@ -1513,6 +1730,49 @@ def _create_search_columns_table(
     )
 
 
+def _create_boosts_table(
+    connection: sqlite3.Connection, config: DredgeConfig
+) -> None:
+    """Record the ordering multipliers a site declared over its Facets.
+
+    One row per boosted value, one per recency curve. ``value`` is typed ``ANY``
+    so a boosted value arrives back at the Runtime as the type its Facet column
+    holds and the comparison it compiles into can match. ``multiplier`` is the
+    factor for a value row and the age-zero lift for a recency row.
+    """
+    connection.execute(
+        "CREATE TABLE dredge_boosts ("
+        "facet TEXT NOT NULL, "
+        "shape TEXT NOT NULL, "
+        "value ANY, "
+        "multiplier REAL NOT NULL, "
+        "half_life_days REAL"
+        ") STRICT"
+    )
+    rows: list[tuple[Any, ...]] = []
+    for boost in config.boosts:
+        if isinstance(boost, ValueBoostConfig):
+            rows.extend(
+                (boost.facet, "value", value, multiplier, None)
+                for value, multiplier in boost.values
+            )
+        else:
+            rows.append(
+                (
+                    boost.facet,
+                    "recency",
+                    None,
+                    boost.maximum,
+                    boost.half_life_days,
+                )
+            )
+    connection.executemany(
+        "INSERT INTO dredge_boosts(facet, shape, value, multiplier, half_life_days) "
+        "VALUES (?, ?, ?, ?, ?)",
+        rows,
+    )
+
+
 def _create_array_facet_tables(
     connection: sqlite3.Connection, config: DredgeConfig
 ) -> None:
@@ -1537,6 +1797,7 @@ def _create_tables(connection: sqlite3.Connection, config: DredgeConfig) -> None
         f"{fts_columns}, content='', tokenize='{FTS_TOKENIZER}')"
     )
     _create_search_columns_table(connection, config)
+    _create_boosts_table(connection, config)
     # Keyed on the surface form rather than a stem, so the Runtime looks up the
     # word the reader typed and ships no stemmer of its own. Left empty when
     # variants are configured off.

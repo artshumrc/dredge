@@ -7,6 +7,7 @@ import shutil
 import sqlite3
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import brotli
 import pytest
@@ -487,6 +488,107 @@ def test_search_column_config_is_validated(
         search_fields=[{"source": "data-dredge-catalog", "name": field_name}],
         search_weights=weights,
     )
+
+    with pytest.raises(BuildError) as error:
+        load_config(config_path)
+
+    assert error.value.code == "CONFIG_INVALID"
+    assert message in str(error.value)
+
+
+def test_declared_boosts_ship_in_the_artifact(tmp_path: Path) -> None:
+    config_path, _ = _write_fixture_project(
+        tmp_path,
+        boosts={
+            "category": {"values": {"collection": 2.5, "guide": 0.5}},
+            "year": {"values": {"2024": 3.0}},
+            "published": {"recency": {"max": 4.0, "half_life_days": 90}},
+        },
+    )
+
+    result = compile_site(config_path)
+
+    connection = sqlite3.connect(f"file:{result.db_path}?mode=ro&immutable=1", uri=True)
+    try:
+        rows = connection.execute(
+            "SELECT facet, shape, value, multiplier, half_life_days "
+            "FROM dredge_boosts ORDER BY rowid"
+        ).fetchall()
+        assert rows == [
+            ("category", "value", "collection", 2.5, None),
+            ("category", "value", "guide", 0.5, None),
+            ("published", "recency", None, 4.0, 90.0),
+            ("year", "value", 2024, 3.0, None),
+        ]
+        # A boost on an integer facet has to reach the Runtime as an integer, or
+        # the comparison it compiles into never matches the column.
+        assert isinstance(rows[3][2], int)
+    finally:
+        connection.close()
+
+
+def test_recency_boost_defaults_its_curve(tmp_path: Path) -> None:
+    config_path, _ = _write_fixture_project(
+        tmp_path, boosts={"published": {"recency": {}}}
+    )
+
+    result = compile_site(config_path)
+
+    connection = sqlite3.connect(f"file:{result.db_path}?mode=ro&immutable=1", uri=True)
+    try:
+        assert connection.execute(
+            "SELECT multiplier, half_life_days FROM dredge_boosts"
+        ).fetchall() == [(2.0, 730.0)]
+    finally:
+        connection.close()
+
+
+def test_config_declaring_no_boost_ships_an_empty_boost_table(tmp_path: Path) -> None:
+    config_path, _ = _write_fixture_project(tmp_path)
+
+    result = compile_site(config_path)
+
+    connection = sqlite3.connect(f"file:{result.db_path}?mode=ro&immutable=1", uri=True)
+    try:
+        assert (
+            connection.execute("SELECT COUNT(*) FROM dredge_boosts").fetchone()[0] == 0
+        )
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize(
+    ("boosts", "message"),
+    [
+        ({"image": {"values": {"a": 2.0}}}, "names a store field"),
+        ({"nosuch": {"values": {"a": 2.0}}}, "names unknown facet"),
+        ({"tags": {"values": {"burial": 2.0}}}, "names array facet"),
+        ({"year": {"recency": {}}}, "needs a date facet"),
+        ({"category": {}}, "must declare exactly one of"),
+        (
+            {"category": {"values": {"guide": 2.0}, "recency": {}}},
+            "must declare exactly one of",
+        ),
+        ({"category": {"curve": {}}}, "unknown key(s) on boosts[category]"),
+        ({"category": {"values": {}}}, "must be a non-empty object"),
+        ({"category": {"values": {"guide": 0}}}, "finite positive multiplier"),
+        ({"category": {"values": {"guide": "heavy"}}}, "must be a number"),
+        ({"year": {"values": {"soon": 2.0}}}, "is not a valid integer"),
+        ({"published": {"recency": {"max": 0.5}}}, "must be at least 1.0"),
+        (
+            {"published": {"recency": {"half_life_days": 0}}},
+            "finite positive number of days",
+        ),
+        (
+            {"published": {"recency": {"decay": 2}}},
+            "unknown key(s) on boosts[published].recency",
+        ),
+    ],
+)
+def test_boost_config_is_validated(
+    tmp_path: Path, boosts: dict[str, Any], message: str
+) -> None:
+    config_path, _ = _write_fixture_project(tmp_path, boosts=boosts)
 
     with pytest.raises(BuildError) as error:
         load_config(config_path)
@@ -1410,6 +1512,7 @@ def _write_fixture_project(
     search_field: bool = True,
     search_fields: list[dict[str, str]] | None = None,
     search_weights: dict[str, float] | None = None,
+    boosts: dict[str, Any] | None = None,
 ) -> tuple[Path, Path]:
     source_dir = tmp_path / "site"
     output_dir = tmp_path / "search"
@@ -1520,6 +1623,8 @@ def _write_fixture_project(
         config["search_fields"] = search_fields or [{"source": "data-dredge-catalog"}]
     if search_weights is not None:
         config["search_weights"] = search_weights
+    if boosts is not None:
+        config["boosts"] = boosts
     if client is not None:
         config["client"] = client
     config_path = tmp_path / "dredge.config.json"

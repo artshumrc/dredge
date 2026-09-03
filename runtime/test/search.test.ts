@@ -971,6 +971,140 @@ describe("term variant widening", () => {
 // and description are the whole of the text there is to mark. The marks are
 // asserted by slicing the field they came back with, because a span that does not
 // line up with the returned string is worse than no span.
+describe("boosted relevance ordering", () => {
+  // The same schema with every declared boost removed, which is the only way to
+  // read the ordering the artifact would have had without them.
+  const unboosted = (schema: SchemaInfo): SchemaInfo => ({ ...schema, boosts: [] });
+
+  it("reads each declared boost from the artifact", () => {
+    withFixture((_exec, schema) => {
+      // Nothing in the runtime names these facets or numbers: both shapes are
+      // read out of the compiled database.
+      expect(schema.boosts).toEqual([
+        {
+          shape: "value",
+          facet: "category",
+          values: [{ value: "collection", multiplier: 8 }],
+        },
+        { shape: "recency", facet: "revised", maximum: 3, halfLifeDays: 730 },
+      ]);
+    });
+  });
+
+  it("orders a boosted facet value ahead of a better bm25 match", () => {
+    withFixture((exec, schema) => {
+      const boosted = search(exec, schema, { query: "canopic", limit: 10 });
+      expect(boosted.hits.map((hit) => hit.title)).toEqual([
+        "Register Index Beta",
+        "Register Index Alpha",
+      ]);
+      // bm25 ranks are negative, so the leading hit holding the *worse* score is
+      // the multiplier at work rather than relevance.
+      expect(boosted.hits[0].score as number).toBeGreaterThan(
+        boosted.hits[1].score as number,
+      );
+      // Same index, same query, boosts removed: relevance alone reads the other
+      // way round.
+      const plain = search(exec, unboosted(schema), { query: "canopic", limit: 10 });
+      expect(plain.hits.map((hit) => hit.title)).toEqual([
+        "Register Index Alpha",
+        "Register Index Beta",
+      ]);
+    });
+  });
+
+  it("changes the order of a boosted query and nothing else", () => {
+    withFixture((exec, schema) => {
+      const request: DredgeSearchRequest = {
+        query: "canopic",
+        includeFacets: true,
+        limit: 1000,
+      };
+      const boosted = search(exec, schema, request);
+      const plain = search(exec, unboosted(schema), request);
+
+      expect(boosted.total).toBe(plain.total);
+      expect(boosted.facets).toEqual(plain.facets);
+      expect(boosted.hits.map((hit) => hit.id).sort()).toEqual(
+        plain.hits.map((hit) => hit.id).sort(),
+      );
+      // Every hit's score is its own bm25 rank either way: the boost orders the
+      // page without rewriting what the engine reports about a hit.
+      const scoreById = new Map(plain.hits.map((hit) => [hit.id, hit.score]));
+      for (const hit of boosted.hits) {
+        expect(hit.score).toBe(scoreById.get(hit.id));
+      }
+    });
+  });
+
+  it("orders a current page above a superseded one at equal relevance", () => {
+    withFixture((exec, schema) => {
+      const boosted = search(exec, schema, { query: "shabti", limit: 10 });
+      expect(boosted.hits.map((hit) => hit.title)).toEqual([
+        "Shabti Notes Updated",
+        "Shabti Notes Superseded",
+      ]);
+      // The two pages are word-for-word identical, so bm25 cannot separate them
+      // and the recency curve over `revised` is the whole of the ordering.
+      expect(boosted.hits[0].score).toBe(boosted.hits[1].score);
+
+      // Without the curve the tie falls to document id, which is the order the
+      // two pages were written in.
+      const plain = search(exec, unboosted(schema), { query: "shabti", limit: 10 });
+      expect(plain.hits.map((hit) => hit.title)).toEqual([
+        "Shabti Notes Superseded",
+        "Shabti Notes Updated",
+      ]);
+    });
+  });
+
+  it("never lifts a variant-only match above an exact one", () => {
+    withFixture((exec, schema) => {
+      const boosted = search(exec, schema, { query: "photographs", limit: 1000 });
+
+      // The best-scoring page of the three carries the boosted category and is
+      // reached only through a Variant Group. Its boosted ordering beats the
+      // exact page's unboosted one several times over, so the band is the only
+      // thing keeping it second.
+      expect(boosted.hits[1].category).toBe("collection");
+      expect((boosted.hits[1].score as number) * 8).toBeLessThan(
+        boosted.hits[0].score as number,
+      );
+
+      const plain = search(exec, unboosted(schema), { query: "photographs", limit: 1000 });
+      expect(boosted.hits.map((hit) => hit.title)).toEqual(
+        plain.hits.map((hit) => hit.title),
+      );
+      expect(boosted.hits.map((hit) => hit.band)).toEqual([0, 1, 1]);
+    });
+  });
+
+  it("ignores boosts under an explicit sort", () => {
+    withFixture((exec, schema) => {
+      const request: DredgeSearchRequest = {
+        query: "canopic",
+        sort: { field: "title" },
+        limit: 10,
+      };
+      const boosted = search(exec, schema, request);
+      const plain = search(exec, unboosted(schema), request);
+
+      // An explicit sort suppresses rank materialization, and a boost is a
+      // factor of the rank ordering: there is nothing left for it to multiply.
+      expect(boosted.hits.map((hit) => hit.title)).toEqual([
+        "Register Index Alpha",
+        "Register Index Beta",
+      ]);
+      expect(boosted.hits.map((hit) => hit.title)).toEqual(
+        plain.hits.map((hit) => hit.title),
+      );
+      for (const hit of boosted.hits) {
+        expect(hit.score).toBe(0);
+      }
+    });
+  });
+});
+
 describe("marked terms on a hit", () => {
   const hitsFor = (query: string): DredgeHit[] => {
     let hits: DredgeHit[] = [];
