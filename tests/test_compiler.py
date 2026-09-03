@@ -15,17 +15,6 @@ from dredge import compiler
 from dredge.codegen import CLIENT_TEMPLATE_RESOURCE, generate_client_source
 from dredge.cli import main
 from dredge.compiler import BuildError, compile_site, load_config
-from dredge.query import escape_fts_query
-
-QUERY_VECTORS_PATH = Path(__file__).parent / "fixtures" / "query-vectors.json"
-
-
-def test_escape_fts_query_matches_shared_vectors() -> None:
-    vectors = json.loads(QUERY_VECTORS_PATH.read_text(encoding="utf-8"))
-    assert vectors, "shared query vectors fixture is empty"
-    for vector in vectors:
-        assert escape_fts_query(vector["q"]) == vector["fts"], vector["q"]
-
 
 def test_compile_fixture_site_and_query_results(tmp_path: Path) -> None:
     config_path, output_dir = _write_fixture_project(tmp_path)

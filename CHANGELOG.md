@@ -6,6 +6,23 @@ All notable changes to Dredge are documented here. This project adheres to
 
 ## Unreleased
 
+### A query language instead of a bag of words
+
+Reader input is parsed into a Query AST and emitted as an FTS5 match expression
+in two separable stages, so quoted phrases, `-` exclusion, `OR`, `field:` scoping,
+`near(a b, N)` and parentheses all work end to end. Nothing else builds a match
+expression, and no reader text reaches `MATCH` unparsed.
+
+- Anything the parser rejects — an unbalanced quote, a stray parenthesis, an
+  unknown field — degrades to the all-terms reading of the raw input. A reader
+  never sees a syntax error.
+- Typeahead is unchanged: only the last term typed is prefix-expanded, never
+  inside a quoted phrase, and a single-character final term stays exact.
+  Catalogue-identifier handling and diacritic folding are untouched.
+- `field:` scopes to the columns the index has today, `title` and `body`.
+- The compiler's duplicate `dredge.query` builder is gone;
+  `tests/fixtures/query-vectors.json` is now the Runtime's golden file alone.
+
 ## 0.2.0 — 2026-09-03
 
 ### Bumping the version in `pyproject.toml` cuts the release

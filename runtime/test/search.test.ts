@@ -15,7 +15,7 @@ import {
   validateManifest,
   verifyDatabaseHash,
 } from "../src/db";
-import type { DredgeSearchRequest, DredgeSearchResponse } from "../src/search";
+import type { DredgeSearchRequest, DredgeSearchResponse, SchemaInfo } from "../src/search";
 import { createSearchSession, introspectSchema, search } from "../src/search";
 import { makeNodeSqliteExec } from "./node-sqlite-exec";
 
@@ -57,6 +57,20 @@ function fixtureDbPath(): string {
     );
   }
   return dbPath;
+}
+
+// Open the compiled fixture database, run `body` against a live Exec, and close
+// it. The fixture is immutable, so every case is independent.
+function withFixture(
+  body: (exec: ReturnType<typeof makeNodeSqliteExec>, schema: SchemaInfo) => void,
+): void {
+  const db = new DatabaseSync(fixtureDbPath());
+  try {
+    const exec = makeNodeSqliteExec(db);
+    body(exec, introspectSchema(exec));
+  } finally {
+    db.close();
+  }
 }
 
 describe("runtime search fixture", () => {
@@ -122,6 +136,126 @@ describe("runtime search fixture", () => {
     } finally {
       db.close();
     }
+  });
+
+  it("matches a quoted phrase only where the words are adjacent", () => {
+    withFixture((exec, schema) => {
+      // Both words are common in the synthetic bodies, so nearly every document
+      // holds each of them somewhere; only a fraction have them side by side.
+      const loose = search(exec, schema, { query: "image temple", limit: 0 });
+      const phrase = search(exec, schema, { query: '"image temple"', limit: 0 });
+
+      expect(loose.total).toBe(49);
+      expect(phrase.total).toBe(13);
+
+      const phraseIds = new Set(
+        search(exec, schema, { query: '"image temple"', limit: 1000 }).hits.map((hit) => hit.id),
+      );
+      const looseIds = search(exec, schema, { query: "image temple", limit: 1000 }).hits.map(
+        (hit) => hit.id,
+      );
+      for (const id of phraseIds) {
+        expect(looseIds).toContain(id);
+      }
+    });
+  });
+
+  it("removes the excluded term's documents with a leading minus", () => {
+    withFixture((exec, schema) => {
+      const all = search(exec, schema, { query: "temple", limit: 1000 });
+      const excluded = search(exec, schema, { query: "sarcophagus", limit: 1000 });
+      const kept = search(exec, schema, { query: "temple -sarcophagus", limit: 1000 });
+
+      expect(kept.total).toBe(22);
+      const excludedIds = new Set(excluded.hits.map((hit) => hit.id));
+      const keptIds = kept.hits.map((hit) => hit.id);
+      for (const id of keptIds) {
+        expect(excludedIds.has(id)).toBe(false);
+      }
+      expect(kept.total).toBe(all.total - all.hits.filter((h) => excludedIds.has(h.id)).length);
+    });
+  });
+
+  it("returns the union of both alternatives for OR", () => {
+    withFixture((exec, schema) => {
+      const left = search(exec, schema, { query: "obelisk", limit: 1000 });
+      const right = search(exec, schema, { query: "cartouche", limit: 1000 });
+      const union = search(exec, schema, { query: "obelisk OR cartouche", limit: 1000 });
+
+      const expected = new Set([
+        ...left.hits.map((hit) => hit.id),
+        ...right.hits.map((hit) => hit.id),
+      ]);
+      expect(union.total).toBe(expected.size);
+      expect(new Set(union.hits.map((hit) => hit.id))).toEqual(expected);
+    });
+  });
+
+  it("restricts a field-scoped term to that column", () => {
+    withFixture((exec, schema) => {
+      const anywhere = search(exec, schema, { query: "temple", limit: 1000 });
+      const titled = search(exec, schema, { query: "title:temple", limit: 1000 });
+
+      expect(anywhere.total).toBe(49);
+      expect(titled.total).toBe(6);
+      for (const hit of titled.hits) {
+        expect(String(hit.title)).toContain("Temple");
+      }
+      // Every body-only mention is dropped, so the scoped result is a strict
+      // subset of the unscoped one.
+      const anywhereIds = new Set(anywhere.hits.map((hit) => hit.id));
+      for (const hit of titled.hits) {
+        expect(anywhereIds.has(hit.id)).toBe(true);
+      }
+    });
+  });
+
+  it("requires NEAR operands to appear within the given distance", () => {
+    withFixture((exec, schema) => {
+      const both = search(exec, schema, { query: "stone temple", limit: 0 });
+      const near = search(exec, schema, { query: "near(stone temple, 3)", limit: 0 });
+
+      expect(both.total).toBe(49);
+      expect(near.total).toBe(46);
+      expect(near.total).toBeLessThan(both.total);
+    });
+  });
+
+  it("combines scoping, exclusion and alternatives in one query", () => {
+    withFixture((exec, schema) => {
+      const combined = search(exec, schema, {
+        query: "title:temple -sarcophagus OR cartouche",
+        limit: 1000,
+      });
+      const titled = new Set(
+        search(exec, schema, { query: "title:temple", limit: 1000 }).hits.map((hit) => hit.id),
+      );
+      const sarcophagus = new Set(
+        search(exec, schema, { query: "sarcophagus", limit: 1000 }).hits.map((hit) => hit.id),
+      );
+      const cartouche = new Set(
+        search(exec, schema, { query: "cartouche", limit: 1000 }).hits.map((hit) => hit.id),
+      );
+
+      // AND binds tighter than OR, so this reads (title:temple NOT sarcophagus)
+      // OR cartouche.
+      const expected = new Set(
+        [...titled].filter((id) => !sarcophagus.has(id)).concat([...cartouche]),
+      );
+      expect(new Set(combined.hits.map((hit) => hit.id))).toEqual(expected);
+      expect(combined.total).toBe(expected.size);
+    });
+  });
+
+  it("degrades a malformed query to its terms instead of throwing", () => {
+    withFixture((exec, schema) => {
+      const plain = search(exec, schema, { query: "temple stone", limit: 0 });
+      for (const malformed of ['"temple stone', "temple (stone", "temple stone)"]) {
+        const response = search(exec, schema, { query: malformed, limit: 0 });
+        expect(response.total).toBe(plain.total);
+      }
+      expect(plain.total).toBeGreaterThan(0);
+    });
   });
 
   it("keeps scalar and array facet counts under all-filters-except-own", () => {

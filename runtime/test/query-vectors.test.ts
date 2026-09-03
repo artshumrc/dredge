@@ -6,9 +6,10 @@ import { describe, expect, it } from "vitest";
 
 import { buildMatchExpression } from "../src/search";
 
-// The single shared fixture (see tests/fixtures/query-vectors.json) is asserted
-// identically by pytest (escape_fts_query) and here (buildMatchExpression), so
-// any tokenization drift between the two implementations fails a test.
+// The golden fixture (see tests/fixtures/query-vectors.json) pins the shape of
+// every emitted match expression. This is the one place an expression is
+// asserted as a string; reader-facing semantics are asserted as documents
+// returned in search.test.ts.
 const vectorsPath = resolve(
   dirname(fileURLToPath(import.meta.url)),
   "..",
