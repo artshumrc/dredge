@@ -22,7 +22,12 @@
 import { WorkerError, toDredgeError } from "./db";
 import type { StatusFn } from "./db";
 import type { DredgeError } from "./protocol";
-import type { DredgeSearchRequest, DredgeSearchResponse } from "./search";
+import type {
+  DredgeSearchRequest,
+  DredgeSearchResponse,
+  DredgeSuggestRequest,
+  DredgeSuggestResponse,
+} from "./search";
 
 // --- Injected primitives (Web Locks / BroadcastChannel shaped) ---------------
 
@@ -78,6 +83,7 @@ export interface CoordinationEnv {
 // booting the database and closing over schema introspection + search().
 export interface LocalBackend {
   search(request: DredgeSearchRequest): DredgeSearchResponse;
+  suggest(request: DredgeSuggestRequest): DredgeSuggestResponse;
 }
 
 // Boot the database and return a LocalBackend. Receives the status callback the
@@ -100,6 +106,7 @@ export interface CoordinatedSessionOptions {
 export interface CoordinatedSession {
   readonly role: "leader" | "follower";
   search(request: DredgeSearchRequest): Promise<DredgeSearchResponse>;
+  suggest(request: DredgeSuggestRequest): Promise<DredgeSuggestResponse>;
   destroy(): void;
 }
 
@@ -110,7 +117,9 @@ type ChannelMessage =
   | { kind: "leader-ready" }
   | { kind: "search-request"; reqId: string; request: DredgeSearchRequest }
   | { kind: "search-response"; reqId: string; response: DredgeSearchResponse }
-  | { kind: "search-error"; reqId: string; error: DredgeError };
+  | { kind: "suggest-request"; reqId: string; request: DredgeSuggestRequest }
+  | { kind: "suggest-response"; reqId: string; response: DredgeSuggestResponse }
+  | { kind: "relay-error"; reqId: string; error: DredgeError };
 
 const DEFAULT_RELAY_TIMEOUT_MS = 10_000;
 
@@ -123,7 +132,9 @@ function channelName(sha: string): string {
 }
 
 interface RelayPending {
-  resolve: (response: DredgeSearchResponse) => void;
+  // The awaited value is whichever response the relayed operation returns; the
+  // caller's own promise is what types it, so this seam is deliberately untyped.
+  resolve: (response: unknown) => void;
   reject: (error: Error) => void;
   cancel: () => void;
 }
@@ -177,7 +188,17 @@ class Session implements CoordinatedSession {
       }
       return this.backend.search(request);
     }
-    return this.relaySearch(request);
+    return this.relay("search-request", request);
+  }
+
+  async suggest(request: DredgeSuggestRequest): Promise<DredgeSuggestResponse> {
+    if (this.role === "leader") {
+      if (!this.backend) {
+        throw new WorkerError({ code: "QUERY_FAILED", message: "Database is not open." });
+      }
+      return this.backend.suggest(request);
+    }
+    return this.relay("suggest-request", request);
   }
 
   destroy(): void {
@@ -305,22 +326,26 @@ class Session implements CoordinatedSession {
       this.broadcastLeaderReady();
       return;
     }
-    if (message.kind === "search-request") {
-      if (!this.backend) {
+    if (message.kind === "search-request" || message.kind === "suggest-request") {
+      const backend = this.backend;
+      if (!backend) {
         return;
       }
       try {
-        const response = this.backend.search(message.request);
-        this.channel?.postMessage({ kind: "search-response", reqId: message.reqId, response });
+        const reply: ChannelMessage =
+          message.kind === "search-request"
+            ? { kind: "search-response", reqId: message.reqId, response: backend.search(message.request) }
+            : { kind: "suggest-response", reqId: message.reqId, response: backend.suggest(message.request) };
+        this.channel?.postMessage(reply);
       } catch (error) {
         this.channel?.postMessage({
-          kind: "search-error",
+          kind: "relay-error",
           reqId: message.reqId,
           error: toDredgeError(error),
         });
       }
     }
-    // leader-ready / search-response / search-error are follower-directed.
+    // leader-ready and the relay replies are follower-directed.
   }
 
   private handleAsFollower(message: ChannelMessage): void {
@@ -328,24 +353,25 @@ class Session implements CoordinatedSession {
       this.applyLeaderReady();
       return;
     }
-    if (message.kind === "search-response") {
-      const pending = this.relayPending.get(message.reqId);
-      if (pending) {
-        this.relayPending.delete(message.reqId);
-        pending.cancel();
-        pending.resolve(message.response);
-      }
+    if (message.kind === "search-response" || message.kind === "suggest-response") {
+      const pending = this.takeRelay(message.reqId);
+      pending?.resolve(message.response);
       return;
     }
-    if (message.kind === "search-error") {
-      const pending = this.relayPending.get(message.reqId);
-      if (pending) {
-        this.relayPending.delete(message.reqId);
-        pending.cancel();
-        pending.reject(new WorkerError(message.error));
-      }
+    if (message.kind === "relay-error") {
+      const pending = this.takeRelay(message.reqId);
+      pending?.reject(new WorkerError(message.error));
     }
-    // leader-query / search-request are leader-directed.
+    // leader-query and the relay requests are leader-directed.
+  }
+
+  private takeRelay(reqId: string): RelayPending | undefined {
+    const pending = this.relayPending.get(reqId);
+    if (pending) {
+      this.relayPending.delete(reqId);
+      pending.cancel();
+    }
+    return pending;
   }
 
   private broadcastLeaderReady(): void {
@@ -364,14 +390,17 @@ class Session implements CoordinatedSession {
 
   // --- Relay -----------------------------------------------------------------
 
-  private relaySearch(request: DredgeSearchRequest): Promise<DredgeSearchResponse> {
+  private relay<T>(
+    kind: "search-request" | "suggest-request",
+    request: DredgeSearchRequest | DredgeSuggestRequest,
+  ): Promise<T> {
     const env = this.env!;
     const reqId = env.newId();
     const timeoutMs = env.relayTimeoutMs ?? DEFAULT_RELAY_TIMEOUT_MS;
-    return new Promise<DredgeSearchResponse>((resolve, reject) => {
+    return new Promise<T>((resolve, reject) => {
       const cancel = env.scheduleTimeout(() => {
         if (this.relayPending.delete(reqId)) {
-          // Leader busy or a zombie holding the lock: fail this search rather
+          // Leader busy or a zombie holding the lock: fail this request rather
           // than silently spinning up a 200 MB in-memory copy. Memory fallback
           // is only for environments that lack the coordination primitives.
           reject(
@@ -382,8 +411,8 @@ class Session implements CoordinatedSession {
           );
         }
       }, timeoutMs);
-      this.relayPending.set(reqId, { resolve, reject, cancel });
-      this.channel?.postMessage({ kind: "search-request", reqId, request });
+      this.relayPending.set(reqId, { resolve: resolve as (value: unknown) => void, reject, cancel });
+      this.channel?.postMessage({ kind, reqId, request } as ChannelMessage);
     });
   }
 

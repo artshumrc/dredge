@@ -6,6 +6,7 @@ import { DatabaseSync } from "node:sqlite";
 
 import { describe, expect, it } from "vitest";
 
+import type { Exec } from "../src/db";
 import {
   clearConnectionCaches,
   closeDatabase,
@@ -21,7 +22,7 @@ import type {
   DredgeSearchResponse,
   SchemaInfo,
 } from "../src/search";
-import { createSearchSession, introspectSchema, search } from "../src/search";
+import { createSearchSession, introspectSchema, search, suggest } from "../src/search";
 import { makeNodeSqliteExec } from "./node-sqlite-exec";
 
 const fixtureRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..", "test-fixtures");
@@ -1696,3 +1697,119 @@ function expectErrorCode(fn: () => unknown, expected: { code: string; message: s
   }
   throw new Error(`Expected ${expected.code} error`);
 }
+
+describe("suggestions from the index vocabulary", () => {
+  // The contract's own check: a suggestion is only legitimate if the index
+  // actually holds the term, so read the vocabulary view directly rather than
+  // trusting the engine's own view of it.
+  function indexTerms(exec: ReturnType<typeof makeNodeSqliteExec>): Set<string> {
+    exec(
+      "CREATE VIRTUAL TABLE IF NOT EXISTS temp.audit_vocab " +
+        "USING fts5vocab(main, documents_fts, 'row')",
+    );
+    return new Set(exec("SELECT term FROM temp.audit_vocab").map((row) => String(row[0])));
+  }
+
+  // An Exec that records every statement it runs and how many rows each returned.
+  function recordingExec(
+    exec: ReturnType<typeof makeNodeSqliteExec>,
+    log: Array<{ sql: string; rows: number }>,
+  ): Exec {
+    return (sql, bind) => {
+      const rows = exec(sql, bind);
+      log.push({ sql, rows: rows.length });
+      return rows;
+    };
+  }
+
+  it("corrects a one-character misspelling to the fixture term it meant", () => {
+    withFixture((exec) => {
+      const { suggestions } = suggest(exec, { term: "cartouchr", kind: "correction" });
+
+      expect(suggestions[0].term).toBe("cartouche");
+      expect(suggestions[0].distance).toBe(1);
+      // Ranking is distance first, so nothing further away may precede it.
+      expect(suggestions.every((s) => s.distance >= suggestions[0].distance)).toBe(true);
+    });
+  });
+
+  it("ranks equal-distance corrections by document frequency", () => {
+    withFixture((exec) => {
+      // `names` and `notes` are both one edit from `nates`; `notes` is in more
+      // documents, so it is the better guess.
+      const { suggestions } = suggest(exec, { term: "nates", kind: "correction" });
+      const terms = suggestions.filter((s) => s.distance === 1).map((s) => s.term);
+
+      expect(terms).toEqual(["notes", "names"]);
+    });
+  });
+
+  it("returns only terms the index holds, for corrections and completions alike", () => {
+    withFixture((exec) => {
+      const terms = indexTerms(exec);
+      const responses = [
+        suggest(exec, { term: "cartouchr", kind: "correction" }),
+        suggest(exec, { term: "limstone", kind: "correction" }),
+        suggest(exec, { term: "st", kind: "completion" }),
+        suggest(exec, { term: "c", kind: "completion" }),
+      ];
+
+      const suggested = responses.flatMap((response) => response.suggestions);
+      expect(suggested.length).toBeGreaterThan(0);
+      for (const suggestion of suggested) {
+        expect(terms.has(suggestion.term)).toBe(true);
+      }
+    });
+  });
+
+  it("completes a prefix only with terms that extend it", () => {
+    withFixture((exec) => {
+      const { suggestions } = suggest(exec, { term: "st", kind: "completion" });
+
+      expect(suggestions.length).toBeGreaterThan(1);
+      for (const suggestion of suggestions) {
+        expect(suggestion.term.startsWith("st")).toBe(true);
+        expect(suggestion.term).not.toBe("st");
+        expect(suggestion.distance).toBe(suggestion.term.length - 2);
+      }
+      // Commonest first: a completion list is a guess, and frequency is the prior.
+      const frequencies = suggestions.map((s) => s.documentFrequency);
+      expect([...frequencies].sort((a, b) => b - a)).toEqual(frequencies);
+    });
+  });
+
+  it("returns an empty list, not an error, when nothing plausible exists", () => {
+    withFixture((exec) => {
+      expect(suggest(exec, { term: "zzqxwv", kind: "correction" }).suggestions).toEqual([]);
+      expect(suggest(exec, { term: "zzqxwv", kind: "completion" }).suggestions).toEqual([]);
+      expect(suggest(exec, { term: "   ", kind: "correction" }).suggestions).toEqual([]);
+    });
+  });
+
+  it("scores only a prefiltered slice of the vocabulary", () => {
+    withFixture((exec) => {
+      const vocabulary = indexTerms(exec);
+      const log: Array<{ sql: string; rows: number }> = [];
+
+      suggest(recordingExec(exec, log), { term: "cartouchr", kind: "correction" });
+
+      const candidates = log.filter((entry) => entry.sql.includes("BETWEEN"));
+      expect(candidates).toHaveLength(1);
+      expect(vocabulary.size).toBeGreaterThan(300);
+      expect(candidates[0].rows).toBeLessThan(vocabulary.size / 10);
+    });
+  });
+
+  it("creates the vocabulary view once per session, not per request", () => {
+    withFixture((exec, schema) => {
+      const log: Array<{ sql: string; rows: number }> = [];
+      const session = createSearchSession(recordingExec(exec, log), schema);
+
+      session.suggest({ term: "cartouchr", kind: "correction" });
+      session.suggest({ term: "st", kind: "completion" });
+      session.suggest({ term: "limstone", kind: "correction" });
+
+      expect(log.filter((entry) => entry.sql.includes("fts5vocab"))).toHaveLength(1);
+    });
+  });
+});

@@ -15,18 +15,25 @@ import type { Exec, StatusFn } from "./db";
 import { startCoordinatedSession } from "./coordination";
 import type { CoordinatedSession, LocalBackend } from "./coordination";
 import { createSearchSession, introspectSchema } from "./search";
-import type { DredgeSearchRequest, DredgeSearchResponse } from "./search";
+import type {
+  DredgeSearchRequest,
+  DredgeSearchResponse,
+  DredgeSuggestRequest,
+  DredgeSuggestResponse,
+} from "./search";
 import type { DredgeError, DredgeStatus } from "./protocol";
 
 type WorkerRequest =
   | { type: "init"; id: number; manifestUrl: string; reset?: boolean }
   | { type: "search"; id: number; request: DredgeSearchRequest }
+  | { type: "suggest"; id: number; request: DredgeSuggestRequest }
   | { type: "destroy"; id: number };
 
 type WorkerResponse =
   | { type: "status"; status: DredgeStatus; detail?: string }
   | { type: "ready"; id: number }
   | { type: "searchResult"; id: number; response: DredgeSearchResponse }
+  | { type: "suggestResult"; id: number; response: DredgeSuggestResponse }
   | { type: "error"; id?: number; error: DredgeError };
 
 // The active session: a leader that owns the database, or a follower relaying to
@@ -67,6 +74,7 @@ async function bootLocal(onStatus: StatusFn): Promise<LocalBackend> {
   setConnectionCacheClearer(() => searchSession.clearConnectionCaches());
   return {
     search: (request) => searchSession.search(request),
+    suggest: (request) => searchSession.suggest(request),
   };
 }
 
@@ -104,6 +112,21 @@ self.onmessage = async (event: MessageEvent<WorkerRequest>) => {
       }
       const response = await session.search(message.request);
       post({ type: "searchResult", id: message.id, response });
+    } catch (error) {
+      post({ type: "error", id: message.id, error: toDredgeError(error) });
+    }
+    return;
+  }
+
+  if (message.type === "suggest") {
+    // Like search, a failure here rejects only this request: a suggestion the
+    // session could not serve must not take the session down with it.
+    try {
+      if (!session) {
+        throw new WorkerError({ code: "QUERY_FAILED", message: "Suggest issued before init." });
+      }
+      const response = await session.suggest(message.request);
+      post({ type: "suggestResult", id: message.id, response });
     } catch (error) {
       post({ type: "error", id: message.id, error: toDredgeError(error) });
     }

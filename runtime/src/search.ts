@@ -62,6 +62,31 @@ export interface DredgeSearchResponse {
   elapsedMs: number;
 }
 
+export type DredgeSuggestKind = "correction" | "completion";
+
+export interface DredgeSuggestRequest {
+  // A single term: the word the reader typed for a correction, the partial word
+  // they are still typing for a completion. Phrases are not suggested against.
+  term: string;
+  kind: DredgeSuggestKind;
+  limit?: number;
+}
+
+export interface DredgeSuggestion {
+  // A term the index actually holds, so accepting this suggestion cannot land
+  // the reader on zero results.
+  term: string;
+  documentFrequency: number;
+  // Edit distance from what the reader typed; for a completion, the number of
+  // characters it adds.
+  distance: number;
+}
+
+export interface DredgeSuggestResponse {
+  suggestions: DredgeSuggestion[];
+  elapsedMs: number;
+}
+
 export class DredgeQueryError extends Error {
   readonly code: string;
 
@@ -705,6 +730,167 @@ export function search(
   }
 }
 
+// --- Suggestions --------------------------------------------------------------
+
+// An FTS5 vocabulary view over the existing index: (term, doc, cnt) for every
+// indexed term. It stores nothing of its own — it reads the index — so a
+// suggestion surface costs no artifact bytes. Created in `temp`, which means it
+// dies with the connection and is rebuilt after a connection swap.
+const VOCAB_TABLE = "dredge_vocab";
+
+// A term held by a single document is more often the corpus's own typo or a
+// one-off than the word the reader meant, and offering it back is how a "did you
+// mean" loses trust. Corrections apply this floor; completions do not, because
+// they compute no edit distance and so need no bound on the candidate set.
+const MIN_DOCUMENT_FREQUENCY = 2;
+
+// Leading characters a correction candidate must share with what the reader
+// typed. One cuts the vocabulary by an order of magnitude while still admitting
+// a typo anywhere after the first character.
+const CORRECTION_PREFIX_LENGTH = 1;
+
+const SUGGESTION_LIMIT = 10;
+
+// One edit for a short word, two for a longer one. At two edits a four-letter
+// word is nearer to most of the dictionary than to what the reader meant.
+function maxEditDistance(length: number): number {
+  return length <= 4 ? 1 : 2;
+}
+
+// A strict upper bound, in SQLite's byte-order comparison of TEXT, for every
+// term beginning with `prefix`: U+10FFFF encodes to the largest UTF-8 sequence
+// there is. This is a seek hint only — `substr(term, 1, n) = prefix` is what
+// makes the predicate exact.
+function prefixUpperBound(prefix: string): string {
+  return `${prefix}\u{10FFFF}`;
+}
+
+// Levenshtein distance over code points, abandoned as soon as no cell in a row
+// is within `max`. The prefilter bounds how many candidates are scored; this
+// bounds the work each one costs.
+function editDistance(a: string[], b: string[], max: number): number {
+  if (Math.abs(a.length - b.length) > max) {
+    return max + 1;
+  }
+  let previous = Array.from({ length: b.length + 1 }, (_, index) => index);
+  for (let i = 1; i <= a.length; i += 1) {
+    const current = new Array<number>(b.length + 1);
+    current[0] = i;
+    let best = i;
+    for (let j = 1; j <= b.length; j += 1) {
+      const substitution = previous[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1);
+      current[j] = Math.min(current[j - 1] + 1, previous[j] + 1, substitution);
+      best = Math.min(best, current[j]);
+    }
+    if (best > max) {
+      return max + 1;
+    }
+    previous = current;
+  }
+  return previous[b.length];
+}
+
+// Create the vocabulary view if this connection does not already carry it.
+// Idempotent, so a caller that has lost track of its connection may repeat it.
+function ensureVocabTable(exec: Exec): void {
+  exec(
+    `CREATE VIRTUAL TABLE IF NOT EXISTS temp.${VOCAB_TABLE} ` +
+      `USING fts5vocab(main, documents_fts, 'row')`,
+  );
+}
+
+// The nearest corpus terms to a misspelling. Candidates are narrowed in SQL by
+// leading character, length window, and the document-frequency floor *before*
+// any distance is computed; ranking is by distance, then by document frequency,
+// because at equal distance the commoner word is the better guess.
+function corrections(exec: Exec, term: string, limit: number): DredgeSuggestion[] {
+  const typed = Array.from(term);
+  const max = maxEditDistance(typed.length);
+  const prefix = typed.slice(0, CORRECTION_PREFIX_LENGTH).join("");
+  const rows = exec(
+    `SELECT term, doc FROM temp.${VOCAB_TABLE} ` +
+      `WHERE doc >= ? AND term >= ? AND term < ? AND substr(term, 1, ?) = ? ` +
+      `AND length(term) BETWEEN ? AND ?`,
+    [
+      MIN_DOCUMENT_FREQUENCY,
+      prefix,
+      prefixUpperBound(prefix),
+      prefix.length,
+      prefix,
+      typed.length - max,
+      typed.length + max,
+    ],
+  );
+
+  const scored: DredgeSuggestion[] = [];
+  for (const row of rows) {
+    const candidate = String(row[0]);
+    // The reader's own word is not a correction of itself.
+    if (candidate === term) {
+      continue;
+    }
+    const distance = editDistance(typed, Array.from(candidate), max);
+    if (distance <= max) {
+      scored.push({ term: candidate, documentFrequency: Number(row[1]), distance });
+    }
+  }
+  scored.sort(
+    (a, b) =>
+      a.distance - b.distance ||
+      b.documentFrequency - a.documentFrequency ||
+      (a.term < b.term ? -1 : a.term > b.term ? 1 : 0),
+  );
+  return scored.slice(0, limit);
+}
+
+// Corpus terms that extend a prefix, commonest first. No edit distance is
+// involved, so SQL alone decides the answer.
+function completions(exec: Exec, prefix: string, limit: number): DredgeSuggestion[] {
+  const length = Array.from(prefix).length;
+  const rows = exec(
+    `SELECT term, doc FROM temp.${VOCAB_TABLE} ` +
+      `WHERE term > ? AND term < ? AND substr(term, 1, ?) = ? ` +
+      `ORDER BY doc DESC, term ASC LIMIT ?`,
+    [prefix, prefixUpperBound(prefix), length, prefix, limit],
+  );
+  return rows.map((row) => {
+    const term = String(row[0]);
+    return {
+      term,
+      documentFrequency: Number(row[1]),
+      distance: Array.from(term).length - length,
+    };
+  });
+}
+
+// Suggestions are drawn from the index's own vocabulary, so every one of them
+// leads somewhere. Blank input suggests nothing rather than the whole corpus.
+function collectSuggestions(exec: Exec, request: DredgeSuggestRequest): DredgeSuggestion[] {
+  const term = foldTerm(request.term.trim());
+  if (term.length === 0) {
+    return [];
+  }
+  const limit = Math.max(0, request.limit ?? SUGGESTION_LIMIT);
+  if (limit === 0) {
+    return [];
+  }
+  return request.kind === "completion"
+    ? completions(exec, term, limit)
+    : corrections(exec, term, limit);
+}
+
+// Stateless suggestion entry point, the sibling of `search`. A SearchSession
+// serves the worker instead, creating the vocabulary view once rather than per
+// request.
+export function suggest(exec: Exec, request: DredgeSuggestRequest): DredgeSuggestResponse {
+  const started = performance.now();
+  ensureVocabTable(exec);
+  return {
+    suggestions: collectSuggestions(exec, request),
+    elapsedMs: performance.now() - started,
+  };
+}
+
 // A tiny insertion-ordered LRU. Stored values are always defined objects, so a
 // missing key is distinguishable by an `undefined` return.
 class Lru<V> {
@@ -790,6 +976,10 @@ export class SearchSession {
   // swap may keep it. Only a close/reset to a *different* database clears it.
   private readonly browseFacetTotals = new Map<string, DredgeFacetBucket[]>();
   private browseTotal: number | undefined;
+  // Whether this connection already carries the vocabulary view. It is a virtual
+  // table over the index, so it is created once per session rather than per
+  // keystroke, and re-created after a connection swap drops the temp schema.
+  private vocabReady = false;
 
   constructor(
     private readonly exec: Exec,
@@ -857,6 +1047,21 @@ export class SearchSession {
     return response;
   }
 
+  // The nearest corpus terms to a misspelling, or the terms extending a prefix.
+  // A separate call from `search`: a reader typing does not need suggestions on
+  // every keystroke, so the consumer decides when to ask.
+  suggest(request: DredgeSuggestRequest): DredgeSuggestResponse {
+    const started = performance.now();
+    if (!this.vocabReady) {
+      ensureVocabTable(this.exec);
+      this.vocabReady = true;
+    }
+    return {
+      suggestions: collectSuggestions(this.exec, request),
+      elapsedMs: performance.now() - started,
+    };
+  }
+
   // Drop the connection-scoped caches and the corpus-constant browse map. Called
   // on database close/reset: no cache may span a database change, and a
   // *different* database must never serve stale browse totals (SPEC.md →
@@ -910,6 +1115,8 @@ export class SearchSession {
     this.matchState = null;
     this.aggregateCache.clear();
     this.responseCache.clear();
+    // The vocabulary view lives in `temp` and dies with the connection.
+    this.vocabReady = false;
   }
 
   private ensureMatchTable(matchExpr: string, rank: boolean, exactExpr: string | null): void {

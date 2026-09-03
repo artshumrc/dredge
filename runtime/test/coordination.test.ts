@@ -12,7 +12,12 @@ import type {
   LocalBackend,
 } from "../src/coordination";
 import type { StatusFn } from "../src/db";
-import type { DredgeSearchRequest, DredgeSearchResponse } from "../src/search";
+import type {
+  DredgeSearchRequest,
+  DredgeSearchResponse,
+  DredgeSuggestRequest,
+  DredgeSuggestResponse,
+} from "../src/search";
 import type { DredgeStatus } from "../src/protocol";
 
 // Ticket 15 (multi-tab leader election) exercised through the CoordinationEnv
@@ -183,6 +188,7 @@ class FakeScheduler {
 
 class FakeBackend implements LocalBackend {
   readonly searches: DredgeSearchRequest[] = [];
+  readonly suggestions: DredgeSuggestRequest[] = [];
 
   constructor(readonly label: string) {}
 
@@ -191,6 +197,14 @@ class FakeBackend implements LocalBackend {
     return {
       total: 1,
       hits: [{ url: `${this.label}:${request.query ?? ""}` }],
+      elapsedMs: 1,
+    };
+  }
+
+  suggest(request: DredgeSuggestRequest): DredgeSuggestResponse {
+    this.suggestions.push(request);
+    return {
+      suggestions: [{ term: `${this.label}:${request.term}`, documentFrequency: 1, distance: 1 }],
       elapsedMs: 1,
     };
   }
@@ -299,6 +313,12 @@ describe("multi-tab leader election (CoordinationEnv seam)", () => {
     // The leader ran it; the follower ran nothing locally.
     expect(tabA.controls.backend.searches).toEqual([{ query: "hello" }]);
     expect(tabB.controls.backend.searches).toEqual([]);
+
+    // Suggestions relay over the same channel, so a follower tab can offer a
+    // correction without a database of its own.
+    const suggested = await follower.suggest({ term: "helo", kind: "correction" });
+    expect(suggested.suggestions[0].term).toBe("A:helo");
+    expect(tabA.controls.backend.suggestions).toEqual([{ term: "helo", kind: "correction" }]);
 
     leader.destroy();
     follower.destroy();
