@@ -35,10 +35,6 @@ const GLOSSARY = {
   facet_integrity: "Do a category's own counts add up correctly? For example, do all of an engine's 'genre' counts add up to that same engine's own total number of results?",
   filter_consistency: "If a visitor filters by a category value, does the result count match what that same value showed before the filter was applied? A mismatch means the filter is quietly losing matches.",
   example: "A real search from this test run, showing exactly what came back — the results and the count for each filter option.",
-  mt_tabs: "How many browser tabs were open on the site at once, to see what happens when a visitor keeps several tabs open at the same time.",
-  mt_single: "How much memory the heaviest of the open tabs uses on its own — for engines that elect one tab to hold the shared index, that's the leader; for the rest, every tab is about the same size anyway. Taken from this same multi-tab run (not a separate single-tab test), so it's directly comparable to the total next to it.",
-  mt_total: "How much memory ALL the open tabs use, added together. Most engines load a full, separate copy of the search index into every tab, so memory use multiplies with each extra tab a visitor opens. Dredge instead keeps one shared copy across all of a visitor's tabs, so its total climbs much more slowly.",
-  mt_p95: "How slow the worst-performing tab gets when every open tab is searching at the same moment — the worst wait a visitor sees with several tabs open.",
 };
 
 // Band tooltips for the six-query workload: two single-token endpoints and four
@@ -499,48 +495,6 @@ function correctnessSection(site, siteReport, engines) {
   return `<h3>${term("Result correctness", "These checks validate totals, facets, filters, and explicit sorts; they do not evaluate relevance ordering or quality.")}</h3>${tableHtml(headers, rows)}`;
 }
 
-function multiTabSection(site, siteReport, engines) {
-  const headers = [
-    "Engine",
-    head("Tabs", GLOSSARY.mt_tabs, "n"),
-    head("Single", GLOSSARY.mt_single, "MiB"),
-    head("Total", GLOSSARY.mt_total, "MiB"),
-    head("p95", GLOSSARY.mt_p95, "ms"),
-  ];
-  const rows = engines.map((engine) => {
-    const item = siteReport.engines[engine];
-    const multitab = item?.browser?.multitab;
-    if (!multitab?.pages?.length) {
-      const single = warmOf(item)?.memory?.bytes;
-      return { dredge: engine === "dredge", caution: engine === "flexsearch", cells: [engineCellHtml(engine), "–", miBCell(single), "–", "–"] };
-    }
-    const pages = multitab.pages;
-    const mems = pages.map((page) => page.memory?.bytes).filter((v) => v != null);
-    // "Single" is the heaviest tab in THIS SAME run — the one actually holding
-    // the index (the leader, for engines that elect one) — not a separate
-    // standalone single-tab measurement. Mixing the two would be dishonest:
-    // Dredge's standalone tab and its multi-tab leader tab aren't guaranteed
-    // to carry identical memory, so comparing "Total" against an unrelated
-    // baseline could hide or fabricate the very multiplication this table
-    // exists to show.
-    const single = mems.length ? Math.max(...mems) : null;
-    const total = mems.length ? mems.reduce((t, v) => t + v, 0) : null;
-    const p95s = pages.map((page) => page?.measurements?.[0]?.p95_ms).filter((v) => v != null);
-    const worstP95 = p95s.length ? Math.max(...p95s) : null;
-    return {
-      dredge: engine === "dredge", caution: engine === "flexsearch",
-      cells: [
-        engineCellHtml(engine),
-        String(multitab.tabs),
-        miBCell(single),
-        miBCell(total),
-        numCell(worstP95, fmtNum(worstP95)),
-      ],
-    };
-  });
-  return `<h3>${term("Multi-tab", "Several browser tabs open on the site at once. 'Total' adds up every tab's memory. Most engines load a full copy of the search index into every tab, so memory use multiplies with each tab a visitor opens — Dredge instead keeps one shared copy across all of a visitor's tabs. The p95 number is how slow the worst tab gets when every tab searches at the same time.")} memory &amp; latency</h3>${tableHtml(headers, rows)}`;
-}
-
 const CAVEATS = [
   "Relevance *quality* is not measured or compared. Ranking scores differ across engines (this is a product benchmark, not a claim of identical retrieval models); notably FlexSearch's ordering is not BM25, which is part of why some of its operations are cheap.",
   "Multi-word queries are normalized to AND on every engine so they answer the same question: Lunr with a required (+) clause per token; native AND on Dredge, Pagefind, and FlexSearch; and Orama by intersecting per-token result sets in adapter JS, because its threshold:0 does NOT enforce AND across prefix-expanded tokens in the pinned version (a single token that expands to several indexed words would otherwise satisfy the multi-token gate). Phrases are sent unquoted and executed as AND-of-terms — no engine here runs true quoted-phrase (adjacency) queries — so each band's document frequency is an adjacency floor and every engine's own result_count shows its divergence.",
@@ -549,6 +503,7 @@ const CAVEATS = [
   "Facet counts under an active filter are disjunctive (skip-self) on every engine, computed differently per engine: Dredge natively in one round trip; FlexSearch, Lunr, and Orama as a second tally over the already-enumerated unfiltered match set; Pagefind from result.totalFilters (empirically verified to equal the unfiltered search's counts). All of that work happens inside the timed search call.",
   "Latency is measured on localhost, so it is compute-bound; the Cold ↓ / Warm ↓ columns are the network-cost proxy. The server negotiates Brotli quality 5 for ordinary compressible files and preserves product-provided compressed artifacts such as Dredge's quality-11 .db.br.",
   "Warm p95 is taken over a time-budgeted number of samples; a cell annotated with a small superscript (or a `*n` suffix in Markdown) had fewer than 10 samples and should be weighed accordingly. A ✗ cell is a scenario that timed out, errored, or was skipped by the circuit breaker (reason in its tooltip) — distinct from a – cell, which was not measured.",
+  "Memory is measured with a single tab open. Engines that load the whole index into the page hold a full independent copy in every tab a visitor opens, so their memory cost multiplies with tab count; Dredge elects one leader tab to own the SQLite database and the others relay to it, so the index is held once no matter how many tabs are open.",
   "Browser memory uses performance.measureUserAgentSpecificMemory(), which the browser deliberately rate-limits (a randomized delay up to ~20s), so it is sampled once per page; a slow sample that exceeds the operation timeout is recorded as unavailable rather than failing the run.",
 ];
 
@@ -863,7 +818,7 @@ export function renderHtml(report, engines) {
   ${exampleSection(site, siteReport, engines)}
   ${chartsSection(site, siteReport, engines)}
   <details class="site-detail">
-    <summary>Full tables — build, delivery, latency, correctness, multi-tab</summary>
+    <summary>Full tables — build, delivery, latency, correctness</summary>
     <div class="site-detail-inner">
       ${banner("Measured on the build machine", "Costs paid once when the site is built — not by a visitor. Index build time, indexer peak memory, and the deployable artifact size.")}
       ${buildMachineSection(site, siteReport, engines)}
@@ -880,7 +835,6 @@ export function renderHtml(report, engines) {
       ${deepPaginationSection(site, siteReport, engines)}
       ${latencySection("Plain query latency — diagnostic", GLOSSARY.lat_plain, site, siteReport, engines, { mode: "none", filtered: false })}
       ${correctnessSection(site, siteReport, engines)}
-      ${multiTabSection(site, siteReport, engines)}
     </div>
   </details>
 </section>`;

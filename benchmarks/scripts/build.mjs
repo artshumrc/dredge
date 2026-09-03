@@ -1,4 +1,4 @@
-import { cp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { performance } from "node:perf_hooks";
 import { resolve } from "node:path";
@@ -42,15 +42,16 @@ async function command(program, args, cwd) {
   return result;
 }
 
+// Re-vendor the browser assets from the current runtime source so the benchmark
+// measures this checkout rather than whatever was last committed; `dredge
+// compile` then installs them into the artifact directory itself.
 async function buildRuntime() {
-  if (!options.engines.includes("dredge")) return undefined;
-  const output = resolve(repoRoot, "runtime", "dist-prod", "search");
-  const result = await command("pnpm", ["build:lib"], resolve(repoRoot, "runtime"));
+  if (!options.engines.includes("dredge")) return;
+  const result = await command("pnpm", ["run", "vendor"], resolve(repoRoot, "runtime"));
   if (result.exit_code !== 0) throw new Error("Dredge runtime build failed");
-  return output;
 }
 
-const runtime = await buildRuntime();
+await buildRuntime();
 for (const site of selectedSites(options.site)) {
   const siteRoot = resolve(distRoot, site);
   const workload = await readJson(resolve(siteRoot, "workload.json")).catch(() => undefined);
@@ -77,12 +78,11 @@ for (const site of selectedSites(options.site)) {
           resolve(siteRoot, "dredge.config.json"),
           "--metrics-json",
           resolve(results, "dredge-compiler.json"),
-           "--jobs",
-           "1",
-         ],
+          "--jobs",
+          "1",
+        ],
         repoRoot,
       );
-      if (result.exit_code === 0 && runtime) await cp(runtime, artifact, { recursive: true });
     } else if (engine === "pagefind") {
       await rm(artifact, { recursive: true, force: true });
       await mkdir(artifact, { recursive: true });

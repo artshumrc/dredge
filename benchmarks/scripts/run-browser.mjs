@@ -27,7 +27,7 @@ async function buildBrowser() {
 // worker traffic entirely. Every fetch — main thread or worker — hits this
 // server, and the browser's HTTP cache means a warm repeat visit re-requests
 // only what it must, which is exactly the transfer we want to measure.
-function runnerUrl(origin, engine, site, { cold, light, mem, once }) {
+function runnerUrl(origin, engine, site, { cold, mem, once }) {
   const url = new URL("/runner/", origin);
   url.searchParams.set("engine", engine);
   url.searchParams.set("site", site);
@@ -38,9 +38,7 @@ function runnerUrl(origin, engine, site, { cold, light, mem, once }) {
   // The cold single-tab page runs each config exactly once (no warmups): its job
   // is cold init and honest first-visit bytes, not the warm latency matrix.
   if (once) url.searchParams.set("once", "1");
-  if (light) url.searchParams.set("light", "1");
-  // The single-tab cold page skips the (slow) memory sample; warm + every
-  // multi-tab page measure it.
+  // The cold page skips the (slow) memory sample; the warm page measures it.
   if (mem === false) url.searchParams.set("mem", "0");
   return url.href;
 }
@@ -48,16 +46,14 @@ function runnerUrl(origin, engine, site, { cold, light, mem, once }) {
 // Load the runner in one page, wait for it to finish, and return its result
 // plus the bytes the server sent while it ran.
 async function runPage(state, page, origin, engine, site, mode) {
-  const before = mode.measureNetwork === false ? undefined : state.bytesServed;
+  const before = state.bytesServed;
   await page.goto(runnerUrl(origin, engine, site, mode), { waitUntil: "load" });
   await page.waitForFunction(() => window.__benchmark?.done, undefined, {
     timeout: options.timeoutMinutes * 60_000,
   });
   const outcome = await page.evaluate(() => window.__benchmark);
   if (outcome.error) throw new Error(outcome.error);
-  return before === undefined
-    ? outcome.result
-    : { ...outcome.result, network_bytes: state.bytesServed - before };
+  return { ...outcome.result, network_bytes: state.bytesServed - before };
 }
 
 // Single-tab run: a fresh context (empty OPFS + HTTP cache), cold page then warm
@@ -72,33 +68,6 @@ async function runSingleTab(browser, origin, state, engine, site) {
     const warm = await runPage(state, warmPage, origin, engine, site, { cold: false, mem: true });
     await warmPage.close();
     return { cold, warm };
-  } finally {
-    await context.close();
-  }
-}
-
-// Multi-tab run: N pages in ONE context (same origin → shared Web Locks +
-// BroadcastChannel), all opened and driven concurrently so they coexist while
-// each measures its own memory. For dredge, one tab wins leadership and owns the
-// database while the rest relay and download nothing; the JS engines have no
-// such sharing, so every tab loads the whole index into its own heap.
-async function runMultiTab(browser, origin, state, engine, site, tabs) {
-  const context = await browser.newContext();
-  try {
-    const before = state.bytesServed;
-    const pages = await Promise.all(Array.from({ length: tabs }, () => context.newPage()));
-    const results = await Promise.all(
-      pages.map((page) =>
-        runPage(state, page, origin, engine, site, {
-          cold: true,
-          light: true,
-          mem: true,
-          measureNetwork: false,
-        }),
-      ),
-    );
-    for (const page of pages) await page.close();
-    return { tabs, network_bytes: state.bytesServed - before, pages: results };
   } finally {
     await context.close();
   }
@@ -139,12 +108,9 @@ try {
         console.log(`Running ${engine}/${site} in Chromium (single-tab)`);
         const { cold, warm } = await runSingleTab(browser, origin, state, engine, site);
         assertPrecompressed();
-        console.log(`Running ${engine}/${site} in Chromium (${options.tabs} tabs)`);
-        const multitab = await runMultiTab(browser, origin, state, engine, site, options.tabs);
-        assertPrecompressed();
         await writeFile(
           browserResultPath,
-          JSON.stringify({ browser_version: browser.version(), cold, warm, multitab }, null, 2) + "\n",
+          JSON.stringify({ browser_version: browser.version(), cold, warm }, null, 2) + "\n",
         );
       } catch (error) {
         const message = error?.stack ?? String(error);

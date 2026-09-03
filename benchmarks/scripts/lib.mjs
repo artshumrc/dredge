@@ -24,7 +24,6 @@ export function parseOptions(argv) {
     iterations: 20,
     sampleBudgetMs: 1500,
     limit: undefined,
-    tabs: 4,
     operationTimeoutSeconds: 60,
     timeoutMinutes: 30,
     skipPrepare: false,
@@ -36,7 +35,6 @@ export function parseOptions(argv) {
     else if (argument === "--iterations") options.iterations = Number(argv[++index]);
     else if (argument === "--sample-budget-ms") options.sampleBudgetMs = Number(argv[++index]);
     else if (argument === "--limit") options.limit = Number(argv[++index]);
-    else if (argument === "--tabs") options.tabs = Number(argv[++index]);
     else if (argument === "--operation-timeout-seconds") {
       options.operationTimeoutSeconds = Number(argv[++index]);
     }
@@ -55,9 +53,6 @@ export function parseOptions(argv) {
   }
   if (!Number.isFinite(options.sampleBudgetMs) || options.sampleBudgetMs <= 0) {
     throw new Error("--sample-budget-ms must be a positive number");
-  }
-  if (!Number.isInteger(options.tabs) || options.tabs < 2) {
-    throw new Error("--tabs must be an integer >= 2");
   }
   if (!Number.isFinite(options.timeoutMinutes) || options.timeoutMinutes <= 0) {
     throw new Error("--timeout-minutes must be a positive number");

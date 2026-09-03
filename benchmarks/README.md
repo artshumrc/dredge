@@ -11,9 +11,9 @@ behaviour, so a fast number can never come from silently skipped work.
 
 | Size | Corpus | Built HTML | Expected pages |
 | --- | --- | --- | ---: |
-| Small | `~/repos/darth-website` | `dist/` | about 250 |
-| Medium | `~/repos/tsumeb-1/tsumeb` | `dist/objects/` | about 840 |
-| Large | `~/repos/amendments-project` | `amendments/static_site/amendments/` | about 22,800 |
+| Small | `~/repos/darth-website` | `dist/` | about 300 |
+| Medium | `~/repos/tsumeb/tsumeb` | `dist/objects/` | about 950 |
+| Large | `~/repos/amendments-project` | `build/site/amendments/` | about 22,800 |
 | Extra large | `~/repos/giza` | `dist/**/full/` | about 159,000 |
 
 The extra-large corpus uses the site key `xlarge`. Source paths and extraction
@@ -26,10 +26,10 @@ ignored by Git.
 Build each source site first if its existing `dist/` is stale or absent:
 
 ```sh
-cd ~/repos/darth-website && npm run build            # Small
-cd ~/repos/tsumeb-1/tsumeb && npm run build          # Medium
-cd ~/repos/amendments-project && ./build_site.sh     # Large
-cd ~/repos/giza && uv run poe static-build-production # Extra large
+cd ~/repos/darth-website && npm install && npm run build  # Small
+cd ~/repos/tsumeb/tsumeb && npm run build                # Medium
+cd ~/repos/amendments-project && poe build               # Large
+cd ~/repos/giza && uv run poe static-build-production    # Extra large
 ```
 
 Install the benchmark dependencies and Chromium:
@@ -84,7 +84,6 @@ Useful flags:
 - `--operation-timeout-seconds <s>` — per-search timeout (default 60); a search
   that exceeds it is recorded as a failed cell, not a crash.
 - `--timeout-minutes <m>` — page-level backstop (default 30).
-- `--tabs <n>` — multi-tab count (default 4).
 
 ### Self-test gate
 
@@ -170,9 +169,11 @@ engine.
   worker at up to ~60s, so it races its own deadline (2× the operation timeout,
   minimum 120s, identical for every engine); a sample that exceeds it is
   recorded as unavailable rather than failing the run.
-- **Multi-tab**: N tabs in one context. Dredge elects one leader tab to own the
-  database while the rest relay and download nothing; the JavaScript engines load
-  a full independent index per tab.
+- **Tabs**: memory is measured with a single tab open. Engines that load the
+  whole index into the page hold an independent copy per tab, so their memory
+  multiplies with tab count; Dredge elects one leader tab to own the database
+  and the rest relay to it, holding the index once. The report states this
+  rather than measuring it.
 - **Failure handling**: a per-config timeout or thrown error becomes an error row
   (rendered `✗` with its reason, distinct from `–` = not measured) and the run
   continues. Three consecutive config failures trip a circuit breaker that marks
@@ -279,7 +280,7 @@ identical retrieval models.
   cache.** Dredge memoizes within a session what cannot change (the database is
   immutable, content-hash named): the FTS match set, the count and facet
   aggregates, and whole responses. So repeated identical warm samples — the same
-  query, the same pagination offset, a multi-tab relay of one search — legitimately
+  query, the same pagination offset — legitimately
   hit that cache, and the warm p95 reflects it. This is deliberate: it is real
   product behaviour (users do paginate and re-run the search they just ran),
   available to every engine in the harness — the others simply do not implement

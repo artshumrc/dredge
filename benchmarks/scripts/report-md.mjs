@@ -56,6 +56,9 @@ function facetInventory(siteReport) {
 
 const rightAligns = (n) => Array.from({ length: n }, () => "---:");
 
+const NOTE =
+  "Memory is measured with a single tab open. Engines that load the whole index into the page hold a full independent copy in every tab a visitor opens, so their memory cost multiplies with tab count; Dredge elects one leader tab to own the SQLite database and the others relay to it, so the index is held once no matter how many tabs are open.";
+
 export function renderMarkdown(report, engines) {
   const rankingSummary = (selected = engines) =>
     selected.map((engine) => `${engine}: ${rankingModelFor(engine).label}`).join("; ");
@@ -79,6 +82,8 @@ export function renderMarkdown(report, engines) {
     "each logical artifact at quality 5; for Dredge it substitutes the raw database for",
     "the shipped quality-11 `.db.br`. Cold/warm MiB are encoded response-body bytes;",
     "HTTP headers and transport framing are excluded.",
+    "",
+    NOTE,
     "",
     "## Ranking models",
     "",
@@ -274,37 +279,6 @@ export function renderMarkdown(report, engines) {
       }),
     );
 
-    // 10) Multi-tab.
-    lines.push("", "#### Multi-tab memory & latency", "");
-    lines.push(
-      "N tabs open at once on one origin. Total is every tab's memory summed. Engines that load a full independent index per tab scale toward N× the single-tab figure; Dredge elects one leader tab to own the SQLite database and the rest relay to it, downloading nothing, so the index is held once no matter how many tabs are open. p95 is the slowest tab with all N searching at once.",
-      rankingNote(),
-      "",
-    );
-    table(
-      ["Engine", "Tabs", "Single MiB", "Total MiB", "p95 ms"],
-      ["---", "---:", "---:", "---:", "---:"],
-      engines.map((engine) => {
-        const item = siteReport.engines[engine];
-        const multitab = item?.browser?.multitab;
-        const single = warmOf(item)?.memory?.bytes;
-        if (!multitab?.pages?.length) {
-          return [engineLabel(engine), "–", mib(single), "–", "–"];
-        }
-        const pages = multitab.pages;
-        const mems = pages.map((page) => page.memory?.bytes).filter((v) => v != null);
-        const total = mems.length ? mems.reduce((t, v) => t + v, 0) : null;
-        const p95s = pages.map((page) => page?.measurements?.[0]?.p95_ms).filter((v) => v != null);
-        const worstP95 = p95s.length ? Math.max(...p95s) : null;
-        return [
-          engineLabel(engine),
-          String(multitab.tabs),
-          mib(single),
-          mib(total),
-          number(worstP95),
-        ];
-      }),
-    );
   }
 
   lines.push("");

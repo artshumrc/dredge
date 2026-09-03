@@ -11,10 +11,6 @@ const operationTimeoutMs = Number(params.get("operation_timeout_ms") ?? 60_000);
 // matrix. `budget_ms` is the warm per-config time budget for sampling.
 const once = params.get("once") === "1";
 const budgetMs = Number(params.get("budget_ms") ?? DEFAULT_BUDGET_MS);
-// `light` mode runs a single representative query with few iterations. It is
-// used by the multi-tab scenario, where the interesting signal is per-tab
-// memory and follower relay latency rather than a full latency matrix.
-const light = params.get("light") === "1";
 // measureUserAgentSpecificMemory() is deliberately rate-limited by the browser
 // (a randomized delay of up to ~20s, to blunt it as a timing side-channel), so
 // we take exactly one sample per page and let the runner skip it where a
@@ -98,17 +94,9 @@ function facetSetsFor(workload) {
 
 // Build the warm test matrix — exactly the spec's ~40 configs per engine/site.
 // Every config counts all results and returns a sorted page; configs with facets
-// also count every requested facet value. In light (multi-tab) mode this is one
-// moderate-band query at page size 10.
+// also count every requested facet value.
 function buildConfigs(workload) {
   const base = { page_size: 10, offset: 0, facet_mode: "none", filtered: false, sort: undefined };
-  if (light) {
-    // Multi-tab uses one moderate-band query; prefer the moderate phrase, else
-    // the first query.
-    const item =
-      workload.queries.find((query) => query.label === "phrase-moderate") ?? workload.queries[0];
-    return [{ ...base, ...item, scenario: "light" }];
-  }
   const configs = [];
   const broad = workload.queries.find((query) => query.label === "broad");
 
@@ -177,7 +165,7 @@ async function run() {
 
   const configs = buildConfigs(workload);
   const measurements = [];
-  const maxSamples = light ? Math.min(iterations, 5) : iterations;
+  const maxSamples = iterations;
   const policy = { mode: once ? "cold" : "warm", budgetMs, maxSamples };
   // Failure handling: a per-config timeout or thrown error becomes an error row
   // and the run continues; three consecutive config failures trip a circuit
@@ -280,7 +268,6 @@ async function run() {
     site,
     cold,
     once,
-    light,
     max_samples: maxSamples,
     init_ms: initMs,
     memory: {

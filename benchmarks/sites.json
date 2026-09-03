@@ -9,8 +9,8 @@
     "search_fields": []
   },
   "medium": {
-    "name": "tsumeb-1",
-    "source": "~/repos/tsumeb-1/tsumeb/dist",
+    "name": "tsumeb",
+    "source": "~/repos/tsumeb/tsumeb/dist",
     "include": ["objects/**/index.html"],
     "exclude": [],
     "title": "h1, title",
@@ -19,8 +19,8 @@
   },
   "large": {
     "name": "amendments-project",
-    "source": "~/repos/amendments-project/amendments/static_site",
-    "include": ["amendments/**/index.html"],
+    "source": "~/repos/amendments-project/build/site",
+    "include": ["amendments/*/index.html"],
     "exclude": [],
     "title": "h1, title",
     "body": "main",
