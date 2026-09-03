@@ -88,7 +88,9 @@ A config declares where the HTML lives, how to extract fields from it, and what 
       "type": "string",
       "source": "data-dredge-category",
       "required": true
-    }
+    },
+    "year": { "type": "integer", "source": "data-dredge-year" },
+    "published": { "type": "date", "source": "data-dredge-published" }
   },
   "store_fields": {
     "image": {
@@ -126,6 +128,42 @@ Keys:
 - `suppressed_variants`: term pairs removed from the merged result, so an over-eager stem like `["statue", "status"]` never ships.
 
 Every field has an explicit **role**. A Facet is indexed, filterable, and countable. A Store Field is carried into results but never indexed, filtered, or counted — use it for display-only data (image URLs, thumbnails) so it stops costing index bytes. Facets and Store Fields share one namespace; a name may not be both, and `result_fields` may reference either role. Filtering or counting on a Store Field fails loudly (`FILTER_INVALID`) rather than scanning the whole table.
+
+## Query language
+
+Whatever a reader types is parsed into a **Query AST** and emitted as one FTS5 match
+expression. This is the whole grammar; document it for your own readers as a search-tips page
+in your own words.
+
+| Reader types | Meaning |
+| --- | --- |
+| `carving` | A term. Matches pages holding `carving`, and pages holding the other forms in its Variant Group (`carvings`, `carved`). |
+| `golden coffin` | Two terms. Both must appear on the page, anywhere. |
+| `"golden coffin"` | A phrase: those words, adjacent, in that order. Never widened to variants. |
+| `-tomb` | Exclusion: drop pages holding `tomb`. Needs at least one ordinary term to exclude from. |
+| `khufu OR cheops` | Alternatives — either term. `OR` must be capitalised; a lowercase `or` is just a word. |
+| `title:carving` | Scoped to one Search Column: `title`, `body`, or any name the config declares. Never widened. |
+| `near(khufu pyramid, 5)` | Both terms within 5 terms of one another, in either order. The distance is optional and defaults to 10. Never widened. |
+| `(khufu OR cheops) pyramid` | Grouping, so an alternation can sit inside a longer query. |
+| `G 7510` | A catalogue identifier. Compact, spaced, and split spellings (`G7510`, `G 7510`, `G-7510`) all find the same record, and an identifier is never widened. |
+
+Operators combine: `title:pyramid (khufu OR cheops) -"old kingdom"` is one query.
+
+Two rules a reader will otherwise trip on:
+
+- **Only the last word is treated as a prefix.** It is the word still being typed, so results
+  appear on every keystroke; every earlier term must match in full. A final term of a single
+  character stays exact, because expanding it would scan the whole term dictionary.
+- **Quotation marks opt out of variant widening.** A bare term also finds its Variant Group's
+  other forms; a quoted phrase matches only what was typed. `field:` scopes and `near()`
+  operands are exact for the same reason. Quotation marks are the reader's precision tool.
+
+Nothing a reader types is an error. Anything the parser cannot read — an unbalanced quote, a
+stray parenthesis, a `field:` name the index does not have — falls back to treating the whole
+input as a list of terms, which is what Dredge did before it had a grammar.
+
+Diacritics fold on both sides, so `café` and `cafe` are one search. Each hit reports which
+spans of its title and description matched, variants included, in `hit.marks`.
 
 ## CLI
 
@@ -200,4 +238,4 @@ pnpm run vendor
 
 ## Vocabulary
 
-Project vocabulary is defined in `CONTEXT.md`. Use those terms when discussing Dredge internals: Facet, Store Field, Field, Field Role, Database Artifact, Boot, Manifest, Runtime, and Compiler.
+Project vocabulary is defined in `CONTEXT.md`. Use those terms when discussing Dredge internals: Facet, Store Field, Field, Field Role, Database Artifact, Boot, Manifest, Runtime, Compiler, Search Column, Boost, Term Variant (and Variant Group), and Query AST.

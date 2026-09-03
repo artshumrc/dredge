@@ -45,3 +45,7 @@ _Avoid_: score, ranking factor — a boost changes order, not what a hit reports
 **Term Variant**:
 A compiled equivalence between two surface forms in the corpus, so that a query for one matches the other. A **Variant Group** is the full set a term belongs to. Groups are derived at build time from the index's own terms and written to `dredge_term_variants`, keyed on the surface form so no stemmer ships to the browser.
 _Avoid_: stem, synonym — both are *sources* of term variants, not the thing itself.
+
+**Query AST**:
+The parsed representation of what a reader typed, owned by the Runtime and the only thing permitted to emit an FTS5 match expression. Anything the parser rejects degrades to the all-terms reading of the raw input, so a reader never sees a syntax error.
+_Avoid_: match expression, query string — the first is what the AST emits, the second is what it parses.

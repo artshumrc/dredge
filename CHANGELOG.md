@@ -6,6 +6,33 @@ All notable changes to Dredge are documented here. This project adheres to
 
 ## Unreleased
 
+### A search finds the corpus's own other words for it
+
+Searching `photographs` no longer misses the pages that write `photograph` or
+`photographed`. The Compiler derives **Term Variant** groups from the finished
+index's own terms and ships them in `dredge_term_variants`; the Runtime widens
+each bare query term across its group before matching.
+
+- Groups are keyed on the surface form, so no stemmer ships to the browser and
+  widening is one indexed probe per term. On a 159k-page corpus the table is
+  9,101 rows — 71.3 KiB compressed inside a 15.5 MiB artifact.
+- Exact matches lead. Documents matching what the reader actually typed sort
+  ahead of documents that matched only through a variant, with bm25 ordering
+  within each band. Each hit carries its `band` (0 exact, 1 variant-only) so a
+  consumer can reproduce the order.
+- Banding is ordering only: the total and every Facet count are identical with
+  and without it, and an explicit `sort` suppresses both.
+- Quoted phrases, `field:` scopes, `near()` operands and catalogue identifiers
+  are never widened, so precision tools stay precise.
+- The table is optional at query time. An artifact without one searches exactly
+  as it did before.
+- `variant_generation`, `synonym_groups` and `suppressed_variants` turn
+  generation off, add a project's own equivalences (`khufu`/`cheops`), and
+  remove an over-eager pairing (`statue`/`status`). A suppression removes that
+  one pairing, not the whole group.
+- `dredge compile --variants-json PATH` writes the pairings a build produced, so
+  a maintainer can audit search before publishing it.
+
 ### A maintainer shapes relevance beyond the text
 
 Some pages matter more than their prose says, and a site can now declare it. A
@@ -66,6 +93,83 @@ expression, and no reader text reaches `MATCH` unparsed.
   whatever the config names.
 - The compiler's duplicate `dredge.query` builder is gone;
   `tests/fixtures/query-vectors.json` is now the Runtime's golden file alone.
+
+### A hit shows why it matched
+
+Every hit carries `marks`: the spans of its `title` and `description` that the
+query matched, ready to wrap in `<mark>`. `snippet()` and `highlight()` return
+`NULL` against a contentless index, so this is computed over what the response
+already holds.
+
+- Marks cover the variants that actually matched, not just the literal input, so
+  highlighting never disagrees with the result set.
+- Offsets are UTF-16 indices into the field string as returned, and the fold is
+  offset-preserving: `Café` folded to `cafe` still marks all four characters.
+- Marks are absent rather than empty — read them as
+  `hit.marks?.[field] ?? []`.
+
+### A typo gets a correction, a half-typed word gets completions
+
+A new `suggest` operation reads the index's own term dictionary through an FTS5
+vocabulary view, which occupies no bytes of its own, so nothing suggested can
+land a reader on zero results.
+
+- One request shape: `{ term, kind: "correction" | "completion", limit? }`.
+  Corrections rank by edit distance computed in the Runtime, since SQLite offers
+  none; completions extend the prefix.
+- Candidates are prefiltered in SQL by leading character, length window, and a
+  document-frequency floor before any distance is computed.
+- Suggestions travel the same worker and multi-tab coordination path as search.
+
+### The generated client reaches everything the engine does
+
+The generated client's request type is level with the engine's: `sort`, the
+query-language surface, `marks`, `band`, and `suggest` are all reachable from a
+typed client without hand-writing around it. `DredgeSortField` names exactly the
+columns that can be sorted — built-ins and scalar Facets — so a Store Field or
+an array Facet is a type error rather than a runtime one.
+
+### Measured and rejected
+
+Recorded so the next person does not re-run the experiments:
+
+- **A `prefix='2 3'` index.** Takes the 159k-page index from 10.69 to 25.10 MiB
+  brotli — 2.4× the download — to save about 3 ms on two-letter prefixes.
+- **Switching the index tokenizer to `porter`.** Stemming the index means
+  stemming the query, and a half-typed word does not stem to a prefix of the
+  finished word's stem: `running` matches at `run` but returns nothing at
+  `runni`. It also makes every conflation permanent and invisible, where a
+  Term Variant table is inspectable and correctable.
+- **Stored-text snippets.** `snippet()` and `highlight()` need the text in the
+  index; storing it is the artifact's whole download budget, and marking the
+  title and description the response already carries costs nothing.
+- **Normalizing the Term Variant table** into group id and member tables: the
+  index on the group id costs more than the redundancy it removes.
+
+### The Database Artifact's schema version moved (breaking)
+
+Term Variants, Search Columns and boosts all change the artifact's shape, so
+`db_schema_version` is now 3. An artifact built by an older Compiler is refused
+at Boot with `SCHEMA_VERSION_MISMATCH` rather than served — a stale deployment
+fails loudly instead of silently mis-serving.
+
+#### Upgrading
+
+Every consumer must recompile and redeploy; there is no in-place migration.
+
+```sh
+dredge compile --config dredge.config.json
+```
+
+If a site installs the Runtime separately from its artifacts, refresh it too, so
+the browser code matches the schema the artifact now declares:
+
+```sh
+dredge install --config dredge.config.json
+```
+
+A config that names none of the new keys compiles to the index it compiled to
+before and behaves as it did; upgrading is not a re-tuning project.
 
 ## 0.2.0 — 2026-09-03
 
