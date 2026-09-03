@@ -6,6 +6,8 @@ All notable changes to Dredge are documented here. This project adheres to
 
 ## Unreleased
 
+## 0.2.0 — 2026-09-03
+
 ### Bumping the version in `pyproject.toml` cuts the release
 
 `pyproject.toml` is the only place a release version is written by hand.
