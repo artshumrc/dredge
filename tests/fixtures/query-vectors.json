@@ -30,5 +30,8 @@
   {"q": "near(coffin gold, 5)", "fts": "NEAR(\"coffin\" \"gold\"*, 5)"},
   {"q": "title:(giza tomb)", "fts": "{title}:(\"giza\" AND \"tomb\"*)"},
   {"q": "body:tomb OR title:giza", "fts": "{body}:\"tomb\" OR {title}:\"giza\"*"},
-  {"q": "category:collection", "fts": "\"category\" AND \"collection\"*"}
+  {"q": "category:collection", "fts": "\"category\" AND \"collection\"*"},
+  {"q": "(khufu OR cheops) pyramid", "fts": "(\"khufu\" OR \"cheops\") AND \"pyramid\"*"},
+  {"q": "(khufu", "fts": "\"khufu\"*"},
+  {"q": "near(khufu pyramid", "fts": "\"near\" AND \"khufu\" AND \"pyramid\"*"}
 ]
