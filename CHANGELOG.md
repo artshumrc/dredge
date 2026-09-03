@@ -129,6 +129,11 @@ typed client without hand-writing around it. `DredgeSortField` names exactly the
 columns that can be sorted — built-ins and scalar Facets — so a Store Field or
 an array Facet is a type error rather than a runtime one.
 
+- The standalone client bundle (`dredge-client.js`) reaches suggestions too:
+  `DredgeSearchClient.suggest()` and the `DredgeSuggest*` types are exported
+  there as well, so a site that never runs `dredge codegen` is not shut out. A
+  suggestion is never superseded by a later search, unlike a search.
+
 ### Measured and rejected
 
 Recorded so the next person does not re-run the experiments:

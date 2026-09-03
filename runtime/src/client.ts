@@ -11,6 +11,8 @@
 import type {
   DredgeSearchRequest,
   DredgeSearchResponse,
+  DredgeSuggestRequest,
+  DredgeSuggestResponse,
 } from "./search";
 
 export type {
@@ -21,6 +23,10 @@ export type {
   DredgeFacetBucket,
   DredgeSearchRequest,
   DredgeSearchResponse,
+  DredgeSuggestKind,
+  DredgeSuggestRequest,
+  DredgeSuggestion,
+  DredgeSuggestResponse,
 } from "./search";
 
 const DEFAULT_WORKER_URL = "/search/dredge-worker.js";
@@ -48,6 +54,7 @@ type WorkerResponse =
   | { type: "status"; status: DredgeStatus; detail?: string }
   | { type: "ready"; id: number }
   | { type: "searchResult"; id: number; response: DredgeSearchResponse }
+  | { type: "suggestResult"; id: number; response: DredgeSuggestResponse }
   | { type: "error"; id?: number; error: DredgeError };
 
 export class DredgeClientError extends Error {
@@ -77,6 +84,11 @@ type Pending =
   | {
       kind: "search";
       resolve: (response: DredgeSearchResponse) => void;
+      reject: (error: DredgeClientError) => void;
+    }
+  | {
+      kind: "suggest";
+      resolve: (response: DredgeSuggestResponse) => void;
       reject: (error: DredgeClientError) => void;
     };
 
@@ -155,6 +167,23 @@ export class DredgeSearchClient {
     });
   }
 
+  /**
+   * Ask the index for corrections or completions of a term.
+   *
+   * Unlike `search()`, suggestions are not superseded by recency: a correction
+   * and a completion answer different questions, and neither is made stale by
+   * a later search.
+   */
+  async suggest(request: DredgeSuggestRequest): Promise<DredgeSuggestResponse> {
+    await this.init();
+    const worker = this.ensureWorker();
+    const id = this.nextId++;
+    return new Promise<DredgeSuggestResponse>((resolve, reject) => {
+      this.pending.set(id, { kind: "suggest", resolve, reject });
+      worker.postMessage({ type: "suggest", id, request });
+    });
+  }
+
   /** Tear down the worker and reject all pending work. */
   destroy(): void {
     if (this.worker) {
@@ -203,6 +232,14 @@ export class DredgeSearchClient {
     if (message.type === "searchResult") {
       const pending = this.pending.get(message.id);
       if (pending?.kind === "search") {
+        this.pending.delete(message.id);
+        pending.resolve(message.response);
+      }
+      return;
+    }
+    if (message.type === "suggestResult") {
+      const pending = this.pending.get(message.id);
+      if (pending?.kind === "suggest") {
         this.pending.delete(message.id);
         pending.resolve(message.response);
       }
