@@ -8,6 +8,25 @@ export interface DredgeRange<T> {
   max?: T;
 }
 
+// The document columns this site can order by. Store Fields are carried on a
+// hit but not orderable, and the engine rejects them with QUERY_INVALID, so
+// they are absent from this union.
+export type DredgeSortField =
+  | "id"
+  | "url"
+  | "title"
+  | "description"
+  | "category"
+  | "featured"
+  | "published"
+  | "rating"
+  | "year";
+
+export interface DredgeSort {
+  field: DredgeSortField;
+  direction?: "asc" | "desc";
+}
+
 export interface DredgeFilters {
   category?: string | string[];
   featured?: boolean | boolean[];
@@ -16,6 +35,16 @@ export interface DredgeFilters {
   tags?: string | string[];
   year?: number | number[] | DredgeRange<number>;
 }
+
+export interface DredgeMark {
+  // Offsets into the field's own string, as returned on the hit.
+  start: number;
+  length: number;
+}
+
+// Marked spans per text field of a hit. Spans, never markup: the consumer
+// renders them into its own DOM.
+export type DredgeMarks = Record<string, DredgeMark[]>;
 
 export interface DredgeResult {
   id: number;
@@ -26,6 +55,8 @@ export interface DredgeResult {
   year?: number;
   image?: string;
   score: number;
+  band: number;
+  marks?: DredgeMarks;
 }
 
 export interface DredgeFacetBucket {
@@ -39,12 +70,40 @@ export interface DredgeSearchRequest {
   limit?: number;
   offset?: number;
   includeFacets?: boolean | Array<keyof DredgeFilters>;
+  // Explicit ordering. When omitted, results are ordered by relevance for
+  // keyword queries and by document id for a match-all browse.
+  sort?: DredgeSort;
 }
 
 export interface DredgeSearchResponse {
   total: number;
   hits: DredgeResult[];
   facets?: Partial<Record<keyof DredgeFilters, DredgeFacetBucket[]>>;
+  elapsedMs: number;
+}
+
+export type DredgeSuggestKind = "correction" | "completion";
+
+export interface DredgeSuggestRequest {
+  // A single term: the word the reader typed for a correction, the partial word
+  // they are still typing for a completion. Phrases are not suggested against.
+  term: string;
+  kind: DredgeSuggestKind;
+  limit?: number;
+}
+
+export interface DredgeSuggestion {
+  // A term the index actually holds, so accepting this suggestion cannot land
+  // the reader on zero results.
+  term: string;
+  documentFrequency: number;
+  // Edit distance from what the reader typed; for a completion, the number of
+  // characters it adds.
+  distance: number;
+}
+
+export interface DredgeSuggestResponse {
+  suggestions: DredgeSuggestion[];
   elapsedMs: number;
 }
 
@@ -90,12 +149,14 @@ export interface DredgeError {
 export type DredgeWorkerRequest =
   | { type: "init"; id: number; manifestUrl: string }
   | { type: "search"; id: number; request: DredgeSearchRequest }
+  | { type: "suggest"; id: number; request: DredgeSuggestRequest }
   | { type: "destroy"; id: number };
 
 export type DredgeWorkerResponse =
   | { type: "status"; id?: number; status: DredgeStatus }
   | { type: "ready"; id: number }
   | { type: "searchResult"; id: number; response: DredgeSearchResponse }
+  | { type: "suggestResult"; id: number; response: DredgeSuggestResponse }
   | { type: "error"; id?: number; error: DredgeError };
 
 export interface DredgeClientOptions {
@@ -106,7 +167,8 @@ export interface DredgeClientOptions {
 
 type PendingRequest =
   | { kind: "init"; resolve: () => void; reject: (error: DredgeClientError) => void }
-  | { kind: "search"; resolve: (response: DredgeSearchResponse) => void; reject: (error: DredgeClientError) => void };
+  | { kind: "search"; resolve: (response: DredgeSearchResponse) => void; reject: (error: DredgeClientError) => void }
+  | { kind: "suggest"; resolve: (response: DredgeSuggestResponse) => void; reject: (error: DredgeClientError) => void };
 
 export class DredgeClientError extends Error {
   readonly code: DredgeErrorCode | string;
@@ -209,6 +271,24 @@ export class DredgeSearchClient {
     });
   }
 
+  // Suggestions are not coalesced the way searches are: a correction and a
+  // completion answer different questions, and neither supersedes a search.
+  async suggest(request: DredgeSuggestRequest): Promise<DredgeSuggestResponse> {
+    await this.init();
+    if (this.status !== "ready") {
+      throw new DredgeClientError({ code: "CLIENT_NOT_READY", message: "Dredge worker is not ready." });
+    }
+
+    const worker = this.ensureWorker();
+    const id = this.allocateRequestId();
+
+    return new Promise<DredgeSuggestResponse>((resolve, reject) => {
+      this.pending.set(id, { kind: "suggest", resolve, reject });
+      const message: DredgeWorkerRequest = { type: "suggest", id, request };
+      worker.postMessage(message);
+    });
+  }
+
   destroy(): void {
     if (this.worker) {
       const message: DredgeWorkerRequest = { type: "destroy", id: this.allocateRequestId() };
@@ -270,6 +350,15 @@ export class DredgeSearchClient {
         }
       }
       this.fail(message.error);
+      return;
+    }
+
+    if (message.type === "suggestResult") {
+      const pending = this.pending.get(message.id);
+      this.pending.delete(message.id);
+      if (pending?.kind === "suggest") {
+        pending.resolve(message.response);
+      }
       return;
     }
 
