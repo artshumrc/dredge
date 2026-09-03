@@ -3,8 +3,9 @@
 // reader text ever reaches MATCH unparsed: anything the parser rejects degrades
 // to the all-terms reading of the raw input rather than raising.
 
-// Columns of the FTS5 index a `field:` scope may name. The compiler's schema is
-// fixed at (title, body); maintainer-named search columns arrive later.
+// The Search Columns a `field:` scope may name when the caller has no schema in
+// hand. Every index carries these two; a config that names further Search
+// Columns puts them in the artifact, and the search engine passes that list in.
 export const FTS_COLUMNS = ["title", "body"] as const;
 
 export type QueryNode =
@@ -107,7 +108,10 @@ class Parser {
   // prefix candidate, and only when it is a bare term rather than a phrase.
   readonly leaves: QueryNode[] = [];
 
-  constructor(private readonly tokens: Token[]) {}
+  constructor(
+    private readonly tokens: Token[],
+    private readonly columns: readonly string[],
+  ) {}
 
   private peek(): Token | undefined {
     return this.tokens[this.index];
@@ -247,7 +251,7 @@ class Parser {
   }
 
   private parseScoped(column: string, rest: string): QueryNode {
-    if (!(FTS_COLUMNS as readonly string[]).includes(column)) {
+    if (!this.columns.includes(column)) {
       throw new QuerySyntaxError(`unknown field ${column}`);
     }
     let child: QueryNode;
@@ -510,10 +514,13 @@ function applyTrailingPrefix(leaves: QueryNode[]): void {
 // all-terms reading of the raw string — the behaviour before a grammar existed —
 // so a reader never sees a syntax error. Returns null when there is nothing to
 // search for.
-export function parseQuery(input: string): QueryNode | null {
+export function parseQuery(
+  input: string,
+  columns: readonly string[] = FTS_COLUMNS,
+): QueryNode | null {
   const query = input.normalize("NFC");
   try {
-    const parser = new Parser(lex(query));
+    const parser = new Parser(lex(query), columns);
     const node = parser.parse();
     if (!node) {
       return null;
@@ -625,7 +632,11 @@ export function emitMatchExpression(node: QueryNode, widen?: VariantLookup): str
   return emitNode(node, widen);
 }
 
-export function buildMatchExpression(query: string, widen?: VariantLookup): string | null {
-  const node = parseQuery(query);
+export function buildMatchExpression(
+  query: string,
+  widen?: VariantLookup,
+  columns?: readonly string[],
+): string | null {
+  const node = parseQuery(query, columns);
   return node === null ? null : emitMatchExpression(node, widen);
 }

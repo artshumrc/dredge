@@ -77,6 +77,12 @@ interface FieldInfo {
   type: string;
 }
 
+// A named, independently weighted full-text column of the index.
+export interface SearchColumn {
+  name: string;
+  weight: number;
+}
+
 export interface SchemaInfo {
   // Scalar facet columns living directly on the documents table.
   scalarColumns: string[];
@@ -88,6 +94,10 @@ export interface SchemaInfo {
   // Whether the artifact carries a Term Variant table. Artifacts built before
   // it existed have none, and widen nothing.
   hasTermVariants: boolean;
+  // The index's Search Columns in column order, each with the bm25 weight the
+  // maintainer's config gave it. `bm25()` takes one weight per column in this
+  // order, and a `field:` scope may name any of them.
+  searchColumns: SearchColumn[];
 }
 
 function quoteIdentifier(name: string): string {
@@ -126,12 +136,17 @@ export function introspectSchema(exec: Exec): SchemaInfo {
     [TERM_VARIANTS_TABLE],
   );
 
+  const searchColumns = exec(
+    `SELECT name, weight FROM ${SEARCH_COLUMNS_TABLE} ORDER BY position`,
+  ).map((row) => ({ name: String(row[0]), weight: Number(row[1]) }));
+
   return {
     scalarColumns,
     arrayFacets,
     fields,
     documentColumns,
     hasTermVariants: variantTable.length > 0,
+    searchColumns,
   };
 }
 
@@ -287,16 +302,15 @@ function facetNamesToCount(schema: SchemaInfo, includeFacets: boolean | string[]
   return [];
 }
 
-// Fixed bm25 column weights for the documents_fts(title, body) index: a title
-// hit outranks a body mention by this constant factor. Not configurable in this
-// release (SPEC.md → "Query execution (single pass)").
-const FTS_TITLE_WEIGHT = 10.0;
-const FTS_BODY_WEIGHT = 1.0;
-
 // The artifact's Term Variant table: surface form -> the group's other surface
 // forms, space separated. Optional — artifacts built before it existed have no
 // such table, and a runtime opening one widens nothing.
 const TERM_VARIANTS_TABLE = "dredge_term_variants";
+
+// The artifact's Search Column table: one row per full-text column, carrying the
+// bm25 weight the maintainer configured and the column's position in the index.
+// The compiler writes it into every artifact, so no ranking constant lives here.
+const SEARCH_COLUMNS_TABLE = "dredge_search_columns";
 
 // The variant table is keyed on the terms the index holds, so a lookup key has
 // to be folded the index's way (`foldTerm`) before it can hit.
@@ -323,7 +337,12 @@ interface MatchPlan {
 }
 
 function planMatch(exec: Exec, schema: SchemaInfo, query: string): MatchPlan | null {
-  const node = query ? parseQuery(query) : null;
+  const node = query
+    ? parseQuery(
+        query,
+        schema.searchColumns.map((column) => column.name),
+      )
+    : null;
   if (node === null) {
     return null;
   }
@@ -376,7 +395,8 @@ function createMatchTable(
   const rankColumns: string[] = [];
   const bind: unknown[] = [];
   if (rank) {
-    rankColumns.push(`bm25(documents_fts, ${FTS_TITLE_WEIGHT}, ${FTS_BODY_WEIGHT}) AS rank`);
+    const weights = schema.searchColumns.map((column) => column.weight).join(", ");
+    rankColumns.push(`bm25(documents_fts, ${weights}) AS rank`);
     if (exactExpr === null) {
       // Nothing widened, so every match is an exact match.
       rankColumns.push("0 AS band");

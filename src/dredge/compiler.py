@@ -3,6 +3,7 @@ from __future__ import annotations
 import fnmatch
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -53,6 +54,19 @@ FTS_TOKENIZER = "unicode61 remove_diacritics 2"
 # forms precisely so the Runtime never has to reproduce this.
 VARIANT_STEM_TOKENIZER = f"porter {FTS_TOKENIZER}"
 
+# The Search Columns every index carries. A named search field becomes a further
+# column after these, in config order; the order is the order ``bm25()`` reads
+# its weights in, so it must never be rearranged.
+BUILTIN_SEARCH_COLUMNS = ("title", "body")
+# Names FTS5 keeps for itself, plus the built-ins a config cannot redeclare.
+RESERVED_SEARCH_COLUMNS = {*BUILTIN_SEARCH_COLUMNS, "rowid", "rank"}
+# The bm25 weight a column carries when the config sets none: a title hit
+# outranks a body mention by this factor. These live here alone — they are
+# written into every artifact, so the Runtime reads them rather than holding a
+# second copy that could drift.
+DEFAULT_SEARCH_WEIGHTS = {"title": 10.0, "body": 1.0}
+DEFAULT_SEARCH_COLUMN_WEIGHT = 1.0
+
 IDENTIFIER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 ATTRIBUTE_RE = re.compile(r"^[A-Za-z_:][-A-Za-z0-9_:.]*$")
 TOKEN_RE = re.compile(r"[\w]+", re.UNICODE)
@@ -66,6 +80,7 @@ TOP_LEVEL_KEYS = {
     "exclude",
     "selectors",
     "search_fields",
+    "search_weights",
     "facets",
     "store_fields",
     "result_fields",
@@ -271,6 +286,15 @@ class FacetConfig:
 @dataclass(frozen=True)
 class SearchFieldConfig:
     source: str
+    # Set when the maintainer names the field, which promotes it out of the
+    # shared body text into a Search Column of its own.
+    name: str | None = None
+
+
+@dataclass(frozen=True)
+class SearchColumnConfig:
+    name: str
+    weight: float
 
 
 @dataclass(frozen=True)
@@ -284,6 +308,7 @@ class DredgeConfig:
     exclude: tuple[str, ...]
     selectors: dict[str, str]
     search_fields: tuple[SearchFieldConfig, ...]
+    search_columns: tuple[SearchColumnConfig, ...]
     facets: tuple[FacetConfig, ...]
     store_fields: tuple[FacetConfig, ...]
     result_fields: tuple[str, ...]
@@ -315,6 +340,15 @@ class DredgeConfig:
     def array_facets(self) -> tuple[FacetConfig, ...]:
         return tuple(facet for facet in self.facets if facet.is_array)
 
+    @property
+    def named_search_columns(self) -> tuple[str, ...]:
+        """The Search Columns beyond ``title`` and ``body``, in column order."""
+        return tuple(
+            column.name
+            for column in self.search_columns
+            if column.name not in BUILTIN_SEARCH_COLUMNS
+        )
+
 
 @dataclass(frozen=True)
 class FileCandidate:
@@ -336,6 +370,9 @@ class ExtractedDocument:
     title: str
     description: str | None
     body: str
+    # Text for each named Search Column, keyed by column name. Always carries
+    # every named column, empty string included, so the FTS insert is positional.
+    search_columns: dict[str, str]
     scalar_facets: dict[str, str | int | float | None]
     array_facets: dict[str, tuple[str, ...]]
     store_fields: dict[str, str | int | float | None]
@@ -548,6 +585,7 @@ def load_config(config_path: Path) -> DredgeConfig:
     exclude = tuple(_optional_string_list(raw, "exclude", []))
     selectors = _load_selectors(raw)
     search_fields = tuple(_load_search_fields(raw))
+    search_columns = _build_search_columns(search_fields, raw)
     facets = _load_facets(raw)
     store_fields = _load_store_fields(raw)
     facet_map = {facet.name: facet for facet in facets}
@@ -577,7 +615,10 @@ def load_config(config_path: Path) -> DredgeConfig:
         "include": list(include),
         "exclude": list(exclude),
         "selectors": selectors,
-        "search_fields": [{"source": field.source} for field in search_fields],
+        "search_fields": [
+            {"source": field.source, "name": field.name} for field in search_fields
+        ],
+        "search_weights": {column.name: column.weight for column in search_columns},
         "facets": {
             facet.name: {
                 "type": facet.type,
@@ -618,6 +659,7 @@ def load_config(config_path: Path) -> DredgeConfig:
         exclude=exclude,
         selectors=selectors,
         search_fields=search_fields,
+        search_columns=search_columns,
         facets=facets,
         store_fields=store_fields,
         result_fields=result_fields,
@@ -808,6 +850,7 @@ def _compile_site(
                 _create_tables(connection, config)
                 connection.commit()
             insert_sql = _document_insert_sql(config)
+            fts_insert_sql = _fts_insert_sql(config)
             array_insert_sql = {
                 facet.name: f"INSERT OR IGNORE INTO {_quote_identifier(_array_table_name(facet.name))} "
                 "(document_id, value) VALUES (?, ?)"
@@ -850,13 +893,21 @@ def _compile_site(
                     build_db_bytes = None
                     if len(batches.documents) >= INSERT_BATCH_SIZE or report_due:
                         _flush_insert_batches(
-                            connection, insert_sql, array_insert_sql, batches
+                            connection,
+                            insert_sql,
+                            fts_insert_sql,
+                            array_insert_sql,
+                            batches,
                         )
                         if report_due:
                             build_db_bytes = _sqlite_database_size_bytes(connection)
                     if index % BATCH_SIZE == 0:
                         _flush_insert_batches(
-                            connection, insert_sql, array_insert_sql, batches
+                            connection,
+                            insert_sql,
+                            fts_insert_sql,
+                            array_insert_sql,
+                            batches,
                         )
                         connection.commit()
                         if reporter is not None:
@@ -870,7 +921,7 @@ def _compile_site(
                         reporter.maybe_report(index, build_db_bytes=build_db_bytes)
                     files_advance(index, build_db_bytes)
                 _flush_insert_batches(
-                    connection, insert_sql, array_insert_sql, batches
+                    connection, insert_sql, fts_insert_sql, array_insert_sql, batches
                 )
                 connection.commit()
                 final_db_bytes = _path_size(build_db_path)
@@ -1029,11 +1080,12 @@ def _load_search_fields(raw: dict[str, Any]) -> list[SearchFieldConfig]:
     if not isinstance(value, list):
         raise BuildError("CONFIG_INVALID", "search_fields must be an array")
     fields: list[SearchFieldConfig] = []
+    taken: set[str] = set()
     for index, item in enumerate(value, start=1):
         if isinstance(item, str):
             source = item
         elif isinstance(item, dict):
-            unknown = sorted(set(item) - {"source"})
+            unknown = sorted(set(item) - {"source", "name"})
             if unknown:
                 raise BuildError(
                     "CONFIG_INVALID",
@@ -1052,8 +1104,83 @@ def _load_search_fields(raw: dict[str, Any]) -> list[SearchFieldConfig]:
         _validate_selector_source(
             source.strip(), f"search_fields[{index}]", allow_direct_attribute=True
         )
-        fields.append(SearchFieldConfig(source=source.strip()))
+        name = item.get("name") if isinstance(item, dict) else None
+        if name is not None:
+            name = _validate_search_column_name(name, index, taken)
+            taken.add(name)
+        fields.append(SearchFieldConfig(source=source.strip(), name=name))
     return fields
+
+
+def _validate_search_column_name(value: Any, index: int, taken: set[str]) -> str:
+    if not isinstance(value, str) or not IDENTIFIER_RE.match(value):
+        raise BuildError(
+            "CONFIG_INVALID",
+            f"search_fields[{index}].name must be an identifier, got {value!r}",
+        )
+    if value in RESERVED_SEARCH_COLUMNS:
+        raise BuildError(
+            "CONFIG_INVALID",
+            f"search_fields[{index}].name {value!r} is reserved",
+        )
+    if value in taken:
+        raise BuildError(
+            "CONFIG_INVALID",
+            f"search_fields[{index}].name {value!r} is already a Search Column",
+        )
+    return value
+
+
+def _build_search_columns(
+    search_fields: Sequence[SearchFieldConfig], raw: dict[str, Any]
+) -> tuple[SearchColumnConfig, ...]:
+    """Resolve the index's Search Columns, in the order ``bm25()`` weights them.
+
+    ``title`` and ``body`` always lead, so a config that names no field produces
+    the two-column index — and the byte cost — it produced before Search Columns
+    existed.
+    """
+    named = [field.name for field in search_fields if field.name]
+    names = [*BUILTIN_SEARCH_COLUMNS, *named]
+    weights = _load_search_weights(raw, names)
+    return tuple(
+        SearchColumnConfig(
+            name=name,
+            weight=weights.get(
+                name, DEFAULT_SEARCH_WEIGHTS.get(name, DEFAULT_SEARCH_COLUMN_WEIGHT)
+            ),
+        )
+        for name in names
+    )
+
+
+def _load_search_weights(
+    raw: dict[str, Any], names: Sequence[str]
+) -> dict[str, float]:
+    value = raw.get("search_weights", {})
+    if not isinstance(value, dict):
+        raise BuildError("CONFIG_INVALID", "search_weights must be an object")
+    weights: dict[str, float] = {}
+    for name, weight in value.items():
+        if name not in names:
+            raise BuildError(
+                "CONFIG_INVALID",
+                f"search_weights names unknown Search Column {name!r}; "
+                f"known columns are {', '.join(names)}",
+            )
+        if isinstance(weight, bool) or not isinstance(weight, (int, float)):
+            raise BuildError(
+                "CONFIG_INVALID",
+                f"search_weights[{name}] must be a number, got {weight!r}",
+            )
+        if not math.isfinite(weight) or weight < 0:
+            raise BuildError(
+                "CONFIG_INVALID",
+                f"search_weights[{name}] must be a finite non-negative number, "
+                f"got {weight!r}",
+            )
+        weights[name] = float(weight)
+    return weights
 
 
 def _load_facets(raw: dict[str, Any]) -> tuple[FacetConfig, ...]:
@@ -1361,6 +1488,31 @@ def _create_dredge_fields_table(
     )
 
 
+def _create_search_columns_table(
+    connection: sqlite3.Connection, config: DredgeConfig
+) -> None:
+    """Record the index's Search Columns and their bm25 weights.
+
+    ``position`` is the column's position in ``documents_fts``, which is the
+    order ``bm25()`` reads its weight arguments in. The Runtime learns both from
+    here, so the weights are configured in exactly one place.
+    """
+    connection.execute(
+        "CREATE TABLE dredge_search_columns ("
+        "name TEXT PRIMARY KEY, "
+        "position INTEGER NOT NULL, "
+        "weight REAL NOT NULL"
+        ") STRICT"
+    )
+    connection.executemany(
+        "INSERT INTO dredge_search_columns(name, position, weight) VALUES (?, ?, ?)",
+        [
+            (column.name, position, column.weight)
+            for position, column in enumerate(config.search_columns)
+        ],
+    )
+
+
 def _create_array_facet_tables(
     connection: sqlite3.Connection, config: DredgeConfig
 ) -> None:
@@ -1379,10 +1531,12 @@ def _create_tables(connection: sqlite3.Connection, config: DredgeConfig) -> None
     document_columns = _documents_column_defs(config)
     connection.execute(f"CREATE TABLE documents ({', '.join(document_columns)}) STRICT")
     _create_dredge_fields_table(connection, config)
+    fts_columns = ", ".join(column.name for column in config.search_columns)
     connection.execute(
         "CREATE VIRTUAL TABLE documents_fts USING fts5("
-        f"title, body, content='', tokenize='{FTS_TOKENIZER}')"
+        f"{fts_columns}, content='', tokenize='{FTS_TOKENIZER}')"
     )
+    _create_search_columns_table(connection, config)
     # Keyed on the surface form rather than a stem, so the Runtime looks up the
     # word the reader typed and ships no stemmer of its own. Left empty when
     # variants are configured off.
@@ -1432,10 +1586,16 @@ def _document_insert_sql(config: DredgeConfig) -> str:
     return f"INSERT INTO documents ({sql_columns}) VALUES ({placeholders})"
 
 
+def _fts_insert_sql(config: DredgeConfig) -> str:
+    columns = ", ".join(column.name for column in config.search_columns)
+    placeholders = ", ".join("?" for _ in config.search_columns)
+    return f"INSERT INTO documents_fts(rowid, {columns}) VALUES (?, {placeholders})"
+
+
 @dataclass
 class _InsertBatches:
     documents: list[tuple[Any, ...]]
-    fts: list[tuple[int, str, str]]
+    fts: list[tuple[Any, ...]]
     array_facets: dict[str, list[tuple[int, str]]]
 
     @classmethod
@@ -1463,7 +1623,14 @@ def _queue_document_insert(
     )
     values.extend(document.store_fields.get(field.name) for field in config.store_fields)
     batches.documents.append(tuple(values))
-    batches.fts.append((document.id, document.title, document.body))
+    batches.fts.append(
+        (
+            document.id,
+            document.title,
+            document.body,
+            *(document.search_columns[name] for name in config.named_search_columns),
+        )
+    )
     for facet in config.array_facets:
         batches.array_facets[facet.name].extend(
             (document.id, value) for value in document.array_facets.get(facet.name, ())
@@ -1473,6 +1640,7 @@ def _queue_document_insert(
 def _flush_insert_batches(
     connection: sqlite3.Connection,
     insert_sql: str,
+    fts_insert_sql: str,
     array_insert_sql: dict[str, str],
     batches: _InsertBatches,
 ) -> None:
@@ -1480,10 +1648,7 @@ def _flush_insert_batches(
         connection.executemany(insert_sql, batches.documents)
         batches.documents.clear()
     if batches.fts:
-        connection.executemany(
-            "INSERT INTO documents_fts(rowid, title, body) VALUES (?, ?, ?)",
-            batches.fts,
-        )
+        connection.executemany(fts_insert_sql, batches.fts)
         batches.fts.clear()
     for facet_name, rows in batches.array_facets.items():
         if rows:
@@ -1608,8 +1773,13 @@ def _extract_document(
 
     body_values = _extract_values(tree, config.selectors["body"])
     extra_search_values: list[str] = []
+    search_columns: dict[str, str] = {}
     for field in config.search_fields:
-        extra_search_values.extend(_extract_values(tree, field.source))
+        values = _extract_values(tree, field.source)
+        if field.name is None:
+            extra_search_values.extend(values)
+        else:
+            search_columns[field.name] = _normalize_text(" ".join(values))
     body = _normalize_text(" ".join((*body_values, *extra_search_values)))
     if not body_values:
         warnings.add(
@@ -1691,6 +1861,7 @@ def _extract_document(
         title=title,
         description=description,
         body=body,
+        search_columns=search_columns,
         scalar_facets=scalar_facets,
         array_facets=array_facets,
         store_fields=store_fields,
@@ -1949,6 +2120,18 @@ def format_payload_report(report: dict[str, Any]) -> str:
         f"  term variants: {variants['row_count']:,} rows, {variant_bytes}"
     )
 
+    search_columns = report["search_columns"]
+    index_bytes = search_columns["index_bytes"]
+    index_total = (
+        _format_bytes(index_bytes) if index_bytes is not None else "unknown total"
+    )
+    lines.append(f"  search columns ({index_total} of full-text index):")
+    for column in search_columns["columns"]:
+        lines.append(
+            f"    {column['name']:<28} {_format_bytes(column['bytes']):>12} "
+            f"weight {column['weight']:>8.2f} {column['postings']:>12,} postings"
+        )
+
     lines.append(f"  documents columns ({report['row_count']:,} rows):")
     for column in report["columns"]:
         lines.append(
@@ -2003,7 +2186,62 @@ def _build_payload_report(
         "tables": tables,
         "columns": columns,
         "term_variants": _payload_term_variant_stats(connection, tables),
+        "search_columns": _payload_search_column_stats(connection, config, tables),
     }
+
+
+def _payload_search_column_stats(
+    connection: sqlite3.Connection,
+    config: DredgeConfig,
+    tables: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """What each Search Column costs, so splitting text is a payload decision.
+
+    FTS5 stores one posting list per (term, column), and the index's bytes track
+    the number of postings rather than the text behind them — which is why the
+    cost of an extra column is per document per column. The index's measured
+    bytes are therefore attributed to columns in proportion to their postings;
+    ``postings`` itself is exact.
+    """
+    index_bytes = sum(
+        entry["bytes"]
+        for entry in tables
+        if entry["name"].startswith("documents_fts")
+    )
+    connection.execute(
+        "CREATE VIRTUAL TABLE temp.dredge_column_vocab USING "
+        "fts5vocab('main', 'documents_fts', 'col')"
+    )
+    try:
+        counts = {
+            str(row[0]): (int(row[1]), int(row[2]), int(row[3]))
+            for row in connection.execute(
+                "SELECT col, COUNT(*), SUM(doc), SUM(cnt) "
+                "FROM temp.dredge_column_vocab GROUP BY col"
+            )
+        }
+    finally:
+        connection.execute("DROP TABLE temp.dredge_column_vocab")
+
+    total_postings = sum(postings for _, postings, _ in counts.values())
+    columns = []
+    for column in config.search_columns:
+        terms, postings, occurrences = counts.get(column.name, (0, 0, 0))
+        columns.append(
+            {
+                "name": column.name,
+                "weight": column.weight,
+                "terms": terms,
+                "postings": postings,
+                "occurrences": occurrences,
+                "bytes": (
+                    round(index_bytes * postings / total_postings)
+                    if total_postings and index_bytes
+                    else 0
+                ),
+            }
+        )
+    return {"index_bytes": index_bytes or None, "columns": columns}
 
 
 def _payload_term_variant_stats(

@@ -263,6 +263,69 @@ describe("runtime search fixture", () => {
     });
   });
 
+  it("reads each Search Column and its bm25 weight from the artifact", () => {
+    withFixture((_exec, schema) => {
+      // The fixture config names `catalog` and weights it above title; title and
+      // body keep the compiler's defaults. Nothing in the runtime knows these
+      // numbers — they are read out of the compiled database.
+      expect(schema.searchColumns).toEqual([
+        { name: "title", weight: 10 },
+        { name: "body", weight: 1 },
+        { name: "catalog", weight: 30 },
+      ]);
+    });
+  });
+
+  it("ranks a term in a heavy Search Column above the same term in a light one", () => {
+    withFixture((exec, schema) => {
+      // `ledger` is the catalog value of one page and a body word of the other.
+      const ranked = search(exec, schema, { query: "ledger", limit: 10 });
+      expect(ranked.total).toBe(2);
+      expect(ranked.hits.map((hit) => hit.title)).toEqual([
+        "Storeroom Inventory",
+        "Field Diary",
+      ]);
+
+      // Same index, same query, only the weight the artifact declared for the
+      // catalog column changed: the order follows it, so the weight bm25 sees
+      // is the artifact's rather than a constant.
+      const lightened: SchemaInfo = {
+        ...schema,
+        searchColumns: schema.searchColumns.map((column) =>
+          column.name === "catalog" ? { ...column, weight: 0.01 } : column,
+        ),
+      };
+      const flipped = search(exec, lightened, { query: "ledger", limit: 10 });
+      expect(flipped.hits.map((hit) => hit.title)).toEqual([
+        "Field Diary",
+        "Storeroom Inventory",
+      ]);
+    });
+  });
+
+  it("scopes a field term to the maintainer's own Search Column", () => {
+    withFixture((exec, schema) => {
+      const anywhere = search(exec, schema, { query: "ledger", limit: 10 });
+      const scoped = search(exec, schema, { query: "catalog:ledger", limit: 10 });
+
+      expect(anywhere.total).toBe(2);
+      expect(scoped.total).toBe(1);
+      expect(scoped.hits.map((hit) => hit.title)).toEqual(["Storeroom Inventory"]);
+    });
+  });
+
+  it("degrades an unknown field name to its terms instead of throwing", () => {
+    withFixture((exec, schema) => {
+      // `image` is a Store Field, not a Search Column, so the scope cannot be
+      // honoured; the query reads as the two words the reader typed.
+      const plain = search(exec, schema, { query: "image temple", limit: 0 });
+      const unknown = search(exec, schema, { query: "image:temple", limit: 0 });
+
+      expect(plain.total).toBe(49);
+      expect(unknown.total).toBe(plain.total);
+    });
+  });
+
   it("keeps scalar and array facet counts under all-filters-except-own", () => {
     const db = new DatabaseSync(fixtureDbPath());
     try {

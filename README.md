@@ -73,8 +73,12 @@ A config declares where the HTML lives, how to extract fields from it, and what 
   },
   "search_fields": [
     "meta[name='keywords']@content",
-    { "source": "meta[data-pagefind-meta='catalog_id[content]']@content" }
+    {
+      "source": "meta[data-pagefind-meta='catalog_id[content]']@content",
+      "name": "catalog_id"
+    }
   ],
+  "search_weights": { "title": 10.0, "catalog_id": 25.0 },
   "facets": {
     "category": {
       "type": "string",
@@ -104,7 +108,8 @@ Keys:
 - `base_url`: URL prefix used when turning HTML paths into result URLs.
 - `include` and `exclude`: glob lists selecting HTML files under `source_dir`.
 - `selectors`: extraction selectors for the built-in `title`, `body`, and `description` fields.
-- `search_fields`: extra fields indexed for full-text search. Each entry is either a selector string or a `{ "source": string }` object; its text is folded into the body full-text index alongside the `body` selector.
+- `search_fields`: extra fields indexed for full-text search. Each entry is either a selector string or a `{ "source": string, "name"?: string }` object. Without a `name` its text is folded into the body full-text index alongside the `body` selector. With one it becomes a **Search Column** of its own — separately weighted for ranking, and addressable as `name:term` in a reader's query.
+- `search_weights`: bm25 weight per Search Column. Keys are `title`, `body`, or any name declared in `search_fields`; values are finite non-negative numbers. Defaults are `title` 10.0, `body` 1.0, and 1.0 for a named Search Column. Every extra Search Column costs roughly 16–20 bytes per document in the shipped index, which the payload report prices per column.
 - `facets`: named fields extracted per page, indexed, filterable, and countable at query time. Supported types are `string`, `string_array`, `integer`, `number`, `boolean`, and `date`.
 - `store_fields`: named fields carried into search results but never indexed, filtered, or counted. Scalar types only — `string_array` must stay a Facet.
 - `result_fields`: fields returned with each hit. May reference built-ins, Facets, and Store Fields.

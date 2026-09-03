@@ -69,6 +69,24 @@ const VARIANT_PAGES = [
   },
 ];
 
+// Pages the Search Column tests rank. `ledger` sits in the catalog Search
+// Column of one and in the body of the other, so the only thing that can order
+// them is the weight the config gives each column.
+const SEARCH_COLUMN_PAGES = [
+  {
+    slug: "storeroom-inventory",
+    title: "Storeroom Inventory",
+    catalog: "ledger",
+    body: "An inventory of vessels held in the northern storeroom.",
+  },
+  {
+    slug: "field-diary",
+    title: "Field Diary",
+    catalog: "diaryset",
+    body: "A ledger was kept beside the trench through the season.",
+  },
+];
+
 // Pages the highlighting tests mark. The diacritic is the point: the index folds
 // it away, so a mark computed on the folded text has to be reported back in the
 // offsets of the title as returned.
@@ -88,7 +106,7 @@ const SYNONYM_GROUPS = [
   ["khufu", "cheops"],
 ];
 
-function fixturePage({ title, body }) {
+function fixturePage({ title, body, catalog = "variantset" }) {
   return `<!doctype html>
 <html lang="en">
   <head>
@@ -104,7 +122,7 @@ function fixturePage({ title, body }) {
       data-dredge-featured="false"
       data-dredge-published="2024-01-01"
       data-dredge-image="/images/variant.jpg"
-      data-dredge-catalog="variantset"
+      data-dredge-catalog="${catalog}"
     >
       <h1>${title}</h1>
       <p>${body}</p>
@@ -118,6 +136,7 @@ async function addFixturePages() {
   for (const [dir, pages] of [
     ["variants", VARIANT_PAGES],
     ["highlight", HIGHLIGHT_PAGES],
+    ["search-columns", SEARCH_COLUMN_PAGES],
   ]) {
     const pageDir = resolve(fixtureRoot, "site", dir);
     await mkdir(pageDir, { recursive: true });
@@ -127,6 +146,11 @@ async function addFixturePages() {
   }
   const config = JSON.parse(await readFile(configPath, "utf8"));
   config.synonym_groups = SYNONYM_GROUPS;
+  // The synthetic config folds the catalog attribute into the body; naming it
+  // promotes it to a Search Column, and the weight is what the ranking tests
+  // read back out of the artifact.
+  config.search_fields = [{ source: "data-dredge-catalog", name: "catalog" }];
+  config.search_weights = { catalog: 30.0 };
   await writeFile(configPath, `${JSON.stringify(config, null, 2)}\n`, "utf8");
 }
 

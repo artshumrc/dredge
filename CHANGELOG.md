@@ -6,6 +6,28 @@ All notable changes to Dredge are documented here. This project adheres to
 
 ## Unreleased
 
+### A site says which of its fields matter
+
+Fields named for full-text search stop being concatenated into one indexed body
+and become **Search Columns** of the index, each with its own bm25 weight. A
+catalogue identifier can now outrank the same string buried in a paragraph.
+
+- A `search_fields` entry with a `name` becomes a Search Column; one without a
+  name is still folded into `body`, exactly as before.
+- `search_weights` sets the bm25 weight of any Search Column, `title` and `body`
+  included. Defaults are `title` 10.0, `body` 1.0, and 1.0 for a named column,
+  so a config that names nothing new compiles to the two-column index and the
+  bytes it compiled to before.
+- The weights ship in the artifact's `dredge_search_columns` table and the
+  runtime reads them there; no ranking constant is left in the runtime.
+- `field:` resolves the maintainer's own names, so `identifier:G7510` scopes to
+  their `identifier` column. An unknown name is a reader error and degrades,
+  never a build error.
+- The payload report prices each Search Column. An extra column costs roughly
+  16–20 bytes per document, because FTS5 restarts a position list at each column
+  boundary — which is why Search Columns are opt-in per site.
+- bm25's `k1` and `b` stay fixed: FTS5 exposes neither.
+
 ### A query language instead of a bag of words
 
 Reader input is parsed into a Query AST and emitted as an FTS5 match expression
@@ -19,7 +41,8 @@ expression, and no reader text reaches `MATCH` unparsed.
 - Typeahead is unchanged: only the last term typed is prefix-expanded, never
   inside a quoted phrase, and a single-character final term stays exact.
   Catalogue-identifier handling and diacritic folding are untouched.
-- `field:` scopes to the columns the index has today, `title` and `body`.
+- `field:` scopes to the index's Search Columns — `title` and `body`, plus
+  whatever the config names.
 - The compiler's duplicate `dredge.query` builder is gone;
   `tests/fixtures/query-vectors.json` is now the Runtime's golden file alone.
 

@@ -349,6 +349,152 @@ def test_compile_without_search_fields_indexes_title_and_body(tmp_path: Path) ->
         connection.close()
 
 
+# The two-column index every config produced before Search Columns existed. A
+# config that names none must still compile to exactly this, byte for byte.
+DEFAULT_FTS_SQL = (
+    "CREATE VIRTUAL TABLE documents_fts USING fts5("
+    "title, body, content='', tokenize='unicode61 remove_diacritics 2')"
+)
+
+
+def test_config_naming_no_search_columns_keeps_the_two_column_index(
+    tmp_path: Path,
+) -> None:
+    config_path, _ = _write_fixture_project(tmp_path)
+
+    result = compile_site(config_path)
+
+    connection = sqlite3.connect(f"file:{result.db_path}?mode=ro&immutable=1", uri=True)
+    try:
+        assert (
+            connection.execute(
+                "SELECT sql FROM sqlite_master WHERE name = 'documents_fts'"
+            ).fetchone()[0]
+            == DEFAULT_FTS_SQL
+        )
+        assert [
+            row[1] for row in connection.execute("PRAGMA table_info(documents_fts)")
+        ] == ["title", "body"]
+        # The weights the runtime used to hold as constants now ship in the
+        # artifact, at the same values.
+        assert connection.execute(
+            "SELECT name, position, weight FROM dredge_search_columns ORDER BY position"
+        ).fetchall() == [("title", 0, 10.0), ("body", 1, 1.0)]
+        # An unnamed search field is still folded into the body column.
+        assert connection.execute(
+            "SELECT COUNT(*) FROM documents_fts WHERE documents_fts MATCH ?",
+            ("{body}:zeta9000",),
+        ).fetchone()[0] == 1
+    finally:
+        connection.close()
+
+
+def test_named_search_fields_become_weighted_search_columns(tmp_path: Path) -> None:
+    config_path, _ = _write_fixture_project(
+        tmp_path,
+        search_fields=[
+            {"source": "data-dredge-catalog", "name": "catalog"},
+            {"source": "data-dredge-image", "name": "imageref"},
+        ],
+        search_weights={"title": 4.0, "catalog": 25.0},
+    )
+
+    result = compile_site(config_path)
+
+    connection = sqlite3.connect(f"file:{result.db_path}?mode=ro&immutable=1", uri=True)
+    try:
+        # Named fields become columns after the built-ins, in config order, and
+        # each carries its own weight — one declared, one left at the default.
+        assert [
+            row[1] for row in connection.execute("PRAGMA table_info(documents_fts)")
+        ] == ["title", "body", "catalog", "imageref"]
+        assert connection.execute(
+            "SELECT name, position, weight FROM dredge_search_columns ORDER BY position"
+        ).fetchall() == [
+            ("title", 0, 4.0),
+            ("body", 1, 1.0),
+            ("catalog", 2, 25.0),
+            ("imageref", 3, 1.0),
+        ]
+        assert connection.execute(
+            "SELECT COUNT(*) FROM documents_fts WHERE documents_fts MATCH ?",
+            ("{imageref}:alpha",),
+        ).fetchone()[0] == 1
+
+        # The named field's text left the body for its own column, so a scope
+        # separates it from the same string in prose.
+        assert connection.execute(
+            "SELECT COUNT(*) FROM documents_fts WHERE documents_fts MATCH ?",
+            ("{catalog}:zeta9000",),
+        ).fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT COUNT(*) FROM documents_fts WHERE documents_fts MATCH ?",
+            ("{body}:zeta9000",),
+        ).fetchone()[0] == 0
+        # Unscoped search still reaches it.
+        assert connection.execute(
+            "SELECT COUNT(*) FROM documents_fts WHERE documents_fts MATCH ?",
+            ("zeta9000",),
+        ).fetchone()[0] == 1
+    finally:
+        connection.close()
+
+
+def test_payload_report_prices_each_search_column(tmp_path: Path) -> None:
+    config_path, _ = _write_fixture_project(
+        tmp_path,
+        search_fields=[{"source": "data-dredge-catalog", "name": "catalog"}],
+        search_weights={"catalog": 25.0},
+    )
+
+    result = compile_site(config_path)
+
+    report = result.metrics["payload_report"]["search_columns"]
+    assert [column["name"] for column in report["columns"]] == [
+        "title",
+        "body",
+        "catalog",
+    ]
+    by_name = {column["name"]: column for column in report["columns"]}
+    assert by_name["catalog"]["weight"] == 25.0
+    assert by_name["catalog"]["postings"] > 0
+    assert sum(column["bytes"] for column in report["columns"]) > 0
+    assert report["index_bytes"] > 0
+
+    rendered = compiler.format_payload_report(result.metrics["payload_report"])
+    assert "search columns" in rendered
+    assert "catalog" in rendered
+
+
+@pytest.mark.parametrize(
+    ("field_name", "weights", "message"),
+    [
+        ("title", None, "is reserved"),
+        ("not an identifier", None, "must be an identifier"),
+        ("catalog", {"nosuch": 2.0}, "unknown Search Column"),
+        ("catalog", {"catalog": -1.0}, "finite non-negative"),
+        ("catalog", {"catalog": "heavy"}, "must be a number"),
+    ],
+)
+def test_search_column_config_is_validated(
+    tmp_path: Path,
+    field_name: str,
+    weights: dict[str, float] | None,
+    message: str,
+) -> None:
+    config_path, _ = _write_fixture_project(
+        tmp_path,
+        search_fields=[{"source": "data-dredge-catalog", "name": field_name}],
+        search_weights=weights,
+    )
+
+    with pytest.raises(BuildError) as error:
+        load_config(config_path)
+
+    assert error.value.code == "CONFIG_INVALID"
+    assert message in str(error.value)
+
+
 def test_artifact_omits_content_hash_and_url_autoindex(tmp_path: Path) -> None:
     config_path, _ = _write_fixture_project(tmp_path)
 
@@ -1262,6 +1408,8 @@ def _write_fixture_project(
     include_descriptions: bool = True,
     client: dict[str, str] | None = None,
     search_field: bool = True,
+    search_fields: list[dict[str, str]] | None = None,
+    search_weights: dict[str, float] | None = None,
 ) -> tuple[Path, Path]:
     source_dir = tmp_path / "site"
     output_dir = tmp_path / "search"
@@ -1369,7 +1517,9 @@ def _write_fixture_project(
         "composite_indices": [["category", "year"]],
     }
     if search_field:
-        config["search_fields"] = [{"source": "data-dredge-catalog"}]
+        config["search_fields"] = search_fields or [{"source": "data-dredge-catalog"}]
+    if search_weights is not None:
+        config["search_weights"] = search_weights
     if client is not None:
         config["client"] = client
     config_path = tmp_path / "dredge.config.json"

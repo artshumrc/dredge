@@ -34,6 +34,10 @@ The browser-side library: worker (SQLite WASM + OPFS) plus the thin client that 
 **Compiler**:
 The Python CLI (`dredge compile`) that extracts, ingests, indexes, and packages a site into the database artifact.
 
+**Search Column**:
+A named, independently weighted full-text column of the Database Artifact's index. `title` and `body` always exist; naming a `search_fields` entry adds another, lifting its text out of the shared body. The columns and their bm25 weights live in the artifact's `dredge_search_columns` table, so the runtime holds no ranking constants of its own.
+_Avoid_: search field, FTS field.
+
 **Term Variant**:
 A compiled equivalence between two surface forms in the corpus, so that a query for one matches the other. A **Variant Group** is the full set a term belongs to. Groups are derived at build time from the index's own terms and written to `dredge_term_variants`, keyed on the surface form so no stemmer ships to the browser.
 _Avoid_: stem, synonym — both are *sources* of term variants, not the thing itself.
