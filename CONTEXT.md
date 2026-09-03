@@ -39,7 +39,7 @@ A named, independently weighted full-text column of the Database Artifact's inde
 _Avoid_: search field, FTS field.
 
 **Boost**:
-A multiplier a site declares over one of its scalar Facets, applied to the relevance ordering of the pages that Facet's value names. Two shapes: a multiplier per value, or a recency curve over a `date` Facet. Boosts multiply rather than add — bm25 ranks are negative — and order pages within a Variant Group band, never across one. They ship in the artifact's `dredge_boosts` table.
+A multiplier a site declares over one of its scalar Facets, applied to the relevance ordering of the pages that Facet's value names. Two shapes: a multiplier per value, or a recency curve over a `date` Facet. Boosts multiply rather than add — bm25 ranks are negative — and order pages within a band, never across one: a page reached only through a Term Variant is never lifted above a page holding the reader's own word. They ship in the artifact's `dredge_boosts` table.
 _Avoid_: score, ranking factor — a boost changes order, not what a hit reports as its `score`.
 
 **Term Variant**:

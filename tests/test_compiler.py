@@ -1337,11 +1337,11 @@ def test_declared_variant_terms_must_be_single_words(tmp_path: Path) -> None:
         tmp_path, synonym_groups=[["great pyramid", "khufu"]]
     )
 
-    with pytest.raises(BuildError) as excinfo:
+    with pytest.raises(BuildError) as error:
         load_config(config_path)
 
-    assert excinfo.value.code == "CONFIG_INVALID"
-    assert "single searchable word" in str(excinfo.value)
+    assert error.value.code == "CONFIG_INVALID"
+    assert "single searchable word" in str(error.value)
 
 
 def _write_multi_page_site(

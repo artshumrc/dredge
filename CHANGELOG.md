@@ -47,8 +47,8 @@ superseded one.
   ordered ascending. A multiplier above 1 moves a page toward the front.
 - Boosting is ordering only. The total and every Facet count are identical with
   and without a boost, and each hit's `score` stays its own bm25 rank.
-- Exact matches still lead: a boost orders pages *within* a Variant Group band
-  and can never lift a variant-only match above an exact one.
+- Exact matches still lead: a boost orders pages *within* a band and can never
+  lift a variant-only match above an exact one.
 - An explicit `sort` suppresses relevance ordering, and boosts with it.
 - The declarations ship in the artifact's `dredge_boosts` table. Boosting a
   Store Field, an array Facet, or an unknown field is a build error

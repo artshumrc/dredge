@@ -160,7 +160,7 @@ Two rules a reader will otherwise trip on:
 
 Nothing a reader types is an error. Anything the parser cannot read — an unbalanced quote, a
 stray parenthesis, a `field:` name the index does not have — falls back to treating the whole
-input as a list of terms, which is what Dredge did before it had a grammar.
+input as a list of terms, all of which must appear on the page.
 
 Diacritics fold on both sides, so `café` and `cafe` are one search. Each hit reports which
 spans of its title and description matched, variants included, in `hit.marks`.
