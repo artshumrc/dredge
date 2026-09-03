@@ -1,0 +1,94 @@
+# Bumping `version` in pyproject.toml on main cuts the release: this workflow
+# tags that commit, stamps the changelog and publishes a GitHub Release. It is a
+# no-op when the tag already exists, so unrelated pyproject edits cost nothing.
+name: Release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - pyproject.toml
+      - .github/workflows/release.yml
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      needed: ${{ steps.plan.outputs.needed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - id: plan
+        run: |
+          version=$(python -c 'import tomllib,pathlib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"])')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if git rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
+            echo "v$version is already tagged; nothing to release." >> "$GITHUB_STEP_SUMMARY"
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Fail before the test run if there are no notes to release, so the
+      # feedback is immediate rather than twenty minutes in.
+      - if: steps.plan.outputs.needed == 'true'
+        run: python scripts/changelog.py notes > /dev/null
+
+  test:
+    needs: plan
+    if: needs.plan.outputs.needed == 'true'
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    needs: [plan, test]
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Collect the release notes
+        run: python scripts/changelog.py notes > "$RUNNER_TEMP/notes.md"
+
+      # Retitling the Unreleased section is the one other place the version
+      # string appears, so CI writes it rather than asking for a second edit.
+      - name: Stamp the changelog
+        run: |
+          python scripts/changelog.py stamp "$VERSION"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Release $VERSION" CHANGELOG.md
+          git push origin HEAD:main
+
+      - name: Tag the release
+        run: |
+          git tag -a "v$VERSION" -m "Dredge $VERSION"
+          git push origin "v$VERSION"
+
+      - run: uv build --wheel --sdist
+
+      - name: Publish the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v$VERSION" \
+            --title "Dredge $VERSION" \
+            --notes-file "$RUNNER_TEMP/notes.md" \
+            dist/*

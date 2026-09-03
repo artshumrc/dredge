@@ -1,6 +1,5 @@
 {
   "name": "dredge-runtime",
-  "version": "0.1.0",
   "private": true,
   "type": "module",
   "description": "Dredge runtime worker + Milestone 4 browser validation harness",

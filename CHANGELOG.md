@@ -6,6 +6,23 @@ All notable changes to Dredge are documented here. This project adheres to
 
 ## Unreleased
 
+### Bumping the version in `pyproject.toml` cuts the release
+
+`pyproject.toml` is the only place a release version is written by hand.
+`dredge.__version__` reads it back from the installed package metadata, the
+private `runtime/` workspace no longer carries a version field of its own, and
+pushing a bump to `main` is what cuts a release: CI runs the full suite, retitles
+the `## Unreleased` section, tags the commit, and publishes a GitHub Release with
+those notes and the built wheel and sdist.
+
+- `runtime_min_version` in the Manifest is a hand-maintained constant rather than
+  the compiler's own version, so a release no longer declares every deployed
+  Runtime out of date. It moves only when a format change actually breaks one.
+- `scripts/changelog.py` reads and stamps `CHANGELOG.md`. Tests cover the file's
+  shape, the version agreeing between `pyproject.toml` and the package, and
+  `runtime/src/db.ts` declaring the same Manifest and schema versions as
+  `dredge.compiler`.
+
 ### The CLI now ships the Runtime
 
 `pip install dredge` carries the browser Runtime — the client and worker bundles

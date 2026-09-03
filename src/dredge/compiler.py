@@ -24,11 +24,13 @@ from selectolax.parser import HTMLParser
 
 import brotli
 
-from . import __version__
 from .progress import CompileProgress
 
 DB_SCHEMA_VERSION = 2
 MANIFEST_VERSION = 1
+# Oldest Runtime that can read what this compiler emits. Bump only when a
+# format change actually breaks older Runtimes, not on every release.
+RUNTIME_MIN_VERSION = "0.1.0"
 SQLITE_PAGE_SIZE = 16_384
 DB_COMPRESSION = "brotli"
 BROTLI_MIN_QUALITY = 0
@@ -906,7 +908,7 @@ def _compile_site(
                 "sqlite_page_size": SQLITE_PAGE_SIZE,
                 "page_count": len(candidates),
                 "config_hash": config.config_hash,
-                "runtime_min_version": __version__,
+                "runtime_min_version": RUNTIME_MIN_VERSION,
             }
             manifest_path = config.output_dir / "search-manifest.json"
             manifest_path.write_text(
