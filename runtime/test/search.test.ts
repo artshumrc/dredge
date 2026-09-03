@@ -745,6 +745,159 @@ describe("runtime search fixture", () => {
   });
 });
 
+// Term Variants widen a reader's term across its Variant Group before matching,
+// and the exact band puts the pages holding the reader's own word back in front.
+// The fixture carries purpose-built pages for this (see scripts/build-fixture.mjs):
+// `photograph` / `photographs` / `photographed` are one generated group, and
+// `ramses`/`ramesses` and `khufu`/`cheops` are declared synonym groups.
+describe("term variant widening", () => {
+  const titlesFor = (query: string, request: Partial<DredgeSearchRequest> = {}): string[] => {
+    let titles: string[] = [];
+    withFixture((exec, schema) => {
+      titles = search(exec, schema, { query, limit: 1000, ...request }).hits.map((hit) =>
+        String(hit.title),
+      );
+    });
+    return titles;
+  };
+
+  it("returns a term's whole Variant Group from a single search", () => {
+    // `photographs` is on one page; the other two hold only other forms, and
+    // neither is a prefix of the query, so only widening can reach them.
+    expect(titlesFor("photographs").sort()).toEqual([
+      "Chamber Survey Notes",
+      "Glass Plate Negatives",
+      "Photographed Chambers Photographed Again",
+    ]);
+  });
+
+  it("reaches another verb form of the same stem", () => {
+    expect(titlesFor("excavation").sort()).toEqual(["Excavation Register", "Trench Notes"]);
+  });
+
+  it("reaches declared spelling variants and synonyms", () => {
+    // Neither `ramses` nor `khufu` appears anywhere in the corpus: the group is
+    // declared in config, so the only hit is the other member's page.
+    expect(titlesFor("ramses")).toEqual(["Ramesses Inscription"]);
+    expect(titlesFor("khufu")).toEqual(["Cheops Plateau"]);
+  });
+
+  it("matches a quoted term only in the form the reader typed", () => {
+    expect(titlesFor('"photographs"')).toEqual(["Chamber Survey Notes"]);
+  });
+
+  it("matches a field-scoped term only in the form the reader typed", () => {
+    // `photographed` is the only one of the three forms in any title, so a
+    // widened scope would return that page for either spelling.
+    expect(titlesFor("title:photographed")).toEqual([
+      "Photographed Chambers Photographed Again",
+    ]);
+    expect(titlesFor("title:photographs")).toEqual([]);
+  });
+
+  it("leaves an identifier lookup unwidened", () => {
+    expect(titlesFor("uid50")).toEqual(["Royal Mask 50"]);
+  });
+
+  it("sorts every exact-form page ahead of every variant-only page", () => {
+    withFixture((exec, schema) => {
+      const response = search(exec, schema, { query: "photographs", limit: 1000 });
+
+      // The exact page holds the word once, in its body; the variant page holds
+      // its own form twice, once in its title. bm25 alone would put the variant
+      // page first, so a worse score leading the list is the band at work.
+      expect(response.hits.map((hit) => String(hit.title))).toEqual([
+        "Chamber Survey Notes",
+        "Photographed Chambers Photographed Again",
+        "Glass Plate Negatives",
+      ]);
+      expect(response.hits.map((hit) => hit.band)).toEqual([0, 1, 1]);
+      expect(response.hits[0].score as number).toBeGreaterThan(response.hits[1].score as number);
+    });
+  });
+
+  it("bands only where relevance ordering applies", () => {
+    withFixture((exec, schema) => {
+      const sorted = search(exec, schema, {
+        query: "photographs",
+        sort: { field: "title" },
+        limit: 1000,
+      });
+      expect(sorted.hits.map((hit) => String(hit.title))).toEqual([
+        "Chamber Survey Notes",
+        "Glass Plate Negatives",
+        "Photographed Chambers Photographed Again",
+      ]);
+      for (const hit of sorted.hits) {
+        expect(hit.band).toBe(0);
+      }
+    });
+  });
+
+  it("changes the order of a widened query and nothing else", () => {
+    withFixture((exec, schema) => {
+      const request: DredgeSearchRequest = {
+        query: "photographs",
+        includeFacets: true,
+        limit: 1000,
+      };
+      const banded = search(exec, schema, request);
+      // An explicit sort suppresses rank materialization and the band with it,
+      // over the same widened match set.
+      const unbanded = search(exec, schema, { ...request, sort: { field: "title" } });
+
+      expect(banded.total).toBe(unbanded.total);
+      expect(banded.facets).toEqual(unbanded.facets);
+      expect(banded.hits.map((hit) => hit.id).sort()).toEqual(
+        unbanded.hits.map((hit) => hit.id).sort(),
+      );
+    });
+  });
+
+  it("serves searches unchanged from an artifact with no Term Variant table", () => {
+    const scratch = join(mkdtempSync(join(tmpdir(), "dredge-novariants-")), "novariants.db");
+    copyFileSync(fixtureDbPath(), scratch);
+    const db = new DatabaseSync(scratch);
+    try {
+      db.exec("DROP TABLE dredge_term_variants");
+      const exec = makeNodeSqliteExec(db);
+      const schema = introspectSchema(exec);
+      expect(schema.hasTermVariants).toBe(false);
+
+      const widened = search(exec, schema, { query: "photographs", limit: 1000 });
+      expect(widened.hits.map((hit) => String(hit.title))).toEqual(["Chamber Survey Notes"]);
+      expect(widened.hits[0].band).toBe(0);
+
+      withFixture((fixtureExec, fixtureSchema) => {
+        const request: DredgeSearchRequest = { query: "uid50", limit: 5, includeFacets: true };
+        const bare = search(exec, schema, request);
+        const withVariants = search(fixtureExec, fixtureSchema, request);
+        expect(bare.total).toBe(withVariants.total);
+        expect(bare.hits).toEqual(withVariants.hits);
+        expect(bare.facets).toEqual(withVariants.facets);
+      });
+    } finally {
+      db.close();
+    }
+  });
+
+  it("keys a session's match table on the banding probe", () => {
+    withFixture((exec, schema) => {
+      const session = createSearchSession(exec, schema);
+      const widened = session.search({ query: "photographs", limit: 1000 });
+      // Same match set, reached without widening: the quoted form must not be
+      // served the widened query's cached table.
+      const quoted = session.search({ query: '"photographs"', limit: 1000 });
+      expect(quoted.total).toBe(1);
+      // ...and repeating the widened query still hits the cache.
+      expect(session.search({ query: "photographs", limit: 1000 })).toEqual({
+        ...widened,
+        elapsedMs: expect.any(Number),
+      });
+    });
+  });
+});
+
 describe("database integrity verification", () => {
   it("accepts decompressed bytes matching the manifest sha256", async () => {
     const manifest = fixtureManifest();

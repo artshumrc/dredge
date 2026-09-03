@@ -1,8 +1,9 @@
 import type { Exec } from "./db";
-import { buildMatchExpression } from "./query";
+import type { VariantLookup } from "./query";
+import { emitMatchExpression, parseQuery } from "./query";
 
 export { buildMatchExpression, emitMatchExpression, parseQuery } from "./query";
-export type { QueryNode } from "./query";
+export type { QueryNode, VariantLookup } from "./query";
 
 export interface DredgeRange<T> {
   min?: T;
@@ -77,6 +78,9 @@ export interface SchemaInfo {
   fields: Map<string, FieldInfo>;
   // All selectable document columns (excluding content_hash) in stable order.
   documentColumns: string[];
+  // Whether the artifact carries a Term Variant table. Artifacts built before
+  // it existed have none, and widen nothing.
+  hasTermVariants: boolean;
 }
 
 function quoteIdentifier(name: string): string {
@@ -110,7 +114,18 @@ export function introspectSchema(exec: Exec): SchemaInfo {
     }
   }
 
-  return { scalarColumns, arrayFacets, fields, documentColumns };
+  const variantTable = exec(
+    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+    [TERM_VARIANTS_TABLE],
+  );
+
+  return {
+    scalarColumns,
+    arrayFacets,
+    fields,
+    documentColumns,
+    hasTermVariants: variantTable.length > 0,
+  };
 }
 
 interface WhereClause {
@@ -271,6 +286,50 @@ function facetNamesToCount(schema: SchemaInfo, includeFacets: boolean | string[]
 const FTS_TITLE_WEIGHT = 10.0;
 const FTS_BODY_WEIGHT = 1.0;
 
+// The artifact's Term Variant table: surface form -> the group's other surface
+// forms, space separated. Optional — artifacts built before it existed have no
+// such table, and a runtime opening one widens nothing.
+const TERM_VARIANTS_TABLE = "dredge_term_variants";
+
+// The index folds case and strips diacritics (`unicode61 remove_diacritics 2`)
+// and the variant table is keyed on the terms it holds, so a lookup key has to
+// be folded the same way before it can hit.
+function foldTerm(term: string): string {
+  return term.normalize("NFD").replace(/\p{Diacritic}/gu, "").toLowerCase();
+}
+
+function variantLookup(exec: Exec): VariantLookup {
+  return (term) => {
+    const rows = exec(`SELECT variants FROM ${TERM_VARIANTS_TABLE} WHERE term = ?`, [
+      foldTerm(term),
+    ]);
+    const variants = rows[0]?.[0];
+    return typeof variants === "string" && variants.length > 0 ? variants.split(" ") : undefined;
+  };
+}
+
+// What to evaluate for a reader's query: the widened expression that decides the
+// match set, and — only when widening actually changed it — the reader's own
+// unwidened expression, which the banding probe evaluates to mark the rows that
+// matched exactly.
+interface MatchPlan {
+  matchExpr: string;
+  exactExpr: string | null;
+}
+
+function planMatch(exec: Exec, schema: SchemaInfo, query: string): MatchPlan | null {
+  const node = query ? parseQuery(query) : null;
+  if (node === null) {
+    return null;
+  }
+  const exactExpr = emitMatchExpression(node);
+  if (!schema.hasTermVariants) {
+    return { matchExpr: exactExpr, exactExpr: null };
+  }
+  const matchExpr = emitMatchExpression(node, variantLookup(exec));
+  return { matchExpr, exactExpr: matchExpr === exactExpr ? null : exactExpr };
+}
+
 // Name of the fixed temp table holding the FTS match: one row per matching
 // document (`id`), its scalar facet columns joined once from `documents` so
 // every downstream read (count, facet counts, scalar-filter evaluation) reads
@@ -286,25 +345,48 @@ const MATCH_TABLE = "m";
 // Materialize the FTS match into the fixed temp table: one row per matching
 // document, its scalar facet columns joined once, and — only when `rank` is set
 // (a keyword query with no explicit sort will read relevance ordering) — its
-// bm25 rank. Always drops any prior table first, so a leftover from a different
-// match is replaced regardless of caller state.
+// bm25 rank and its band. Always drops any prior table first, so a leftover from
+// a different match is replaced regardless of caller state.
+//
+// The band is what keeps widening from displacing the reader's own words: 0 for
+// a document matching the unwidened expression, 1 for one reached only through a
+// Variant Group. FTS5 offers no per-term weight, so it is established by
+// evaluating `exactExpr` a second time — over the narrower expression, and so
+// the cheaper of the two — as an uncorrelated IN subquery, which SQLite
+// materializes once rather than per row. Banding is ordering only: every row
+// here is in the match set either way, so the total and the facet counts are
+// untouched by it.
 function createMatchTable(
   exec: Exec,
   schema: SchemaInfo,
   matchExpr: string,
   rank: boolean,
+  exactExpr: string | null,
 ): void {
-  const rankColumn = rank
-    ? [`bm25(documents_fts, ${FTS_TITLE_WEIGHT}, ${FTS_BODY_WEIGHT}) AS rank`]
-    : [];
+  const rankColumns: string[] = [];
+  const bind: unknown[] = [];
+  if (rank) {
+    rankColumns.push(`bm25(documents_fts, ${FTS_TITLE_WEIGHT}, ${FTS_BODY_WEIGHT}) AS rank`);
+    if (exactExpr === null) {
+      // Nothing widened, so every match is an exact match.
+      rankColumns.push("0 AS band");
+    } else {
+      rankColumns.push(
+        `CASE WHEN f.rowid IN (SELECT rowid FROM documents_fts WHERE documents_fts MATCH ?) ` +
+          `THEN 0 ELSE 1 END AS band`,
+      );
+      bind.push(exactExpr);
+    }
+  }
   const scalarColumns = schema.scalarColumns.map((name) => `d.${quoteIdentifier(name)}`);
-  const matchColumns = ["f.rowid AS id", ...rankColumn, ...scalarColumns];
+  const matchColumns = ["f.rowid AS id", ...rankColumns, ...scalarColumns];
+  bind.push(matchExpr);
   exec(`DROP TABLE IF EXISTS temp.${MATCH_TABLE}`);
   exec(
     `CREATE TEMP TABLE ${MATCH_TABLE} AS SELECT ${matchColumns.join(", ")} ` +
       `FROM documents_fts f JOIN documents d ON d.id = f.rowid ` +
       `WHERE documents_fts MATCH ?`,
-    [matchExpr],
+    bind,
   );
 }
 
@@ -400,8 +482,9 @@ function computeHits(
   const filters = request.filters ?? {};
   const limit = Math.max(0, request.limit ?? 20);
   const offset = Math.max(0, request.offset ?? 0);
-  // bm25 rank exists (and is read as `score`, and orders the hits) only for a
-  // keyword query with no explicit sort; otherwise it was never materialized.
+  // bm25 rank and band exist (and are read as `score` and `band`, and order the
+  // hits) only for a keyword query with no explicit sort; otherwise they were
+  // never materialized.
   const usesRank = usesFts && !request.sort;
 
   const columns = schema.documentColumns;
@@ -414,14 +497,15 @@ function computeHits(
     // filters via EXISTS keyed by `m.id` — the same clauses the count uses),
     // then joins `documents` for only that page's display columns instead of
     // probing it for every match. The outer ORDER BY re-asserts page order
-    // after the join.
+    // after the join. Band leads the ordering: exact matches first, bm25 within
+    // the band, document id beneath that.
     const countFilter = buildFilterClauses(schema, filters, MATCH_TABLE);
     const pageWhere = countFilter.sql.length ? `WHERE ${countFilter.sql.join(" AND ")}` : "";
     hitSql =
-      `SELECT ${select}, mm.rank AS score ` +
-      `FROM (SELECT id, rank FROM ${MATCH_TABLE} ${pageWhere} ` +
-      `ORDER BY rank, id LIMIT ? OFFSET ?) mm ` +
-      `JOIN documents d ON d.id = mm.id ORDER BY mm.rank, d.id`;
+      `SELECT ${select}, mm.rank AS score, mm.band AS band ` +
+      `FROM (SELECT id, rank, band FROM ${MATCH_TABLE} ${pageWhere} ` +
+      `ORDER BY band, rank, id LIMIT ? OFFSET ?) mm ` +
+      `JOIN documents d ON d.id = mm.id ORDER BY mm.band, mm.rank, d.id`;
     hitBind = [...countFilter.bind, limit, offset];
   } else {
     // Explicit-sort keyword pages sort on a `documents` column, so the join must
@@ -442,6 +526,9 @@ function computeHits(
       hit[name] = row[index] as string | number | boolean | null;
     });
     hit.score = usesRank ? Number(row[columns.length]) : 0;
+    // 0 is both "matched the reader's own words" and "no banding ran" — the same
+    // convention `score` already uses for a page that was never ranked.
+    hit.band = usesRank ? Number(row[columns.length + 1]) : 0;
     return hit;
   });
 }
@@ -456,10 +543,9 @@ export function search(
   request: DredgeSearchRequest,
 ): DredgeSearchResponse {
   const started = performance.now();
-  const query = (request.query ?? "").trim();
-  const matchExpr = query ? buildMatchExpression(query) : null;
+  const plan = planMatch(exec, schema, (request.query ?? "").trim());
 
-  if (matchExpr === null) {
+  if (plan === null) {
     // Browse: no text query, so no FTS evaluation and no temp table — read
     // directly from the documents table as before.
     const { total, facets } = computeAggregate(exec, schema, request, false);
@@ -469,7 +555,7 @@ export function search(
 
   // Single-pass: evaluate the FTS match exactly once into a temp table, then
   // read the count, hits page, and all facet counts from it.
-  createMatchTable(exec, schema, matchExpr, !request.sort);
+  createMatchTable(exec, schema, plan.matchExpr, !request.sort, plan.exactExpr);
   try {
     const { total, facets } = computeAggregate(exec, schema, request, true);
     const hits = computeHits(exec, schema, request, true);
@@ -543,8 +629,8 @@ function canonicalSort(sort: DredgeSort | undefined): { field: string; direction
 // Session-scoped memoization over an immutable database. Three layers, keyed so
 // that key equality matches semantic equality:
 //   1. Match-table reuse — the FTS match temp table survives between requests,
-//      keyed by (match expression, rank materialized). A same-key request reuses
-//      it; a different key rebuilds; reset/close drops it.
+//      keyed by (match expression, rank materialized, banding probe). A same-key
+//      request reuses it; a different key rebuilds; reset/close drops it.
 //   2. Aggregate cache — {total, facets} keyed by (match, filters, facet names),
 //      so paginating a query re-runs only the hits page.
 //   3. Response cache — whole responses keyed by the canonical request, so exact
@@ -552,7 +638,7 @@ function canonicalSort(sort: DredgeSort | undefined): { field: string; direction
 // A worker owns one session and executes serially, so the single fixed match
 // table name is safe. `elapsedMs` always reflects the serving request.
 export class SearchSession {
-  private matchState: { matchExpr: string; rank: boolean } | null = null;
+  private matchState: { matchExpr: string; rank: boolean; exactExpr: string | null } | null = null;
   private readonly aggregateCache = new Lru<Aggregate>(AGGREGATE_CACHE_SIZE);
   private readonly responseCache = new Lru<DredgeSearchResponse>(RESPONSE_CACHE_SIZE);
   // Unfiltered-browse facet totals: the buckets for the no-query, no-filter case
@@ -572,8 +658,8 @@ export class SearchSession {
 
   search(request: DredgeSearchRequest): DredgeSearchResponse {
     const started = performance.now();
-    const query = (request.query ?? "").trim();
-    const matchExpr = query ? buildMatchExpression(query) : null;
+    const plan = planMatch(this.exec, this.schema, (request.query ?? "").trim());
+    const matchExpr = plan?.matchExpr ?? null;
     const facetNames = [
       ...new Set(facetNamesToCount(this.schema, request.includeFacets ?? false)),
     ];
@@ -581,6 +667,10 @@ export class SearchSession {
 
     const responseKey = JSON.stringify({
       m: matchExpr,
+      // The banding probe is part of what a page of hits is ordered by, so two
+      // reader inputs that widen to the same expression from different words
+      // still get their own response.
+      x: plan?.exactExpr ?? null,
       f: filters,
       fn: facetNames,
       l: Math.max(0, request.limit ?? 20),
@@ -594,9 +684,9 @@ export class SearchSession {
       return { ...cached, elapsedMs: performance.now() - started };
     }
 
-    const usesFts = matchExpr !== null;
-    if (usesFts) {
-      this.ensureMatchTable(matchExpr, !request.sort);
+    const usesFts = plan !== null;
+    if (plan) {
+      this.ensureMatchTable(plan.matchExpr, !request.sort, plan.exactExpr);
     }
 
     let aggregate: Aggregate;
@@ -682,12 +772,17 @@ export class SearchSession {
     this.responseCache.clear();
   }
 
-  private ensureMatchTable(matchExpr: string, rank: boolean): void {
-    if (this.matchState && this.matchState.matchExpr === matchExpr && this.matchState.rank === rank) {
+  private ensureMatchTable(matchExpr: string, rank: boolean, exactExpr: string | null): void {
+    if (
+      this.matchState &&
+      this.matchState.matchExpr === matchExpr &&
+      this.matchState.rank === rank &&
+      this.matchState.exactExpr === exactExpr
+    ) {
       return;
     }
-    createMatchTable(this.exec, this.schema, matchExpr, rank);
-    this.matchState = { matchExpr, rank };
+    createMatchTable(this.exec, this.schema, matchExpr, rank, exactExpr);
+    this.matchState = { matchExpr, rank, exactExpr };
   }
 }
 

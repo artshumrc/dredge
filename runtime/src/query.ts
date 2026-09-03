@@ -260,6 +260,9 @@ class Parser {
     } else {
       child = this.parsePrimary();
     }
+    // A `field:` scope is the reader's opt-out from widening, exactly as
+    // quotation marks are, so nothing beneath it stays wideable.
+    markNotWideable(child);
     return { kind: "scoped", column, child };
   }
 
@@ -313,6 +316,29 @@ class Parser {
 
   private plainNodes(words: string[]): QueryNode[] {
     return queryTerms(words).map((term) => this.leaf(termNode(term)));
+  }
+}
+
+function markNotWideable(node: QueryNode): void {
+  switch (node.kind) {
+    case "term":
+      node.wideable = false;
+      return;
+    case "identifier":
+    case "phrase":
+      return;
+    case "near":
+    case "and":
+    case "or":
+      node.children.forEach(markNotWideable);
+      return;
+    case "scoped":
+      markNotWideable(node.child);
+      return;
+    case "not":
+      markNotWideable(node.left);
+      markNotWideable(node.right);
+      return;
   }
 }
 
@@ -524,41 +550,62 @@ function emitIdentifier(subterms: string[], prefix: boolean): string {
   return deduped.length === 1 ? deduped[0] : `(${deduped.join(" OR ")})`;
 }
 
+// The other surface forms of a term's Variant Group, or nothing when the term
+// belongs to no group. Supplied by the runtime, which reads the artifact's
+// `dredge_term_variants` table; an artifact without that table supplies none.
+export type VariantLookup = (term: string) => readonly string[] | undefined;
+
 // FTS5 binds NOT tighter than AND, and AND tighter than OR, so a node is
 // parenthesised only where the emitted string would otherwise regroup.
-function emitOperand(node: QueryNode, looserThan: "and" | "not"): string {
+function emitOperand(node: QueryNode, looserThan: "and" | "not", widen?: VariantLookup): string {
   const needsParens =
     node.kind === "or" || (looserThan === "not" && (node.kind === "and" || node.kind === "not"));
-  const emitted = emitNode(node);
+  const emitted = emitNode(node, widen);
   return needsParens ? `(${emitted})` : emitted;
 }
 
-function emitNode(node: QueryNode): string {
+// A wideable term matches its whole Variant Group. The alternation is always
+// parenthesised so it stays one operand wherever it sits. The reader's own form
+// leads, and the prefix rule applies to every form alike: whether the term is
+// the one still being typed is a property of the query, not of the group.
+function emitTerm(node: Extract<QueryNode, { kind: "term" }>, widen?: VariantLookup): string {
+  const termExpr = node.prefix ? ftsPrefixTerm : ftsExactTerm;
+  const variants = node.wideable && widen ? widen(node.value) : undefined;
+  if (!variants || variants.length === 0) {
+    return termExpr(node.value);
+  }
+  return `(${[node.value, ...variants].map(termExpr).join(" OR ")})`;
+}
+
+function emitNode(node: QueryNode, widen?: VariantLookup): string {
   switch (node.kind) {
     case "term":
-      return node.prefix ? ftsPrefixTerm(node.value) : ftsExactTerm(node.value);
+      return emitTerm(node, widen);
     case "identifier":
       return emitIdentifier(node.subterms, node.prefix);
     case "phrase":
       return ftsPhrase(node.terms, ftsExactTerm);
     case "near":
-      return `NEAR(${node.children.map(emitNode).join(" ")}, ${node.distance})`;
+      return `NEAR(${node.children.map((child) => emitNode(child)).join(" ")}, ${node.distance})`;
     case "scoped":
-      return `{${node.column}}:${emitOperand(node.child, "not")}`;
+      return `{${node.column}}:${emitOperand(node.child, "not", widen)}`;
     case "and":
-      return node.children.map((child) => emitOperand(child, "and")).join(" AND ");
+      return node.children.map((child) => emitOperand(child, "and", widen)).join(" AND ");
     case "or":
-      return node.children.map(emitNode).join(" OR ");
+      return node.children.map((child) => emitNode(child, widen)).join(" OR ");
     case "not":
-      return `${emitOperand(node.left, "not")} NOT ${emitOperand(node.right, "not")}`;
+      return `${emitOperand(node.left, "not", widen)} NOT ${emitOperand(node.right, "not", widen)}`;
   }
 }
 
-export function emitMatchExpression(node: QueryNode): string {
-  return emitNode(node);
+// Emit the FTS5 match expression for a Query AST. With no `widen` the expression
+// is the reader's own terms and nothing else, which is what the banding probe
+// evaluates.
+export function emitMatchExpression(node: QueryNode, widen?: VariantLookup): string {
+  return emitNode(node, widen);
 }
 
-export function buildMatchExpression(query: string): string | null {
+export function buildMatchExpression(query: string, widen?: VariantLookup): string | null {
   const node = parseQuery(query);
-  return node === null ? null : emitMatchExpression(node);
+  return node === null ? null : emitMatchExpression(node, widen);
 }
