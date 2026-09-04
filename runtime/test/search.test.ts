@@ -1031,12 +1031,30 @@ describe("out-of-vocabulary correction", () => {
   });
 
   it("leaves a correctly spelled query exactly as it was", () => {
-    const response = responseFor("cartouche limestone");
+    const db = new DatabaseSync(fixtureDbPath());
+    try {
+      const base = makeNodeSqliteExec(db);
+      let matchSql = "";
+      const exec: typeof base = (sql, bind) => {
+        if (sql.startsWith("CREATE TEMP TABLE m ")) {
+          matchSql = sql;
+        }
+        return base(sql, bind);
+      };
+      const schema = introspectSchema(exec);
+      const response = search(exec, schema, { query: "cartouche limestone", limit: 1000 });
 
-    expect(response).not.toHaveProperty("corrections");
-    // Neither term is widened by anything, so all three planned expressions are
-    // the reader's own and the banding probe is not emitted at all.
-    expect(response.hits.map((hit) => hit.band)).toEqual(response.hits.map(() => 0));
+      expect(response).not.toHaveProperty("corrections");
+      // Neither term is widened by anything, so all three planned expressions
+      // are the reader's own. `0 AS band` is what that equality looks like from
+      // outside the planner: both probes are dropped, leaving the SQL an
+      // unwidened query emitted before corrections existed.
+      expect(matchSql).toContain("0 AS band");
+      expect(matchSql).not.toContain("documents_fts MATCH ?) THEN");
+      expect(response.hits.map((hit) => hit.band)).toEqual(response.hits.map(() => 0));
+    } finally {
+      db.close();
+    }
   });
 
   it("leaves the word still being typed alone while a dictionary word extends it", () => {
