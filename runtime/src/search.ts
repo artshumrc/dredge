@@ -578,8 +578,10 @@ function planMatch(
   const widen = schema.hasTermVariants ? variantLookup(exec) : undefined;
   const variantExpr = widen ? emitMatchExpression(node, widen) : exactExpr;
   const planned = planCorrections(exec, node);
-  // An out-of-vocabulary term belongs to no Variant Group, so the two widenings
-  // never touch the same term and the correction lookup is a plain map.
+  // Usually the two widenings touch different terms, Variant Groups being keyed
+  // on terms the index holds. A group member declared in config but absent from
+  // the corpus is both, and its alternation carries its variants then its
+  // corrections — so a variant page still bands ahead of a corrected one.
   const byTerm = new Map(planned.map((correction) => [correction.term, correction.to]));
   const correct: CorrectionLookup | undefined =
     byTerm.size > 0 ? (term) => byTerm.get(foldTerm(term)) : undefined;
