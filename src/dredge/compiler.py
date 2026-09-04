@@ -31,7 +31,7 @@ DB_SCHEMA_VERSION = 3
 MANIFEST_VERSION = 1
 # Oldest Runtime that can read what this compiler emits. Bump only when a
 # format change actually breaks older Runtimes, not on every release.
-RUNTIME_MIN_VERSION = "0.1.0"
+RUNTIME_MIN_VERSION = "0.3.0"
 SQLITE_PAGE_SIZE = 16_384
 DB_COMPRESSION = "brotli"
 BROTLI_MIN_QUALITY = 0
