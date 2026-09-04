@@ -164,8 +164,9 @@ Three rules a reader will otherwise trip on:
   `field:` scopes, `near()` operands, and catalogue identifiers — and so does an excluded term,
   because a guess must never remove pages the reader wanted. The word still being typed is
   corrected only when no term in the dictionary extends it, so `cartou` is a half-typed word
-  while `cartouchr` is a misspelling. A term appearing on a single page is never offered as a
-  correction, so the corpus's own typos are not handed back.
+  while `cartouchr` is a misspelling. A word of fewer than three characters is never corrected,
+  because at that length too much of the dictionary is one edit away. A term appearing on a
+  single page is never offered as a correction, so the corpus's own typos are not handed back.
 
 Nothing a reader types is an error. Anything the parser cannot read — an unbalanced quote, a
 stray parenthesis, a `field:` name the index does not have — falls back to treating the whole
@@ -182,8 +183,9 @@ only, leaving the total and every Facet count untouched, and an explicit `sort` 
 relevance ordering and the banding with it.
 
 Where a word was corrected, the response says so rather than substituting silently: a
-`corrections` array names each corrected word and the terms it became, so a page can tell the
-reader "showing results for *cartouche*". It is present only when something was corrected.
+`corrections` array names each corrected word and the terms it became — at most three per
+word, in the order they were ranked — so a page can tell the reader "showing results for
+*cartouche*". It is present only when something was corrected.
 
 ```ts
 const response = await client.search({ query: "cartouchr limestone" });
@@ -203,7 +205,9 @@ being suggested against, and whatever filters are active — and every suggestio
 verified to co-occur with it, so accepting one cannot land the reader on zero results *in
 combination* with the rest of their query. `documentFrequency` then reports the in-context
 count rather than the corpus-wide one, and completions come back ordered by it. A request
-without `context` behaves exactly as it always has.
+without `context` behaves exactly as it always has, and so does one whose `context.query` is
+blank or reads as nothing but exclusions — the query is what makes a context, so filters
+passed without one do not narrow the suggestions.
 
 ```ts
 const { suggestions } = await client.suggest({

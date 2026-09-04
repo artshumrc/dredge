@@ -87,7 +87,10 @@ function makeResponse(total = 0): DredgeSearchResponse {
 }
 
 function makeSuggestions(...terms: string[]): DredgeSuggestResponse {
-  return { suggestions: terms.map((term) => ({ term, documentFrequency: 1, distance: 1 })), elapsedMs: 1 };
+  return {
+    suggestions: terms.map((term) => ({ term, documentFrequency: 1, distance: 1 })),
+    elapsedMs: 1,
+  };
 }
 
 function completion(term: string): DredgeSuggestRequest {

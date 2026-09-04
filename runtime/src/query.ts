@@ -658,13 +658,17 @@ function emitNode(node: QueryNode, widen?: VariantLookup, correct?: CorrectionLo
       // An exclusion widens through its Variant Group as any term does, but is
       // never corrected: a guess at a word the index lacks must not be able to
       // remove pages the reader asked for.
-      return `${emitOperand(node.left, "not", widen, correct)} NOT ${emitOperand(node.right, "not", widen)}`;
+      return (
+        `${emitOperand(node.left, "not", widen, correct)} ` +
+        `NOT ${emitOperand(node.right, "not", widen)}`
+      );
   }
 }
 
-// Emit the FTS5 match expression for a Query AST. With no `widen` the expression
-// is the reader's own terms and nothing else, which is what the banding probe
-// evaluates.
+// Emit the FTS5 match expression for a Query AST, at whichever width the
+// supplied lookups give it: with neither `widen` nor `correct` the expression is
+// the reader's own terms and nothing else, which is the narrowest width the
+// banding probes evaluate.
 export function emitMatchExpression(
   node: QueryNode,
   widen?: VariantLookup,

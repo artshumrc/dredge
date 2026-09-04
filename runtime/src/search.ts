@@ -491,9 +491,10 @@ function inVocabularyAsPrefix(exec: Exec, term: string): boolean {
 // The folded terms of a query that may be corrected, each against the test its
 // occurrences call for: the prefix test where the term is the word still being
 // typed, the exact test otherwise. A term typed both ways takes the prefix test,
-// the stricter of the two. `wideable` already excludes phrases, identifiers,
-// `field:` operands and `near()` operands; the right side of an exclusion is
-// never corrected, so it is not collected.
+// which is satisfied by more of the vocabulary and so is the more reluctant of
+// the two to call the word a misspelling. `wideable` already excludes phrases,
+// identifiers, `field:` operands and `near()` operands; the right side of an
+// exclusion is never corrected, so it is not collected.
 function collectCorrectable(node: QueryNode, out: Map<string, boolean>): void {
   switch (node.kind) {
     case "term":
@@ -606,12 +607,6 @@ function planMatch(
 // single fixed name is safe; every rebuild drops any prior table first.
 const MATCH_TABLE = "m";
 
-// Materialize the FTS match into the fixed temp table: one row per matching
-// document, its scalar facet columns joined once, and — only when `rank` is set
-// (a keyword query with no explicit sort will read relevance ordering) — its
-// bm25 rank and its band. Always drops any prior table first, so a leftover from
-// a different match is replaced regardless of caller state.
-//
 // The band is what keeps widening from displacing the reader's own words: 0 for
 // a document matching the unwidened expression, 1 for one reached only through a
 // Variant Group, 2 for one reached only through a Correction. FTS5 offers no
@@ -643,6 +638,11 @@ function bandExpression(
   return `CASE ${branches.join(" ")} ELSE ${corrected ? 2 : 1} END AS band`;
 }
 
+// Materialize the FTS match into the fixed temp table: one row per matching
+// document, its scalar facet columns joined once, and — only when `rank` is set
+// (a keyword query with no explicit sort will read relevance ordering) — its
+// bm25 rank and its band. Always drops any prior table first, so a leftover from
+// a different match is replaced regardless of caller state.
 function createMatchTable(
   exec: Exec,
   schema: SchemaInfo,
@@ -1206,8 +1206,8 @@ function canonicalSort(sort: DredgeSort | undefined): { field: string; direction
 // that key equality matches semantic equality:
 //   1. Match-table reuse — the FTS match temp table survives between requests,
 //      keyed by (match expression, rank materialized, the two narrower
-//      expressions the banding probes evaluate). A same-key
-//      request reuses it; a different key rebuilds; reset/close drops it.
+//      expressions the banding probes evaluate). A same-key request reuses it; a
+//      different key rebuilds; reset/close drops it.
 //   2. Aggregate cache — {total, facets} keyed by (match, filters, facet names),
 //      so paginating a query re-runs only the hits page.
 //   3. Response cache — whole responses keyed by the canonical request, so exact
@@ -1232,9 +1232,8 @@ export class SearchSession {
   // swap may keep it. Only a close/reset to a *different* database clears it.
   private readonly browseFacetTotals = new Map<string, DredgeFacetBucket[]>();
   private browseTotal: number | undefined;
-  // Whether this connection already carries the vocabulary view. It is a virtual
-  // table over the index, so it is created once per session rather than per
-  // keystroke, and re-created after a connection swap drops the temp schema.
+  // Whether this connection already carries the vocabulary view. A connection
+  // swap drops the temp schema, so it is re-created after one.
   private vocabReady = false;
 
   constructor(
@@ -1380,8 +1379,8 @@ export class SearchSession {
   }
 
   // The vocabulary view backs both suggestion and the out-of-vocabulary test
-  // search planning runs, so it is created once per connection rather than per
-  // request.
+  // search planning runs. It is a virtual table over the index, so it is created
+  // once per connection rather than per request.
   private ensureVocab(): void {
     if (!this.vocabReady) {
       ensureVocabTable(this.exec);

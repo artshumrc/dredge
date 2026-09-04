@@ -25,7 +25,9 @@ does hold, and searches for those alongside the rest of the query.
   are never corrected, and neither is an excluded term (`-tomb`) — a guess must
   not remove pages the reader wanted.
 - The word still being typed is corrected only when no term in the dictionary
-  extends it, so `cartou` stays a half-typed word.
+  extends it, so `cartou` stays a half-typed word. A word of fewer than three
+  characters is never corrected, and no word is corrected to more than three
+  terms.
 - A term held by a single document is never offered, so the corpus's own typos
   are not handed back.
 - Corrected terms are marked in `hit.marks` exactly as variants are.
@@ -51,7 +53,8 @@ verified to co-occur with it.
   context, so the likeliest continuation leads, and `documentFrequency` reports
   that in-context count.
 - Active filters are honoured, so a term appearing only outside the filtered set
-  is not offered.
+  is not offered. The context's query is what makes a context: filters passed
+  without one do not narrow the suggestions.
 - Corrections accept the same context, so a "did you mean" offers only words
   that lead somewhere in combination with the rest of the query.
 - A request without `context` behaves exactly as before.
