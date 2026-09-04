@@ -6,6 +6,8 @@ All notable changes to Dredge are documented here. This project adheres to
 
 ## Unreleased
 
+## 0.3.0 — 2026-09-04
+
 ### A search finds the corpus's own other words for it
 
 Searching `photographs` no longer misses the pages that write `photograph` or
