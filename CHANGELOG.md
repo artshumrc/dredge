@@ -6,6 +6,64 @@ All notable changes to Dredge are documented here. This project adheres to
 
 ## Unreleased
 
+### A misspelled word finds the pages that hold the right one
+
+A reader who types `cartouchr` no longer gets nothing. When a word is absent from
+the index's own vocabulary the Runtime widens it to the nearest terms the corpus
+does hold, and searches for those alongside the rest of the query.
+
+- Only words the index lacks are widened this way, so a correctly spelled query
+  is matched exactly as before and emits the SQL it emitted before.
+- Pages reached only through a correction sort last: a new band, 2, beneath the
+  existing 0 (exact) and 1 (variant-only). Banding remains ordering only — the
+  total and every Facet count are unchanged, and an explicit `sort` suppresses
+  it.
+- The response carries a `corrections` array naming each corrected word and the
+  terms it became, so a page can say "showing results for *cartouche*" instead
+  of substituting silently. The field is absent when nothing was corrected.
+- Quoted phrases, `field:` scopes, `near()` operands and catalogue identifiers
+  are never corrected, and neither is an excluded term (`-tomb`) — a guess must
+  not remove pages the reader wanted.
+- The word still being typed is corrected only when no term in the dictionary
+  extends it, so `cartou` stays a half-typed word.
+- A term held by a single document is never offered, so the corpus's own typos
+  are not handed back.
+- Corrected terms are marked in `hit.marks` exactly as variants are.
+- Corrections cost no artifact bytes and no schema version bump: they are
+  computed at query time from the FTS index's own vocabulary, which every
+  artifact has. An artifact built before Term Variants existed benefits without
+  a rebuild.
+
+### A typo in a word's first letter is correctable
+
+`kartouche` now finds `cartouche`. For a word of four or more characters the
+correction candidates no longer have to begin with the letter the reader typed.
+Shorter words keep that filter, because a first-letter change in a short word is
+nearer to too much of the dictionary to guess from.
+
+### A suggestion can be scoped to the rest of the query
+
+`suggest` takes an optional `context: { query, filters }` — the rest of what the
+reader has typed, and their active filters — and every suggestion returned is
+verified to co-occur with it.
+
+- Completions come back ranked by how many pages hold them alongside the
+  context, so the likeliest continuation leads, and `documentFrequency` reports
+  that in-context count.
+- Active filters are honoured, so a term appearing only outside the filtered set
+  is not offered.
+- Corrections accept the same context, so a "did you mean" offers only words
+  that lead somewhere in combination with the rest of the query.
+- A request without `context` behaves exactly as before.
+
+### A completion dropdown stops showing stale answers
+
+Rapid `suggest` completion requests now coalesce latest-wins in the client, as
+searches already did: a newer completion supersedes an older pending one with
+`STALE_RESPONSE`, so a dropdown never shows an answer for a prefix the reader
+has moved past. Correction requests are never superseded, so a "did you mean"
+for an earlier word survives later keystrokes.
+
 ## 0.3.0 — 2026-09-04
 
 ### A search finds the corpus's own other words for it

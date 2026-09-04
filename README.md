@@ -149,7 +149,7 @@ in your own words.
 
 Operators combine: `title:pyramid (khufu OR cheops) -"old kingdom"` is one query.
 
-Two rules a reader will otherwise trip on:
+Three rules a reader will otherwise trip on:
 
 - **Only the last word is treated as a prefix.** It is the word still being typed, so results
   appear on every keystroke; every earlier term must match in full. A final term of a single
@@ -157,6 +157,15 @@ Two rules a reader will otherwise trip on:
 - **Quotation marks opt out of variant widening.** A bare term also finds its Variant Group's
   other forms; a quoted phrase matches only what was typed. `field:` scopes and `near()`
   operands are exact for the same reason. Quotation marks are the reader's precision tool.
+- **A word the index does not hold is widened to its nearest terms.** A misspelling finds the
+  pages holding the dictionary terms closest to it, so a typo is not a dead end. It fires only
+  for such words: a term the index holds is searched for as typed and never widened this way.
+  Everything that opts out of variant widening opts out of correction too — quoted phrases,
+  `field:` scopes, `near()` operands, and catalogue identifiers — and so does an excluded term,
+  because a guess must never remove pages the reader wanted. The word still being typed is
+  corrected only when no term in the dictionary extends it, so `cartou` is a half-typed word
+  while `cartouchr` is a misspelling. A term appearing on a single page is never offered as a
+  correction, so the corpus's own typos are not handed back.
 
 Nothing a reader types is an error. Anything the parser cannot read — an unbalanced quote, a
 stray parenthesis, a `field:` name the index does not have — falls back to treating the whole
@@ -166,15 +175,59 @@ Diacritics fold on both sides, so `café` and `cafe` are one search. Each hit re
 spans of its title and description matched, variants included, in `hit.marks`.
 
 Widening never displaces the reader's own words: pages matching what they typed sort ahead of
-pages that matched only through a Variant Group, and each hit carries the band it landed in as
-`hit.band` — 0 exact, 1 variant-only — so a consumer can reproduce the ordering. Banding is
-ordering only, leaving the total and every Facet count untouched, and an explicit `sort`
-replaces relevance ordering and the banding with it.
+pages that matched only through a Variant Group, which in turn sort ahead of pages reached only
+through a correction. Each hit carries the band it landed in as `hit.band` — 0 exact, 1
+variant-only, 2 correction-only — so a consumer can reproduce the ordering. Banding is ordering
+only, leaving the total and every Facet count untouched, and an explicit `sort` replaces
+relevance ordering and the banding with it.
+
+Where a word was corrected, the response says so rather than substituting silently: a
+`corrections` array names each corrected word and the terms it became, so a page can tell the
+reader "showing results for *cartouche*". It is present only when something was corrected.
+
+```ts
+const response = await client.search({ query: "cartouchr limestone" });
+
+for (const { term, to } of response.corrections ?? []) {
+  console.log(`${term} → ${to.join(", ")}`);
+}
+```
 
 A term can also be asked about rather than searched for. `client.suggest({ term, kind })`
 answers `"correction"` with the nearest terms by edit distance and `"completion"` with the
 terms extending it, each `{ term, documentFrequency, distance }` and each drawn from the
 index's own dictionary — so accepting a suggestion cannot land the reader on zero results.
+
+Pass `context: { query, filters }` — the rest of what the reader has typed, without the word
+being suggested against, and whatever filters are active — and every suggestion returned is
+verified to co-occur with it, so accepting one cannot land the reader on zero results *in
+combination* with the rest of their query. `documentFrequency` then reports the in-context
+count rather than the corpus-wide one, and completions come back ordered by it. A request
+without `context` behaves exactly as it always has.
+
+```ts
+const { suggestions } = await client.suggest({
+  term: "pyr",
+  kind: "completion",
+  context: { query: "khufu", filters: { category: "collection" } },
+});
+```
+
+**Suggesting whole pages** needs no separate feature: it is plain search with a small limit.
+Ask for a few hits and render each one's `title` and `url` as a dropdown row.
+
+```ts
+const { hits } = await client.search({ query, limit: 5 });
+
+dropdown.replaceChildren(
+  ...hits.map((hit) => {
+    const link = document.createElement("a");
+    link.href = hit.url;
+    link.textContent = hit.title;
+    return link;
+  }),
+);
+```
 
 ## CLI
 
@@ -257,4 +310,4 @@ pnpm run vendor
 
 ## Vocabulary
 
-Project vocabulary is defined in `CONTEXT.md`. Use those terms when discussing Dredge internals: Facet, Store Field, Field, Field Role, Database Artifact, Boot, Manifest, Runtime, Compiler, Search Column, Boost, Term Variant (and Variant Group), and Query AST.
+Project vocabulary is defined in `CONTEXT.md`. Use those terms when discussing Dredge internals: Facet, Store Field, Field, Field Role, Database Artifact, Boot, Manifest, Runtime, Compiler, Search Column, Boost, Term Variant (and Variant Group), Query AST, Correction, and Suggestion Context.
