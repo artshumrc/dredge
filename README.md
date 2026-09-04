@@ -4,7 +4,7 @@ Dredge is client-side search for very large static websites: the Compiler turns 
 
 ## Architecture
 
-The Compiler reads a `dredge.config.json`, extracts pages from `source_dir`, builds a SQLite search database, compresses it with Brotli, writes `search-manifest.json`, and can generate a typed TypeScript client. The Manifest describes the database artifact so the Runtime can fetch the right file, verify its metadata, and open it in the worker.
+The Compiler reads a `dredge.config.json`, extracts pages from `source_dir`, builds a SQLite search database, compresses it with Brotli, writes `search-manifest.json`, and can generate a typed TypeScript client. The Manifest describes the database artifact so the Runtime can fetch the right file, verify its metadata, and open it in the worker. It also declares the artifact's schema version, and a Runtime opens only the schema it was built for: anything else is refused at boot with `SCHEMA_VERSION_MISMATCH`.
 
 The Runtime lives in the browser. Its worker owns SQLite-WASM and the database handle; the generated or hand-written client sends search requests to that worker and receives hits, counts, and optional Facet buckets.
 
@@ -165,6 +165,17 @@ input as a list of terms, all of which must appear on the page.
 Diacritics fold on both sides, so `café` and `cafe` are one search. Each hit reports which
 spans of its title and description matched, variants included, in `hit.marks`.
 
+Widening never displaces the reader's own words: pages matching what they typed sort ahead of
+pages that matched only through a Variant Group, and each hit carries the band it landed in as
+`hit.band` — 0 exact, 1 variant-only — so a consumer can reproduce the ordering. Banding is
+ordering only, leaving the total and every Facet count untouched, and an explicit `sort`
+replaces relevance ordering and the banding with it.
+
+A term can also be asked about rather than searched for. `client.suggest({ term, kind })`
+answers `"correction"` with the nearest terms by edit distance and `"completion"` with the
+terms extending it, each `{ term, documentFrequency, distance }` and each drawn from the
+index's own dictionary — so accepting a suggestion cannot land the reader on zero results.
+
 ## CLI
 
 Validate a config without writing artifacts:
@@ -216,17 +227,25 @@ dredge synth /tmp/dredge-synthetic --count 1000 --seed 1 --shard-size 1000
 - `dredge-client.js` — the ESM client bundle the page imports (the generated TypeScript client wraps this API).
 - `dredge-worker.js` — the search Worker, plus its content-hashed SQLite and Brotli WASM payloads and the OPFS proxy chunk.
 
-Every asset is minified, and content-hashed names make them safe to serve immutable.
+Every asset is minified. The WASM and proxy payloads carry content-hashed names and are safe
+to serve immutable; `dredge-client.js` and `dredge-worker.js` keep fixed names, so give those a
+short max-age — a returning visitor holding a cached Runtime alongside a freshly compiled
+artifact is the one way to meet `SCHEMA_VERSION_MISMATCH` on a correct deploy.
 
 Compression is left to the host, because a browser only decompresses a response its server marked `Content-Encoding`. Hosts that compress on the fly — GitHub Pages, Netlify, Cloudflare, Vercel — need nothing from Dredge; GitHub Pages gzips these assets including the `.wasm`. On a host configured to serve precompressed files from disk (nginx `brotli_static`/`gzip_static`, Caddy `precompressed`), `--precompress` writes a `.br` (Brotli quality 11) and `.gz` beside each asset, which takes the 1,277 kB of Runtime from 551 kB gzipped on the fly down to 454 kB. Hosts without that mechanism never request the sidecars, so leave them off.
 
 Every installed file is named `dredge-*`. That is what lets a reinstall retire the previous version's content-hashed payloads instead of leaving them to accumulate; nothing else in `output_dir` — the `search.*` database artifacts included — is ever touched.
 
-Pass `--no-runtime-assets` to leave the Runtime out entirely and install it yourself. To refresh the Runtime after upgrading Dredge without recompiling the site, install it on its own:
+Pass `--no-runtime-assets` to leave the Runtime out entirely, and install it as its own step:
 
 ```sh
 dredge install --config dredge.config.json
 ```
+
+The Runtime and the artifact it opens must come from the same Dredge version, so installing the
+Runtime on its own belongs to a build that compiled the artifact from that same version.
+Upgrading Dredge means recompiling the site, not reinstalling the Runtime beside a database
+built by an older one.
 
 The assets are built from `runtime/` and vendored into the Python package, which is what lets the wheel ship them. After changing anything under `runtime/src/`, rebuild them:
 

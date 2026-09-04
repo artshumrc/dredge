@@ -59,7 +59,8 @@ function makeClient(): { client: DredgeSearchClient; worker: FakeWorker } {
 }
 
 const SUGGESTIONS: DredgeSuggestResponse = {
-  suggestions: [{ term: "pyramid", score: 1 }],
+  suggestions: [{ term: "pyramid", documentFrequency: 12, distance: 1 }],
+  elapsedMs: 1,
 };
 
 describe("DredgeSearchClient suggestions", () => {
@@ -81,7 +82,7 @@ describe("DredgeSearchClient suggestions", () => {
     await flush();
     const suggestId = worker.idOf("suggest");
 
-    const searching = client.search({ q: "pyramid" });
+    const searching = client.search({ query: "pyramid" });
     await flush();
     const response: DredgeSearchResponse = { total: 0, hits: [], elapsedMs: 1 };
     worker.emit({ type: "searchResult", id: worker.idOf("search"), response });
