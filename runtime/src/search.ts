@@ -1,8 +1,8 @@
 import type { Exec } from "./db";
 import type { DredgeMarks, MarkForms } from "./highlight";
 import { foldTerm, markFields, markForms } from "./highlight";
-import type { CorrectionLookup, QueryNode, VariantLookup } from "./query";
-import { emitMatchExpression, parseQuery } from "./query";
+import type { CorrectionLookup, ParseQueryOptions, QueryNode, VariantLookup } from "./query";
+import { emitMatchExpression, ftsExactTerm, parseQuery } from "./query";
 
 export { buildMatchExpression, emitMatchExpression, parseQuery } from "./query";
 export type { CorrectionLookup, QueryNode, VariantLookup } from "./query";
@@ -82,6 +82,9 @@ export interface DredgeSuggestRequest {
   term: string;
   kind: DredgeSuggestKind;
   limit?: number;
+  // The rest of the reader's query (without the word being suggested against)
+  // and their filters. Every suggestion returned co-occurs with it.
+  context?: { query?: string; filters?: DredgeFilters };
 }
 
 export interface DredgeSuggestion {
@@ -555,11 +558,17 @@ interface MatchPlan {
 // Correction reads the FTS index's own vocabulary, which every artifact has, so
 // planning runs whether or not the artifact carries a Term Variant table. The
 // vocabulary view must already exist on the connection.
-function planMatch(exec: Exec, schema: SchemaInfo, query: string): MatchPlan | null {
+function planMatch(
+  exec: Exec,
+  schema: SchemaInfo,
+  query: string,
+  options: ParseQueryOptions = {},
+): MatchPlan | null {
   const node = query
     ? parseQuery(
         query,
         schema.searchColumns.map((column) => column.name),
+        options,
       )
     : null;
   if (node === null) {
@@ -1003,9 +1012,95 @@ function completions(exec: Exec, prefix: string, limit: number): DredgeSuggestio
   });
 }
 
+// How wide the candidate pool is opened when a Suggestion Context has to be
+// verified: enough that a limit's worth normally survives the context, capped so
+// the per-candidate count stays proportional to the limit rather than the
+// corpus.
+const CONTEXT_CANDIDATE_FACTOR = 5;
+const MAX_CONTEXT_CANDIDATES = 50;
+
+// A Suggestion Context reduced to what verification needs: the match expression
+// the rest of the reader's query plans to, and the filter clauses to apply
+// against the `documents` alias.
+interface SuggestContext {
+  expr: string;
+  filter: WhereClause;
+}
+
+// Plan a Suggestion Context, or null when there is none to plan. The context's
+// last word is complete — the reader moved on to the word being suggested
+// against — so trailing-prefix expansion is suppressed; everything else widens
+// exactly as the same text would in a search. A context that yields no AST
+// (blank, or nothing but exclusions) is no context at all, filters included.
+function planSuggestContext(
+  exec: Exec,
+  schema: SchemaInfo,
+  context: DredgeSuggestRequest["context"],
+): SuggestContext | null {
+  const query = (context?.query ?? "").trim();
+  if (!query) {
+    return null;
+  }
+  const plan = planMatch(exec, schema, query, { trailingPrefix: false });
+  if (plan === null) {
+    return null;
+  }
+  return {
+    expr: plan.matchExpr,
+    filter: buildFilterClauses(schema, context?.filters ?? {}, "d"),
+  };
+}
+
+// How many documents hold this candidate alongside the context, under the
+// reader's filters. One FTS count per candidate: the vocabulary view can list
+// terms per document, but a short prefix over a large corpus yields millions of
+// rows, while verifying a bounded pool costs one indexed count each.
+function contextCount(exec: Exec, context: SuggestContext, candidate: string): number {
+  const where = ["documents_fts MATCH ?", ...context.filter.sql];
+  const rows = exec(
+    `SELECT count(*) FROM documents_fts f JOIN documents d ON d.id = f.rowid ` +
+      `WHERE ${where.join(" AND ")}`,
+    [`(${context.expr}) AND ${ftsExactTerm(candidate)}`, ...context.filter.bind],
+  );
+  return Number(rows[0]?.[0] ?? 0);
+}
+
+// Keep only the candidates the context actually reaches, reporting the in-context
+// count as the document frequency so ranking and the response agree on what the
+// number means. Completions rank by that count; corrections keep distance first,
+// because a nearer word is a better guess than a commoner one.
+function verifyInContext(
+  exec: Exec,
+  context: SuggestContext,
+  candidates: DredgeSuggestion[],
+  kind: DredgeSuggestKind,
+): DredgeSuggestion[] {
+  const survivors: DredgeSuggestion[] = [];
+  for (const candidate of candidates) {
+    const count = contextCount(exec, context, candidate.term);
+    if (count > 0) {
+      survivors.push({ ...candidate, documentFrequency: count });
+    }
+  }
+  survivors.sort(
+    (a, b) =>
+      (kind === "correction" ? a.distance - b.distance : 0) ||
+      b.documentFrequency - a.documentFrequency ||
+      (a.term < b.term ? -1 : a.term > b.term ? 1 : 0),
+  );
+  return survivors;
+}
+
 // Suggestions are drawn from the index's own vocabulary, so every one of them
 // leads somewhere. Blank input suggests nothing rather than the whole corpus.
-function collectSuggestions(exec: Exec, request: DredgeSuggestRequest): DredgeSuggestion[] {
+// With a Suggestion Context a wider pool is drawn and then verified against it,
+// so every suggestion leads somewhere *in combination with* what the reader has
+// already typed.
+function collectSuggestions(
+  exec: Exec,
+  request: DredgeSuggestRequest,
+  context: SuggestContext | null,
+): DredgeSuggestion[] {
   const term = foldTerm(request.term.trim());
   if (term.length === 0) {
     return [];
@@ -1014,9 +1109,17 @@ function collectSuggestions(exec: Exec, request: DredgeSuggestRequest): DredgeSu
   if (limit === 0) {
     return [];
   }
-  return request.kind === "completion"
-    ? completions(exec, term, limit)
-    : corrections(exec, term, limit);
+  const pool = context
+    ? Math.min(MAX_CONTEXT_CANDIDATES, CONTEXT_CANDIDATE_FACTOR * limit)
+    : limit;
+  const candidates =
+    request.kind === "completion"
+      ? completions(exec, term, pool)
+      : corrections(exec, term, pool);
+  if (!context) {
+    return candidates;
+  }
+  return verifyInContext(exec, context, candidates, request.kind).slice(0, limit);
 }
 
 // Stateless suggestion entry point, the sibling of `search`. A SearchSession
@@ -1025,8 +1128,13 @@ function collectSuggestions(exec: Exec, request: DredgeSuggestRequest): DredgeSu
 export function suggest(exec: Exec, request: DredgeSuggestRequest): DredgeSuggestResponse {
   const started = performance.now();
   ensureVocabTable(exec);
+  // Only a Suggestion Context needs the schema — to plan its query and to bind
+  // its filters — so a request without one pays nothing for introspection.
+  const context = request.context
+    ? planSuggestContext(exec, introspectSchema(exec), request.context)
+    : null;
   return {
-    suggestions: collectSuggestions(exec, request),
+    suggestions: collectSuggestions(exec, request, context),
     elapsedMs: performance.now() - started,
   };
 }
@@ -1202,7 +1310,11 @@ export class SearchSession {
     const started = performance.now();
     this.ensureVocab();
     return {
-      suggestions: collectSuggestions(this.exec, request),
+      suggestions: collectSuggestions(
+        this.exec,
+        request,
+        planSuggestContext(this.exec, this.schema, request.context),
+      ),
       elapsedMs: performance.now() - started,
     };
   }

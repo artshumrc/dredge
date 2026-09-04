@@ -510,6 +510,13 @@ function applyTrailingPrefix(leaves: QueryNode[]): void {
   }
 }
 
+export interface ParseQueryOptions {
+  // Whether the last term is the word the reader is still typing. False for text
+  // whose final word is known to be complete — a Suggestion Context, whose last
+  // word the reader finished before starting the one being suggested against.
+  trailingPrefix?: boolean;
+}
+
 // Parse reader text into a Query AST. Unparseable input degrades to the
 // all-terms reading of the raw string — the behaviour before a grammar existed —
 // so a reader never sees a syntax error. Returns null when there is nothing to
@@ -517,7 +524,9 @@ function applyTrailingPrefix(leaves: QueryNode[]): void {
 export function parseQuery(
   input: string,
   columns: readonly string[] = FTS_COLUMNS,
+  options: ParseQueryOptions = {},
 ): QueryNode | null {
+  const trailingPrefix = options.trailingPrefix ?? true;
   const query = input.normalize("NFC");
   try {
     const parser = new Parser(lex(query), columns);
@@ -525,22 +534,26 @@ export function parseQuery(
     if (!node) {
       return null;
     }
-    applyTrailingPrefix(parser.leaves);
+    if (trailingPrefix) {
+      applyTrailingPrefix(parser.leaves);
+    }
     return node;
   } catch (error) {
     if (!(error instanceof QuerySyntaxError)) {
       throw error;
     }
-    return degradeQuery(query);
+    return degradeQuery(query, trailingPrefix);
   }
 }
 
-function degradeQuery(query: string): QueryNode | null {
+function degradeQuery(query: string, trailingPrefix: boolean): QueryNode | null {
   const nodes = queryTerms(query.split(/\s+/)).map(termNode);
   if (nodes.length === 0) {
     return null;
   }
-  applyTrailingPrefix(nodes);
+  if (trailingPrefix) {
+    applyTrailingPrefix(nodes);
+  }
   return nodes.length === 1 ? nodes[0] : { kind: "and", children: nodes };
 }
 
@@ -548,7 +561,8 @@ function degradeQuery(query: string): QueryNode | null {
 /* Emitter                                                                     */
 /* -------------------------------------------------------------------------- */
 
-function ftsExactTerm(token: string): string {
+// One FTS5 term, quoted so a token needs no escaping rules of its own.
+export function ftsExactTerm(token: string): string {
   return `"${token.replace(/"/g, '""')}"`;
 }
 

@@ -105,6 +105,9 @@ export interface DredgeSuggestRequest {
   term: string;
   kind: DredgeSuggestKind;
   limit?: number;
+  // The rest of the reader's query (without the word being suggested against)
+  // and their filters. Every suggestion returned co-occurs with it.
+  context?: { query?: string; filters?: DredgeFilters };
 }
 
 export interface DredgeSuggestion {

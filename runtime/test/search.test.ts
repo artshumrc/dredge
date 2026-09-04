@@ -2068,4 +2068,107 @@ describe("suggestions from the index vocabulary", () => {
       expect(log.filter((entry) => entry.sql.includes("fts5vocab"))).toHaveLength(1);
     });
   });
+
+  it("offers only completions that co-occur with the Suggestion Context", () => {
+    withFixture((exec, schema) => {
+      const { suggestions } = suggest(exec, {
+        term: "st",
+        kind: "completion",
+        context: { query: "cartouche" },
+      });
+
+      // `stages` and `storeroom` extend `st` in the corpus but appear on no
+      // page with `cartouche`, so accepting them would land on zero results.
+      expect(suggestions.map((s) => s.term)).toEqual(["stone", "stela", "statue"]);
+      // Commonest in context first, and the reported frequency is the
+      // in-context count rather than the corpus one.
+      const counts = suggestions.map((s) => s.documentFrequency);
+      expect([...counts].sort((a, b) => b - a)).toEqual(counts);
+      for (const suggestion of suggestions) {
+        expect(suggestion.documentFrequency).toBeGreaterThan(0);
+        const combined = search(exec, schema, {
+          query: `cartouche ${suggestion.term}`,
+          limit: 0,
+        });
+        expect(combined.total).toBe(suggestion.documentFrequency);
+      }
+    });
+  });
+
+  it("drops a completion present only outside the context's filters", () => {
+    withFixture((exec) => {
+      const unfiltered = suggest(exec, {
+        term: "st",
+        kind: "completion",
+        context: { query: "cartouche" },
+      });
+      const filtered = suggest(exec, {
+        term: "st",
+        kind: "completion",
+        context: { query: "cartouche", filters: { category: "publication" } },
+      });
+
+      // `statue` co-occurs with `cartouche` only on `object` pages.
+      expect(unfiltered.suggestions.map((s) => s.term)).toContain("statue");
+      expect(filtered.suggestions.map((s) => s.term)).not.toContain("statue");
+      expect(filtered.suggestions.map((s) => s.term)).toEqual(["stela", "stone"]);
+    });
+  });
+
+  it("treats the context's last word as complete, not as a live prefix", () => {
+    withFixture((exec) => {
+      // `cartou` extends to `cartouche`, so prefix-expanding it would make this
+      // the `cartouche` context. The context's last word is one the reader has
+      // finished, so it is the exact word `cartou` — which is on no page.
+      const asWritten = suggest(exec, {
+        term: "st",
+        kind: "completion",
+        context: { query: "cartou" },
+      });
+      const expanded = suggest(exec, {
+        term: "st",
+        kind: "completion",
+        context: { query: "cartouche" },
+      });
+
+      expect(asWritten.suggestions).toEqual([]);
+      expect(expanded.suggestions.length).toBeGreaterThan(0);
+    });
+  });
+
+  it("excludes a correction that never co-occurs with the context", () => {
+    withFixture((exec) => {
+      const bare = suggest(exec, { term: "stane", kind: "correction" });
+      const inContext = suggest(exec, {
+        term: "stane",
+        kind: "correction",
+        context: { query: "mask" },
+      });
+
+      // Both are within the edit-distance bound of `stane`, but `statue` shares
+      // no page with `mask`, so a "did you mean" must not offer it here.
+      expect(bare.suggestions.map((s) => s.term)).toEqual(["stone", "statue"]);
+      expect(inContext.suggestions.map((s) => s.term)).toEqual(["stone"]);
+      expect(inContext.suggestions[0].documentFrequency).toBe(10);
+    });
+  });
+
+  it("answers a request without a context exactly as it did before", () => {
+    withFixture((exec) => {
+      expect(suggest(exec, { term: "st", kind: "completion" }).suggestions).toEqual([
+        { term: "stone", documentFrequency: 50, distance: 3 },
+        { term: "stela", documentFrequency: 27, distance: 3 },
+        { term: "statue", documentFrequency: 5, distance: 4 },
+        { term: "stages", documentFrequency: 1, distance: 4 },
+        { term: "storeroom", documentFrequency: 1, distance: 7 },
+      ]);
+      expect(suggest(exec, { term: "cartouchr", kind: "correction" }).suggestions).toEqual([
+        { term: "cartouche", documentFrequency: 27, distance: 1 },
+      ]);
+      // An empty context is no context: the corpus counts stand.
+      expect(suggest(exec, { term: "st", kind: "completion", context: {} }).suggestions).toEqual(
+        suggest(exec, { term: "st", kind: "completion" }).suggestions,
+      );
+    });
+  });
 });
