@@ -11,6 +11,7 @@
 import type {
   DredgeSearchRequest,
   DredgeSearchResponse,
+  DredgeSuggestKind,
   DredgeSuggestRequest,
   DredgeSuggestResponse,
 } from "./search";
@@ -89,6 +90,7 @@ type Pending =
     }
   | {
       kind: "suggest";
+      suggestKind: DredgeSuggestKind;
       resolve: (response: DredgeSuggestResponse) => void;
       reject: (error: DredgeClientError) => void;
     };
@@ -100,7 +102,8 @@ type Pending =
  * which downloads + decompresses the database into OPFS and opens it. Repeat
  * visits reuse the OPFS copy. Searches are debounced by recency: when a newer
  * search is issued, older in-flight searches reject with a `STALE_RESPONSE`
- * error so callers can safely ignore superseded queries.
+ * error so callers can safely ignore superseded queries. Completions form a
+ * second, independent lane with the same rule.
  */
 export class DredgeSearchClient {
   private readonly workerUrl: string | URL;
@@ -160,7 +163,7 @@ export class DredgeSearchClient {
     await this.init();
     const worker = this.ensureWorker();
     const id = this.nextId++;
-    this.rejectOlderSearches(id);
+    this.rejectSuperseded("search", id);
     this.latestSearchId = id;
     return new Promise<DredgeSearchResponse>((resolve, reject) => {
       this.pending.set(id, { kind: "search", resolve, reject });
@@ -171,16 +174,23 @@ export class DredgeSearchClient {
   /**
    * Ask the index for corrections or completions of a term.
    *
-   * Unlike `search()`, suggestions are not superseded by recency: a correction
-   * and a completion answer different questions, and neither is made stale by
-   * a later search.
+   * Completions are superseded by recency within their own lane, as searches
+   * are: a newer completion rejects any older pending one with
+   * `STALE_RESPONSE`, so a dropdown never answers a prefix the reader has
+   * moved past. Corrections are never superseded — not by a search, not by a
+   * completion, not by another correction — because a correction for an
+   * earlier word must outlive the keystrokes that follow it. The completion
+   * lane and the search lane never supersede each other.
    */
   async suggest(request: DredgeSuggestRequest): Promise<DredgeSuggestResponse> {
     await this.init();
     const worker = this.ensureWorker();
     const id = this.nextId++;
+    if (request.kind === "completion") {
+      this.rejectSuperseded("completion", id);
+    }
     return new Promise<DredgeSuggestResponse>((resolve, reject) => {
-      this.pending.set(id, { kind: "suggest", resolve, reject });
+      this.pending.set(id, { kind: "suggest", suggestKind: request.kind, resolve, reject });
       worker.postMessage({ type: "suggest", id, request });
     });
   }
@@ -265,14 +275,19 @@ export class DredgeSearchClient {
     this.fail({ code: "WORKER_ERROR", message: "Dredge worker failed." });
   };
 
-  private rejectOlderSearches(newestId: number): void {
+  /** Reject every pending request in one lane older than `newestId`. */
+  private rejectSuperseded(lane: "search" | "completion", newestId: number): void {
     for (const [id, pending] of this.pending) {
-      if (pending.kind === "search" && id < newestId) {
+      const inLane =
+        lane === "search"
+          ? pending.kind === "search"
+          : pending.kind === "suggest" && pending.suggestKind === "completion";
+      if (inLane && id < newestId) {
         this.pending.delete(id);
         pending.reject(
           new DredgeClientError({
             code: "STALE_RESPONSE",
-            message: "A newer Dredge search superseded this request.",
+            message: "A newer Dredge request superseded this request.",
           }),
         );
       }

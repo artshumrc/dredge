@@ -213,6 +213,15 @@ export class DredgeSearchClient {
         reject: (error: DredgeClientError) => void;
       }
     | undefined = undefined;
+  private inFlightCompletionId: number | undefined = undefined;
+  private pendingCompletion:
+    | {
+        id: number;
+        request: DredgeSuggestRequest;
+        resolve: (response: DredgeSuggestResponse) => void;
+        reject: (error: DredgeClientError) => void;
+      }
+    | undefined = undefined;
   private readonly pending = new Map<number, PendingRequest>();
   private readonly statusListeners = new Set<(status: DredgeStatus) => void>();
 
@@ -285,8 +294,11 @@ export class DredgeSearchClient {
     });
   }
 
-  // Suggestions are not coalesced the way searches are: a correction and a
-  // completion answer different questions, and neither supersedes a search.
+  // Completions coalesce latest-wins in their own lane, as searches do: a
+  // dropdown must never answer a prefix the reader has moved past. Corrections
+  // are never superseded — a correction for an earlier word outlives the
+  // keystrokes that follow it. The lanes are independent of each other and of
+  // the search lane.
   async suggest(request: DredgeSuggestRequest): Promise<DredgeSuggestResponse> {
     await this.init();
     if (this.status !== "ready") {
@@ -296,10 +308,23 @@ export class DredgeSearchClient {
     const worker = this.ensureWorker();
     const id = this.allocateRequestId();
 
+    if (request.kind !== "completion") {
+      return new Promise<DredgeSuggestResponse>((resolve, reject) => {
+        this.pending.set(id, { kind: "suggest", resolve, reject });
+        const message: DredgeWorkerRequest = { type: "suggest", id, request };
+        worker.postMessage(message);
+      });
+    }
+
     return new Promise<DredgeSuggestResponse>((resolve, reject) => {
-      this.pending.set(id, { kind: "suggest", resolve, reject });
-      const message: DredgeWorkerRequest = { type: "suggest", id, request };
-      worker.postMessage(message);
+      if (this.inFlightCompletionId === undefined) {
+        this.submitCompletion(id, request, resolve, reject);
+        return;
+      }
+      if (this.pendingCompletion) {
+        this.pendingCompletion.reject(this.staleError());
+      }
+      this.pendingCompletion = { id, request, resolve, reject };
     });
   }
 
@@ -359,6 +384,9 @@ export class DredgeSearchClient {
           } else if (message.id === this.inFlightSearchId) {
             this.inFlightSearchId = undefined;
             this.submitPendingSearch();
+          } else if (message.id === this.inFlightCompletionId) {
+            this.inFlightCompletionId = undefined;
+            this.submitPendingCompletion();
           }
           return;
         }
@@ -370,6 +398,18 @@ export class DredgeSearchClient {
     if (message.type === "suggestResult") {
       const pending = this.pending.get(message.id);
       this.pending.delete(message.id);
+      if (message.id === this.inFlightCompletionId) {
+        this.inFlightCompletionId = undefined;
+        if (pending?.kind === "suggest") {
+          if (this.pendingCompletion) {
+            pending.reject(this.staleError());
+          } else {
+            pending.resolve(message.response);
+          }
+        }
+        this.submitPendingCompletion();
+        return;
+      }
       if (pending?.kind === "suggest") {
         pending.resolve(message.response);
       }
@@ -425,8 +465,30 @@ export class DredgeSearchClient {
     this.submitSearch(next.id, next.request, next.resolve, next.reject);
   }
 
+  private submitCompletion(
+    id: number,
+    request: DredgeSuggestRequest,
+    resolve: (response: DredgeSuggestResponse) => void,
+    reject: (error: DredgeClientError) => void,
+  ): void {
+    const worker = this.ensureWorker();
+    this.inFlightCompletionId = id;
+    this.pending.set(id, { kind: "suggest", resolve, reject });
+    const message: DredgeWorkerRequest = { type: "suggest", id, request };
+    worker.postMessage(message);
+  }
+
+  private submitPendingCompletion(): void {
+    const next = this.pendingCompletion;
+    if (!next) {
+      return;
+    }
+    this.pendingCompletion = undefined;
+    this.submitCompletion(next.id, next.request, next.resolve, next.reject);
+  }
+
   private staleError(): DredgeClientError {
-    return new DredgeClientError({ code: "STALE_RESPONSE", message: "A newer Dredge search superseded this request." });
+    return new DredgeClientError({ code: "STALE_RESPONSE", message: "A newer Dredge request superseded this request." });
   }
 
   private rejectAll(error: DredgeError): void {
@@ -439,7 +501,12 @@ export class DredgeSearchClient {
       this.pendingSearch.reject(clientError);
       this.pendingSearch = undefined;
     }
+    if (this.pendingCompletion) {
+      this.pendingCompletion.reject(clientError);
+      this.pendingCompletion = undefined;
+    }
     this.inFlightSearchId = undefined;
+    this.inFlightCompletionId = undefined;
   }
 
   private fail(error: DredgeError): void {

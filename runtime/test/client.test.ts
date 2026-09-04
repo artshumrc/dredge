@@ -5,6 +5,8 @@ import {
   type DredgeSearchRequest,
   type DredgeSearchResponse,
   type DredgeStatus,
+  type DredgeSuggestRequest,
+  type DredgeSuggestResponse,
   type DredgeWorkerRequest,
   type DredgeWorkerResponse,
 } from "../src/client.template";
@@ -55,6 +57,20 @@ class FakeWorker {
     this.emit({ type: "searchResult", id, response });
   }
 
+  suggestPosts(): Array<{ id: number; request: DredgeSuggestRequest }> {
+    const suggests: Array<{ id: number; request: DredgeSuggestRequest }> = [];
+    for (const message of this.posts) {
+      if (message.type === "suggest") {
+        suggests.push({ id: message.id, request: message.request });
+      }
+    }
+    return suggests;
+  }
+
+  respondSuggest(id: number, response: DredgeSuggestResponse): void {
+    this.emit({ type: "suggestResult", id, response });
+  }
+
   private emit(data: DredgeWorkerResponse): void {
     for (const listener of this.messageListeners) {
       listener({ data });
@@ -68,6 +84,18 @@ function flush(): Promise<void> {
 
 function makeResponse(total = 0): DredgeSearchResponse {
   return { total, hits: [], elapsedMs: 1 };
+}
+
+function makeSuggestions(...terms: string[]): DredgeSuggestResponse {
+  return { suggestions: terms.map((term) => ({ term, documentFrequency: 1 })), elapsedMs: 1 };
+}
+
+function completion(term: string): DredgeSuggestRequest {
+  return { term, kind: "completion" };
+}
+
+function correction(term: string): DredgeSuggestRequest {
+  return { term, kind: "correction" };
 }
 
 function makeClient(): { client: DredgeSearchClient; worker: FakeWorker } {
@@ -141,6 +169,88 @@ describe("DredgeSearchClient coalescing", () => {
     expect(outcomes[1].status).toBe("rejected");
     expect(outcomes[2].status).toBe("fulfilled");
     expect((outcomes[2] as PromiseFulfilledResult<DredgeSearchResponse>).value.total).toBe(7);
+  });
+
+  it("posts only the first and last of three rapid completions", async () => {
+    const { client, worker } = makeClient();
+    await client.init();
+
+    const p1 = client.suggest(completion("p"));
+    const p2 = client.suggest(completion("py"));
+    const p3 = client.suggest(completion("pyr"));
+    const settled = Promise.allSettled([p1, p2, p3]);
+
+    await flush();
+
+    expect(worker.suggestPosts()).toHaveLength(1);
+    const first = worker.suggestPosts()[0];
+    expect(first.request).toEqual(completion("p"));
+
+    // The middle keystroke never reaches the worker; the newest is retained.
+    await expect(p2).rejects.toMatchObject({ code: "STALE_RESPONSE" });
+
+    worker.respondSuggest(first.id, makeSuggestions("pylon"));
+    await flush();
+
+    expect(worker.suggestPosts()).toHaveLength(2);
+    const last = worker.suggestPosts()[1];
+    expect(last.request).toEqual(completion("pyr"));
+
+    worker.respondSuggest(last.id, makeSuggestions("pyramid"));
+    const outcomes = await settled;
+
+    expect(outcomes[0].status).toBe("rejected");
+    expect(outcomes[1].status).toBe("rejected");
+    expect(outcomes[2].status).toBe("fulfilled");
+    expect(
+      (outcomes[2] as PromiseFulfilledResult<DredgeSuggestResponse>).value.suggestions[0].term,
+    ).toBe("pyramid");
+  });
+
+  it("neither supersedes nor is superseded by a correction between two completions", async () => {
+    const { client, worker } = makeClient();
+    await client.init();
+
+    const first = client.suggest(completion("pyr"));
+    const fix = client.suggest(correction("kartouche"));
+    const second = client.suggest(completion("pyra"));
+
+    await flush();
+
+    // The correction posts immediately alongside the in-flight completion, and
+    // the completion it sits between is the one retained.
+    const posts = worker.suggestPosts();
+    expect(posts.map((post) => post.request)).toEqual([completion("pyr"), correction("kartouche")]);
+
+    worker.respondSuggest(posts[1].id, makeSuggestions("cartouche"));
+    await expect(fix).resolves.toMatchObject({ suggestions: [{ term: "cartouche" }] });
+
+    worker.respondSuggest(posts[0].id, makeSuggestions("pylon"));
+    await expect(first).rejects.toMatchObject({ code: "STALE_RESPONSE" });
+    await flush();
+
+    const last = worker.suggestPosts()[2];
+    expect(last.request).toEqual(completion("pyra"));
+    worker.respondSuggest(last.id, makeSuggestions("pyramid"));
+    await expect(second).resolves.toMatchObject({ suggestions: [{ term: "pyramid" }] });
+  });
+
+  it("does not reject an in-flight search when a completion is issued", async () => {
+    const { client, worker } = makeClient();
+    await client.init();
+
+    const search = client.search({ query: "khufu" });
+    const suggestion = client.suggest(completion("pyr"));
+    await flush();
+
+    expect(worker.searchPosts()).toHaveLength(1);
+    expect(worker.suggestPosts()).toHaveLength(1);
+
+    worker.respondSuggest(worker.suggestPosts()[0].id, makeSuggestions("pyramid"));
+    await expect(suggestion).resolves.toMatchObject({ suggestions: [{ term: "pyramid" }] });
+
+    worker.respondSearch(worker.searchPosts()[0].id, makeResponse(9));
+    await expect(search).resolves.toMatchObject({ total: 9 });
   });
 
   it("resolves a lone in-flight search that is never superseded", async () => {
