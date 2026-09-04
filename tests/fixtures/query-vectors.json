@@ -35,5 +35,6 @@
   {"q": "(khufu", "fts": "\"khufu\"*"},
   {"q": "near(khufu pyramid", "fts": "\"near\" AND \"khufu\" AND \"pyramid\"*"},
   {"q": "cartouchr limestone", "fts": "(\"cartouchr\" OR \"cartouche\") AND \"limestone\"*", "corrections": {"cartouchr": ["cartouche"]}},
-  {"q": "limestone -cartouchr granite", "fts": "(\"limestone\" AND \"granite\"*) NOT \"cartouchr\"", "corrections": {"cartouchr": ["cartouche"]}}
+  {"q": "limestone -cartouchr granite", "fts": "(\"limestone\" AND \"granite\"*) NOT \"cartouchr\"", "corrections": {"cartouchr": ["cartouche"]}},
+  {"q": "limestone cartouchr", "fts": "\"limestone\" AND (\"cartouchr\"* OR \"cartouche\"*)", "corrections": {"cartouchr": ["cartouche"]}}
 ]

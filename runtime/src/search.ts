@@ -473,16 +473,30 @@ function inVocabulary(exec: Exec, term: string): boolean {
   return exec(`SELECT 1 FROM temp.${VOCAB_TABLE} WHERE term = ? LIMIT 1`, [term]).length > 0;
 }
 
-// The folded terms of a query that may be corrected, in the order they were
-// typed. `wideable` already excludes phrases, identifiers, `field:` operands and
-// `near()` operands; on top of that the trailing prefix term is the word still
-// being typed rather than a misspelling, and the right side of an exclusion is
-// never corrected, so neither is collected.
-function collectCorrectable(node: QueryNode, out: Set<string>): void {
+// Whether the index holds any term this one begins. The out-of-vocabulary test
+// for the word still being typed: `cartou` extends to `cartouche`, so it is a
+// half-typed word rather than a misspelling, while nothing extends `cartouchr`.
+function inVocabularyAsPrefix(exec: Exec, term: string): boolean {
+  return (
+    exec(`SELECT 1 FROM temp.${VOCAB_TABLE} WHERE term >= ? AND term < ? LIMIT 1`, [
+      term,
+      prefixUpperBound(term),
+    ]).length > 0
+  );
+}
+
+// The folded terms of a query that may be corrected, each against the test its
+// occurrences call for: the prefix test where the term is the word still being
+// typed, the exact test otherwise. A term typed both ways takes the prefix test,
+// the stricter of the two. `wideable` already excludes phrases, identifiers,
+// `field:` operands and `near()` operands; the right side of an exclusion is
+// never corrected, so it is not collected.
+function collectCorrectable(node: QueryNode, out: Map<string, boolean>): void {
   switch (node.kind) {
     case "term":
-      if (node.wideable && !node.prefix) {
-        out.add(foldTerm(node.value));
+      if (node.wideable) {
+        const term = foldTerm(node.value);
+        out.set(term, (out.get(term) ?? false) || node.prefix);
       }
       return;
     case "near":
@@ -504,14 +518,15 @@ function collectCorrectable(node: QueryNode, out: Set<string>): void {
 }
 
 // The corrections a query's terms widen to, keyed by folded term. Only terms the
-// vocabulary has no row for are scanned, so a correctly spelled query costs one
-// indexed probe per term and nothing else.
+// vocabulary knows nothing of are scanned, so a correctly spelled query costs
+// one indexed probe per term and nothing else.
 function planCorrections(exec: Exec, node: QueryNode): DredgeCorrection[] {
-  const correctable = new Set<string>();
+  const correctable = new Map<string, boolean>();
   collectCorrectable(node, correctable);
   const planned: DredgeCorrection[] = [];
-  for (const term of correctable) {
-    if (Array.from(term).length < MIN_CORRECTION_LENGTH || inVocabulary(exec, term)) {
+  for (const [term, prefix] of correctable) {
+    const known = prefix ? inVocabularyAsPrefix(exec, term) : inVocabulary(exec, term);
+    if (Array.from(term).length < MIN_CORRECTION_LENGTH || known) {
       continue;
     }
     const candidates = corrections(exec, term, MAX_CORRECTIONS_PER_TERM);

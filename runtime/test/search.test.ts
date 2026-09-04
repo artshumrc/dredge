@@ -1024,6 +1024,43 @@ describe("out-of-vocabulary correction", () => {
     expect(response.hits.map((hit) => hit.band)).toEqual(response.hits.map(() => 0));
   });
 
+  it("leaves the word still being typed alone while a dictionary word extends it", () => {
+    // `cartou` is half of `cartouche`, so the prefix search already reaches the
+    // pages the reader is heading for and there is nothing to correct.
+    const partial = responseFor("cartou");
+
+    expect(partial).not.toHaveProperty("corrections");
+    expect(partial.total).toBeGreaterThan(0);
+    expect(titlesOf(partial)).toEqual(titlesOf(responseFor("cartouche")));
+  });
+
+  it("corrects the word still being typed when no dictionary word extends it", () => {
+    const corrected = responseFor("cartouchr");
+
+    expect(corrected.corrections).toEqual([{ term: "cartouchr", to: ["cartouche"] }]);
+    expect(corrected.total).toBeGreaterThan(0);
+    expect(titlesOf(corrected)).toEqual(titlesOf(responseFor("cartouche")));
+    expect(corrected.hits.map((hit) => hit.band)).toEqual(corrected.hits.map(() => 2));
+  });
+
+  it("corrects the word still being typed after a trailing space", () => {
+    // The search path trims the query, so the space the reader has just typed
+    // leaves the misspelling as the trailing prefix term it already was.
+    expect(responseFor("cartouchr ")).toEqual({
+      ...responseFor("cartouchr"),
+      elapsedMs: expect.any(Number),
+    });
+  });
+
+  it("never corrects a word of fewer than three code points", () => {
+    // One is a live prefix of much of the vocabulary and one is a prefix of
+    // nothing; at two code points neither is far enough from the dictionary to
+    // be called a misspelling.
+    for (const query of ["ca", "zq"]) {
+      expect(responseFor(query)).not.toHaveProperty("corrections");
+    }
+  });
+
   it("leaves the reader's precision tools exact", () => {
     // A phrase, a `field:` operand, a `near()` operand: none is wideable, so
     // none is corrected and none finds the pages the corrected word would have.
