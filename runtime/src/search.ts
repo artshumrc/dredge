@@ -780,9 +780,9 @@ function computeHits(
     // probing it for every match. The outer ORDER BY re-asserts page order
     // after the join, which is why the boosted ordering is materialized as its
     // own column: only `mm` is in scope by then. Band leads the ordering, so a
-    // boost reorders within a band and can never lift a variant-only match
-    // above an exact one; `score` stays the raw bm25 rank, because boosting is
-    // ordering and not scoring.
+    // boost reorders within a band and can never lift a variant-only or
+    // correction-only match above an exact one; `score` stays the raw bm25
+    // rank, because boosting is ordering and not scoring.
     const countFilter = buildFilterClauses(schema, filters, MATCH_TABLE);
     const pageWhere = countFilter.sql.length ? `WHERE ${countFilter.sql.join(" AND ")}` : "";
     const boost = boostFactor(schema, MATCH_TABLE);
@@ -1205,7 +1205,8 @@ function canonicalSort(sort: DredgeSort | undefined): { field: string; direction
 // Session-scoped memoization over an immutable database. Three layers, keyed so
 // that key equality matches semantic equality:
 //   1. Match-table reuse — the FTS match temp table survives between requests,
-//      keyed by (match expression, rank materialized, banding probe). A same-key
+//      keyed by (match expression, rank materialized, the two narrower
+//      expressions the banding probes evaluate). A same-key
 //      request reuses it; a different key rebuilds; reset/close drops it.
 //   2. Aggregate cache — {total, facets} keyed by (match, filters, facet names),
 //      so paginating a query re-runs only the hits page.
