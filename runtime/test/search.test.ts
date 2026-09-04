@@ -1030,6 +1030,35 @@ describe("out-of-vocabulary correction", () => {
     ).toEqual(["Glass Plate Negatives", "Photographed Chambers Photographed Again"]);
   });
 
+  it("corrects a transposition in a word too short for two edits", () => {
+    // `tobm` is two Levenshtein edits from `tomb` but one Damerau edit, and at
+    // four code points the bound is a single edit — so the metric is the whole
+    // difference between finding the tomb pages and finding nothing.
+    const corrected = responseFor("tobm");
+
+    expect(corrected.corrections).toEqual([{ term: "tobm", to: ["tomb"] }]);
+    expect(titlesOf(corrected)).toEqual(titlesOf(responseFor("tomb")));
+  });
+
+  it("leaves the reader's own words alone when correction is off", () => {
+    // The word the index lacks narrows the AND to nothing, which is what a
+    // reader saw before corrections existed.
+    const off = responseFor("cartouchr limestone", { correct: false });
+
+    expect(off).not.toHaveProperty("corrections");
+    expect(off.total).toBe(0);
+    expect(responseFor("cartouchr limestone").total).toBeGreaterThan(0);
+  });
+
+  it("still widens Variant Groups when correction is off", () => {
+    // Variants are compiled and cost artifact bytes; the switch is over the
+    // query-time guess alone, so it must not take them with it.
+    const off = responseFor("photographs", { correct: false });
+
+    expect(off).not.toHaveProperty("corrections");
+    expect(off.hits.map((hit) => Number(hit.band))).toContain(1);
+  });
+
   it("leaves a correctly spelled query exactly as it was", () => {
     const db = new DatabaseSync(fixtureDbPath());
     try {
@@ -1987,6 +2016,69 @@ describe("suggestions from the index vocabulary", () => {
       // Ranking is distance first, so nothing further away may precede it.
       expect(suggestions.every((s) => s.distance >= suggestions[0].distance)).toBe(true);
     });
+  });
+
+  it("counts an adjacent transposition as one edit", () => {
+    withFixture((exec) => {
+      // Two substitutions under plain Levenshtein, which at five code points
+      // would rank `stlea` behind any single-edit neighbour.
+      const { suggestions } = suggest(exec, { term: "stlea", kind: "correction" });
+
+      expect(suggestions[0]).toMatchObject({ term: "stela", distance: 1 });
+    });
+  });
+
+  it("discards a candidate the commonest one dominates", () => {
+    // The shape a transcribed corpus takes: a common word surrounded by its own
+    // misspellings, each in enough documents to clear the frequency floor and
+    // each nearer to the reader's typo than the word itself.
+    const db = new DatabaseSync(":memory:");
+    try {
+      const exec = makeNodeSqliteExec(db);
+      exec("CREATE VIRTUAL TABLE documents_fts USING fts5(body)");
+      for (let i = 0; i < 500; i += 1) {
+        exec("INSERT INTO documents_fts(body) VALUES (?)", ["amendment"]);
+      }
+      // Two documents clears the frequency floor, so nothing but dominance can
+      // discard this: it is the same single Damerau edit from the reader's word
+      // that `amendment` is.
+      exec("INSERT INTO documents_fts(body) VALUES (?)", ["amendmnent"]);
+      exec("INSERT INTO documents_fts(body) VALUES (?)", ["amendmnent"]);
+
+      const { suggestions } = suggest(exec, { term: "amendmnet", kind: "correction" });
+
+      expect(suggestions.map((suggestion) => suggestion.term)).toEqual(["amendment"]);
+      expect(suggestions[0].documentFrequency).toBe(500);
+    } finally {
+      db.close();
+    }
+  });
+
+  it("keeps every candidate when none of them dominates", () => {
+    // The same two candidates, but the commoner one is no longer commoner by
+    // enough to silence the other — so a genuinely rare word, whose candidates
+    // are all rare together, stays correctable.
+    const db = new DatabaseSync(":memory:");
+    try {
+      const exec = makeNodeSqliteExec(db);
+      exec("CREATE VIRTUAL TABLE documents_fts USING fts5(body)");
+      for (let i = 0; i < 6; i += 1) {
+        exec("INSERT INTO documents_fts(body) VALUES (?)", ["amendment"]);
+      }
+      exec("INSERT INTO documents_fts(body) VALUES (?)", ["amendmnent"]);
+      exec("INSERT INTO documents_fts(body) VALUES (?)", ["amendmnent"]);
+
+      const { suggestions } = suggest(exec, { term: "amendmnet", kind: "correction" });
+
+      // Both are one Damerau edit away — `amendment` by the transposition — so
+      // document frequency alone decides which leads.
+      expect(suggestions.map((suggestion) => suggestion.term)).toEqual([
+        "amendment",
+        "amendmnent",
+      ]);
+    } finally {
+      db.close();
+    }
   });
 
   it("corrects a typo in the first letter of a long enough word", () => {

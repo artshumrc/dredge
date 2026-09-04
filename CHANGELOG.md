@@ -29,12 +29,26 @@ does hold, and searches for those alongside the rest of the query.
   characters is never corrected, and no word is corrected to more than three
   terms.
 - A term held by a single document is never offered, so the corpus's own typos
-  are not handed back.
+  are not handed back. Neither is one the best candidate outnumbers by more than
+  a hundred to one — the shape a corpus transcribed from scans takes, holding a
+  shell of its own misspellings around every common word. Where no candidate
+  outnumbers the rest that way they all stand, so a rare word stays correctable.
+- Two letters typed in the wrong order count as one edit rather than two, so
+  `tobm` finds `tomb` even at four characters, where the bound is a single edit.
 - Corrected terms are marked in `hit.marks` exactly as variants are.
 - Corrections cost no artifact bytes and no schema version bump: they are
   computed at query time from the FTS index's own vocabulary, which every
   artifact has. An artifact built before Term Variants existed benefits without
   a rebuild.
+
+### A site can turn correction off
+
+`search` takes `correct: false` for a site that would rather own its own "did you
+mean": the reader's own words become the whole query and the `corrections` array
+is absent. Compiled Term Variants are unaffected — the switch is over the
+query-time guess alone — and correction is on by default. It is a query-time
+setting rather than a compile-time one because nothing about corrections ships in
+the artifact, so no rebuild and no schema bump can be involved in changing it.
 
 ### A typo in a word's first letter is correctable
 

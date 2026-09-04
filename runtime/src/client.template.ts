@@ -77,6 +77,10 @@ export interface DredgeSearchRequest {
   // Explicit ordering. When omitted, results are ordered by relevance for
   // keyword queries and by document id for a match-all browse.
   sort?: DredgeSort;
+  // Whether a word the index does not hold is widened to its nearest terms.
+  // Defaults to true. Set false to own the "did you mean" through `suggest`
+  // instead; compiled Term Variants are unaffected either way.
+  correct?: boolean;
 }
 
 // One word the reader typed that the index does not hold, and the dictionary

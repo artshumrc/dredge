@@ -165,8 +165,14 @@ Three rules a reader will otherwise trip on:
   because a guess must never remove pages the reader wanted. The word still being typed is
   corrected only when no term in the dictionary extends it, so `cartou` is a half-typed word
   while `cartouchr` is a misspelling. A word of fewer than three characters is never corrected,
-  because at that length too much of the dictionary is one edit away. A term appearing on a
-  single page is never offered as a correction, so the corpus's own typos are not handed back.
+  because at that length too much of the dictionary is one edit away. Two letters typed in the
+  wrong order count as one edit rather than two, so `tobm` finds `tomb`.
+- **The corpus's own misspellings are not handed back.** A term appearing on a single page is
+  never offered as a correction. Neither is one the best candidate overwhelmingly outnumbers —
+  below a hundredth of that candidate's page count — which is the shape a corpus transcribed
+  from scans takes, holding a shell of its own misspellings around every common word. Where no
+  candidate outnumbers the rest that way, all of them stand, so a genuinely rare word stays
+  correctable.
 
 Nothing a reader types is an error. Anything the parser cannot read — an unbalanced quote, a
 stray parenthesis, a `field:` name the index does not have — falls back to treating the whole
@@ -193,6 +199,17 @@ const response = await client.search({ query: "cartouchr limestone" });
 for (const { term, to } of response.corrections ?? []) {
   console.log(`${term} → ${to.join(", ")}`);
 }
+```
+
+A site that would rather own its own "did you mean" turns correction off per request with
+`correct: false`, leaving the reader's own words — and their Variant Groups, which are compiled
+and unaffected — as the whole query, and drives its own prompt from `suggest` instead.
+Correction is on by default. It is a query-time setting rather than a compile-time one because
+corrections are computed from the index's own vocabulary and nothing about them ships in the
+artifact:
+
+```ts
+const response = await client.search({ query: "cartouchr limestone", correct: false });
 ```
 
 A term can also be asked about rather than searched for. `client.suggest({ term, kind })`

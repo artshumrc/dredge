@@ -51,7 +51,7 @@ The parsed representation of what a reader typed, owned by the Runtime and the o
 _Avoid_: match expression, query string — the first is what the AST emits, the second is what it parses.
 
 **Correction**:
-A term the index holds, within the correction edit-distance bound of a word the reader typed that the index does not hold, and appearing in at least two documents. Corrections are computed at query time from the vocabulary view; nothing about them ships in the artifact. A document reached only through one lands in band 2.
+A term the index holds, within the correction edit-distance bound of a word the reader typed that the index does not hold, appearing in at least two documents, and not outnumbered by more than a hundred to one by the commonest candidate for the same word. Distance is Damerau-Levenshtein, so two letters in the wrong order are one edit. Corrections are computed at query time from the vocabulary view; nothing about them ships in the artifact, and `correct: false` on a search turns them off. A document reached only through one lands in band 2.
 _Avoid_: fuzzy match, typo fix
 
 **Suggestion Context**:

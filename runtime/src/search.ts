@@ -40,6 +40,11 @@ export interface DredgeSearchRequest {
   // Explicit ordering. When omitted, results are ordered by relevance
   // (bm25) for keyword queries, or by document id for match-all browse.
   sort?: DredgeSort;
+  // Whether a word the index does not hold is widened to its nearest terms.
+  // Defaults to true. Set false to keep the reader's own words — and their
+  // Variant Groups, which are compiled and not affected by this — as the whole
+  // query, leaving a site free to own its own "did you mean" through `suggest`.
+  correct?: boolean;
 }
 
 export interface DredgeFacetBucket {
@@ -556,6 +561,11 @@ interface MatchPlan {
   markForms: MarkForms;
 }
 
+interface PlanMatchOptions extends ParseQueryOptions {
+  // Whether out-of-vocabulary words are widened to their nearest terms.
+  correct?: boolean;
+}
+
 // Correction reads the FTS index's own vocabulary, which every artifact has, so
 // planning runs whether or not the artifact carries a Term Variant table. The
 // vocabulary view must already exist on the connection.
@@ -563,7 +573,7 @@ function planMatch(
   exec: Exec,
   schema: SchemaInfo,
   query: string,
-  options: ParseQueryOptions = {},
+  options: PlanMatchOptions = {},
 ): MatchPlan | null {
   const node = query
     ? parseQuery(
@@ -578,7 +588,7 @@ function planMatch(
   const exactExpr = emitMatchExpression(node);
   const widen = schema.hasTermVariants ? variantLookup(exec) : undefined;
   const variantExpr = widen ? emitMatchExpression(node, widen) : exactExpr;
-  const planned = planCorrections(exec, node);
+  const planned = (options.correct ?? true) ? planCorrections(exec, node) : [];
   // Usually the two widenings touch different terms, Variant Groups being keyed
   // on terms the index holds. A group member declared in config but absent from
   // the corpus is both, and its alternation carries its variants then its
@@ -838,7 +848,9 @@ export function search(
   // Planning reads the vocabulary view to decide what is a misspelling, so it
   // has to exist before the query is planned — as it does for `suggest`.
   ensureVocabTable(exec);
-  const plan = planMatch(exec, schema, (request.query ?? "").trim());
+  const plan = planMatch(exec, schema, (request.query ?? "").trim(), {
+    correct: request.correct,
+  });
 
   if (plan === null) {
     // Browse: no text query, so no FTS evaluation and no temp table — read
@@ -888,6 +900,16 @@ const MIN_DOCUMENT_FREQUENCY = 2;
 // whole length window can be scanned.
 const CORRECTION_PREFIX_LENGTH = 1;
 
+// How small a candidate's document frequency may be, as a fraction of the
+// commonest candidate's, before it is discarded. A corpus transcribed from scans
+// holds a shell of its own misspellings around every common word, each in enough
+// documents to clear `MIN_DOCUMENT_FREQUENCY` and each one nearer than the word
+// itself: `amendment` in 15,619 documents beside `amendmnent` in 5. A floor
+// taken from the best candidate rather than from the corpus discards those
+// without silencing a genuinely rare word — a rare word's candidates are all
+// rare together, so none of them dominates.
+const CORRECTION_DOMINANCE_RATIO = 0.01;
+
 // Typed length at and above which the leading-character filter is dropped, so
 // that a typo in the first letter is correctable.
 const CORRECTION_WIDE_SCAN_LENGTH = 4;
@@ -908,13 +930,24 @@ function prefixUpperBound(prefix: string): string {
   return `${prefix}\u{10FFFF}`;
 }
 
-// Levenshtein distance over code points, abandoned as soon as no cell in a row
-// is within `max`. The prefilter bounds how many candidates are scored; this
-// bounds the work each one costs.
+// Damerau-Levenshtein distance over code points — optimal string alignment, so
+// adjacent transposition is one edit rather than two. Transposition earns its
+// place because it is among the commonest typing slips and because two edits is
+// where a word stops being guessable: under plain Levenshtein `amendmnet` sits
+// two edits from `amendment` and so ranks behind every one-edit neighbour,
+// including the misspellings a transcribed corpus holds of its own common words.
+//
+// Abandoned as soon as no cell in a row is within `max`. That stays correct with
+// the transposition term, which reads two rows back: `twoBack[j - 2] <= max - 1`
+// would imply `previous[j - 1] <= max` by the substitution term alone, so a row
+// entirely above `max` cannot precede a cell a transposition brings back within
+// it. The prefilter bounds how many candidates are scored; this bounds the work
+// each one costs.
 function editDistance(a: string[], b: string[], max: number): number {
   if (Math.abs(a.length - b.length) > max) {
     return max + 1;
   }
+  let twoBack: number[] = [];
   let previous = Array.from({ length: b.length + 1 }, (_, index) => index);
   for (let i = 1; i <= a.length; i += 1) {
     const current = new Array<number>(b.length + 1);
@@ -922,12 +955,17 @@ function editDistance(a: string[], b: string[], max: number): number {
     let best = i;
     for (let j = 1; j <= b.length; j += 1) {
       const substitution = previous[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1);
-      current[j] = Math.min(current[j - 1] + 1, previous[j] + 1, substitution);
-      best = Math.min(best, current[j]);
+      let cost = Math.min(current[j - 1] + 1, previous[j] + 1, substitution);
+      if (i > 1 && j > 1 && a[i - 1] === b[j - 2] && a[i - 2] === b[j - 1]) {
+        cost = Math.min(cost, twoBack[j - 2] + 1);
+      }
+      current[j] = cost;
+      best = Math.min(best, cost);
     }
     if (best > max) {
       return max + 1;
     }
+    twoBack = previous;
     previous = current;
   }
   return previous[b.length];
@@ -985,13 +1023,19 @@ function corrections(exec: Exec, term: string, limit: number): DredgeSuggestion[
       scored.push({ term: candidate, documentFrequency: Number(row[1]), distance });
     }
   }
-  scored.sort(
+  const commonest = scored.reduce(
+    (best, candidate) => Math.max(best, candidate.documentFrequency),
+    0,
+  );
+  const floor = commonest * CORRECTION_DOMINANCE_RATIO;
+  const surviving = scored.filter((candidate) => candidate.documentFrequency >= floor);
+  surviving.sort(
     (a, b) =>
       a.distance - b.distance ||
       b.documentFrequency - a.documentFrequency ||
       (a.term < b.term ? -1 : a.term > b.term ? 1 : 0),
   );
-  return scored.slice(0, limit);
+  return surviving.slice(0, limit);
 }
 
 // Corpus terms that extend a prefix, commonest first. No edit distance is
@@ -1244,7 +1288,9 @@ export class SearchSession {
   search(request: DredgeSearchRequest): DredgeSearchResponse {
     const started = performance.now();
     this.ensureVocab();
-    const plan = planMatch(this.exec, this.schema, (request.query ?? "").trim());
+    const plan = planMatch(this.exec, this.schema, (request.query ?? "").trim(), {
+      correct: request.correct,
+    });
     const matchExpr = plan?.matchExpr ?? null;
     const facetNames = [
       ...new Set(facetNamesToCount(this.schema, request.includeFacets ?? false)),
