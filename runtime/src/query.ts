@@ -582,32 +582,52 @@ function emitIdentifier(subterms: string[], prefix: boolean): string {
 // `dredge_term_variants` table; an artifact without that table supplies none.
 export type VariantLookup = (term: string) => readonly string[] | undefined;
 
+// The dictionary terms a word the index does not hold is corrected to, keyed and
+// shaped like a Variant Group lookup so both widenings join one alternation.
+// Supplied by the search engine, which computes them from the index vocabulary
+// at query time; eligibility (which nodes may be corrected at all) is decided
+// there, so a term reaching this lookup is already known to be correctable.
+export type CorrectionLookup = VariantLookup;
+
 // FTS5 binds NOT tighter than AND, and AND tighter than OR, so a node is
 // parenthesised only where the emitted string would otherwise regroup.
-function emitOperand(node: QueryNode, looserThan: "and" | "not", widen?: VariantLookup): string {
+function emitOperand(
+  node: QueryNode,
+  looserThan: "and" | "not",
+  widen?: VariantLookup,
+  correct?: CorrectionLookup,
+): string {
   const needsParens =
     node.kind === "or" || (looserThan === "not" && (node.kind === "and" || node.kind === "not"));
-  const emitted = emitNode(node, widen);
+  const emitted = emitNode(node, widen, correct);
   return needsParens ? `(${emitted})` : emitted;
 }
 
-// A wideable term matches its whole Variant Group. The alternation is always
-// parenthesised so it stays one operand wherever it sits. The reader's own form
-// leads, and the prefix rule applies to every form alike: whether the term is
-// the one still being typed is a property of the query, not of the group.
-function emitTerm(node: Extract<QueryNode, { kind: "term" }>, widen?: VariantLookup): string {
+// A wideable term matches its whole Variant Group, and — when the index does not
+// hold it at all — its corrections too. The alternation is always parenthesised
+// so it stays one operand wherever it sits. The reader's own form leads, then
+// the variants, then the corrections; the prefix rule applies to every form
+// alike, because whether the term is the one still being typed is a property of
+// the query, not of the forms it widened to.
+function emitTerm(
+  node: Extract<QueryNode, { kind: "term" }>,
+  widen?: VariantLookup,
+  correct?: CorrectionLookup,
+): string {
   const termExpr = node.prefix ? ftsPrefixTerm : ftsExactTerm;
-  const variants = node.wideable && widen ? widen(node.value) : undefined;
-  if (!variants || variants.length === 0) {
+  const widened = node.wideable
+    ? [...(widen?.(node.value) ?? []), ...(correct?.(node.value) ?? [])]
+    : [];
+  if (widened.length === 0) {
     return termExpr(node.value);
   }
-  return `(${[node.value, ...variants].map(termExpr).join(" OR ")})`;
+  return `(${[node.value, ...widened].map(termExpr).join(" OR ")})`;
 }
 
-function emitNode(node: QueryNode, widen?: VariantLookup): string {
+function emitNode(node: QueryNode, widen?: VariantLookup, correct?: CorrectionLookup): string {
   switch (node.kind) {
     case "term":
-      return emitTerm(node, widen);
+      return emitTerm(node, widen, correct);
     case "identifier":
       return emitIdentifier(node.subterms, node.prefix);
     case "phrase":
@@ -615,28 +635,36 @@ function emitNode(node: QueryNode, widen?: VariantLookup): string {
     case "near":
       return `NEAR(${node.children.map((child) => emitNode(child)).join(" ")}, ${node.distance})`;
     case "scoped":
-      return `{${node.column}}:${emitOperand(node.child, "not", widen)}`;
+      return `{${node.column}}:${emitOperand(node.child, "not", widen, correct)}`;
     case "and":
-      return node.children.map((child) => emitOperand(child, "and", widen)).join(" AND ");
+      return node.children.map((child) => emitOperand(child, "and", widen, correct)).join(" AND ");
     case "or":
-      return node.children.map((child) => emitNode(child, widen)).join(" OR ");
+      return node.children.map((child) => emitNode(child, widen, correct)).join(" OR ");
     case "not":
-      return `${emitOperand(node.left, "not", widen)} NOT ${emitOperand(node.right, "not", widen)}`;
+      // An exclusion widens through its Variant Group as any term does, but is
+      // never corrected: a guess at a word the index lacks must not be able to
+      // remove pages the reader asked for.
+      return `${emitOperand(node.left, "not", widen, correct)} NOT ${emitOperand(node.right, "not", widen)}`;
   }
 }
 
 // Emit the FTS5 match expression for a Query AST. With no `widen` the expression
 // is the reader's own terms and nothing else, which is what the banding probe
 // evaluates.
-export function emitMatchExpression(node: QueryNode, widen?: VariantLookup): string {
-  return emitNode(node, widen);
+export function emitMatchExpression(
+  node: QueryNode,
+  widen?: VariantLookup,
+  correct?: CorrectionLookup,
+): string {
+  return emitNode(node, widen, correct);
 }
 
 export function buildMatchExpression(
   query: string,
   widen?: VariantLookup,
   columns?: readonly string[],
+  correct?: CorrectionLookup,
 ): string | null {
   const node = parseQuery(query, columns);
-  return node === null ? null : emitMatchExpression(node, widen);
+  return node === null ? null : emitMatchExpression(node, widen, correct);
 }

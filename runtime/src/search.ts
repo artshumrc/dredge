@@ -1,11 +1,11 @@
 import type { Exec } from "./db";
 import type { DredgeMarks, MarkForms } from "./highlight";
 import { foldTerm, markFields, markForms } from "./highlight";
-import type { VariantLookup } from "./query";
+import type { CorrectionLookup, QueryNode, VariantLookup } from "./query";
 import { emitMatchExpression, parseQuery } from "./query";
 
 export { buildMatchExpression, emitMatchExpression, parseQuery } from "./query";
-export type { QueryNode, VariantLookup } from "./query";
+export type { CorrectionLookup, QueryNode, VariantLookup } from "./query";
 export type { DredgeMark, DredgeMarks } from "./highlight";
 
 export interface DredgeRange<T> {
@@ -55,10 +55,22 @@ export interface DredgeHit {
   marks?: DredgeMarks;
 }
 
+// One word the reader typed that the index does not hold, and the dictionary
+// terms the search was widened to instead. Reported so a page can say "showing
+// results for cartouche" rather than substituting silently.
+export interface DredgeCorrection {
+  // The reader's word, folded the index's way.
+  term: string;
+  // The corrections used, in the order they were ranked.
+  to: string[];
+}
+
 export interface DredgeSearchResponse {
   total: number;
   hits: DredgeHit[];
   facets?: Record<string, DredgeFacetBucket[]>;
+  // Present only when at least one term was corrected.
+  corrections?: DredgeCorrection[];
   elapsedMs: number;
 }
 
@@ -447,18 +459,87 @@ function variantLookup(exec: Exec): VariantLookup {
   };
 }
 
-// What to evaluate for a reader's query: the widened expression that decides the
-// match set, and — only when widening actually changed it — the reader's own
-// unwidened expression, which the banding probe evaluates to mark the rows that
-// matched exactly.
+// A term is corrected only when the index holds nothing like it, so a word of a
+// couple of letters — near half the vocabulary at one edit — is left alone.
+const MIN_CORRECTION_LENGTH = 3;
+
+// How many dictionary terms one misspelling widens to. Past a few the
+// alternation stops being a guess at the reader's word and starts being a scan.
+const MAX_CORRECTIONS_PER_TERM = 3;
+
+// Whether the index holds this exact term. The vocabulary view must already
+// exist on the connection.
+function inVocabulary(exec: Exec, term: string): boolean {
+  return exec(`SELECT 1 FROM temp.${VOCAB_TABLE} WHERE term = ? LIMIT 1`, [term]).length > 0;
+}
+
+// The folded terms of a query that may be corrected, in the order they were
+// typed. `wideable` already excludes phrases, identifiers, `field:` operands and
+// `near()` operands; on top of that the trailing prefix term is the word still
+// being typed rather than a misspelling, and the right side of an exclusion is
+// never corrected, so neither is collected.
+function collectCorrectable(node: QueryNode, out: Set<string>): void {
+  switch (node.kind) {
+    case "term":
+      if (node.wideable && !node.prefix) {
+        out.add(foldTerm(node.value));
+      }
+      return;
+    case "near":
+    case "and":
+    case "or":
+      for (const child of node.children) {
+        collectCorrectable(child, out);
+      }
+      return;
+    case "scoped":
+      collectCorrectable(node.child, out);
+      return;
+    case "not":
+      collectCorrectable(node.left, out);
+      return;
+    default:
+      return;
+  }
+}
+
+// The corrections a query's terms widen to, keyed by folded term. Only terms the
+// vocabulary has no row for are scanned, so a correctly spelled query costs one
+// indexed probe per term and nothing else.
+function planCorrections(exec: Exec, node: QueryNode): DredgeCorrection[] {
+  const correctable = new Set<string>();
+  collectCorrectable(node, correctable);
+  const planned: DredgeCorrection[] = [];
+  for (const term of correctable) {
+    if (Array.from(term).length < MIN_CORRECTION_LENGTH || inVocabulary(exec, term)) {
+      continue;
+    }
+    const candidates = corrections(exec, term, MAX_CORRECTIONS_PER_TERM);
+    if (candidates.length > 0) {
+      planned.push({ term, to: candidates.map((candidate) => candidate.term) });
+    }
+  }
+  return planned;
+}
+
+// What to evaluate for a reader's query, at the three widths banding reads: the
+// reader's own terms, those widened through their Variant Groups, and those
+// widened again through corrections. `variantExpr` is null when Term Variants
+// changed nothing, and `matchExpr` — the expression that decides the match set —
+// equals the variant width when nothing was corrected.
 interface MatchPlan {
+  exactExpr: string;
+  variantExpr: string | null;
   matchExpr: string;
-  exactExpr: string | null;
+  corrections: DredgeCorrection[];
   // The surface forms to mark on each hit — the reader's own terms plus whatever
   // widening added, so the marking cannot contradict the match set.
   markForms: MarkForms;
 }
 
+// Correction reads the FTS index's own vocabulary, which every artifact has, so
+// planning runs whether or not the artifact carries a Term Variant table. The
+// vocabulary view must already exist on the connection.
 function planMatch(exec: Exec, schema: SchemaInfo, query: string): MatchPlan | null {
   const node = query
     ? parseQuery(
@@ -470,15 +551,20 @@ function planMatch(exec: Exec, schema: SchemaInfo, query: string): MatchPlan | n
     return null;
   }
   const exactExpr = emitMatchExpression(node);
-  if (!schema.hasTermVariants) {
-    return { matchExpr: exactExpr, exactExpr: null, markForms: markForms(node) };
-  }
-  const widen = variantLookup(exec);
-  const matchExpr = emitMatchExpression(node, widen);
+  const widen = schema.hasTermVariants ? variantLookup(exec) : undefined;
+  const variantExpr = widen ? emitMatchExpression(node, widen) : exactExpr;
+  const planned = planCorrections(exec, node);
+  // An out-of-vocabulary term belongs to no Variant Group, so the two widenings
+  // never touch the same term and the correction lookup is a plain map.
+  const byTerm = new Map(planned.map((correction) => [correction.term, correction.to]));
+  const correct: CorrectionLookup | undefined =
+    byTerm.size > 0 ? (term) => byTerm.get(foldTerm(term)) : undefined;
   return {
-    matchExpr,
-    exactExpr: matchExpr === exactExpr ? null : exactExpr,
-    markForms: markForms(node, widen),
+    exactExpr,
+    variantExpr: variantExpr === exactExpr ? null : variantExpr,
+    matchExpr: correct ? emitMatchExpression(node, widen, correct) : variantExpr,
+    corrections: planned,
+    markForms: markForms(node, widen, correct),
   };
 }
 
@@ -502,34 +588,49 @@ const MATCH_TABLE = "m";
 //
 // The band is what keeps widening from displacing the reader's own words: 0 for
 // a document matching the unwidened expression, 1 for one reached only through a
-// Variant Group. FTS5 offers no per-term weight, so it is established by
-// evaluating `exactExpr` a second time — over the narrower expression, and so
-// the cheaper of the two — as an uncorrelated IN subquery, which SQLite
-// materializes once rather than per row. Banding is ordering only: every row
-// here is in the match set either way, so the total and the facet counts are
-// untouched by it.
+// Variant Group, 2 for one reached only through a Correction. FTS5 offers no
+// per-term weight, so each band boundary is established by evaluating the
+// narrower expression again — the cheaper of the pair — as an uncorrelated IN
+// subquery, which SQLite materializes once rather than per row. A probe is
+// omitted where its expression repeats the one below it, so a query with no
+// corrections emits the SQL it emitted before corrections existed. Banding is
+// ordering only: every row here is in the match set either way, so the total and
+// the facet counts are untouched by it.
+function bandExpression(
+  matchExpr: string,
+  exactExpr: string,
+  variantExpr: string | null,
+  bind: unknown[],
+): string {
+  const corrected = matchExpr !== (variantExpr ?? exactExpr);
+  if (variantExpr === null && !corrected) {
+    // Nothing widened, so every match is an exact match.
+    return "0 AS band";
+  }
+  const probe = "f.rowid IN (SELECT rowid FROM documents_fts WHERE documents_fts MATCH ?)";
+  const branches = [`WHEN ${probe} THEN 0`];
+  bind.push(exactExpr);
+  if (variantExpr !== null && corrected) {
+    branches.push(`WHEN ${probe} THEN 1`);
+    bind.push(variantExpr);
+  }
+  return `CASE ${branches.join(" ")} ELSE ${corrected ? 2 : 1} END AS band`;
+}
+
 function createMatchTable(
   exec: Exec,
   schema: SchemaInfo,
   matchExpr: string,
   rank: boolean,
-  exactExpr: string | null,
+  exactExpr: string,
+  variantExpr: string | null,
 ): void {
   const rankColumns: string[] = [];
   const bind: unknown[] = [];
   if (rank) {
     const weights = schema.searchColumns.map((column) => column.weight).join(", ");
     rankColumns.push(`bm25(documents_fts, ${weights}) AS rank`);
-    if (exactExpr === null) {
-      // Nothing widened, so every match is an exact match.
-      rankColumns.push("0 AS band");
-    } else {
-      rankColumns.push(
-        `CASE WHEN f.rowid IN (SELECT rowid FROM documents_fts WHERE documents_fts MATCH ?) ` +
-          `THEN 0 ELSE 1 END AS band`,
-      );
-      bind.push(exactExpr);
-    }
+    rankColumns.push(bandExpression(matchExpr, exactExpr, variantExpr, bind));
   }
   const scalarColumns = schema.scalarColumns.map((name) => `d.${quoteIdentifier(name)}`);
   const matchColumns = ["f.rowid AS id", ...rankColumns, ...scalarColumns];
@@ -708,6 +809,9 @@ export function search(
   request: DredgeSearchRequest,
 ): DredgeSearchResponse {
   const started = performance.now();
+  // Planning reads the vocabulary view to decide what is a misspelling, so it
+  // has to exist before the query is planned — as it does for `suggest`.
+  ensureVocabTable(exec);
   const plan = planMatch(exec, schema, (request.query ?? "").trim());
 
   if (plan === null) {
@@ -720,11 +824,17 @@ export function search(
 
   // Single-pass: evaluate the FTS match exactly once into a temp table, then
   // read the count, hits page, and all facet counts from it.
-  createMatchTable(exec, schema, plan.matchExpr, !request.sort, plan.exactExpr);
+  createMatchTable(exec, schema, plan.matchExpr, !request.sort, plan.exactExpr, plan.variantExpr);
   try {
     const { total, facets } = computeAggregate(exec, schema, request, true);
     const hits = computeHits(exec, schema, request, true, plan.markForms);
-    return { total, hits, facets, elapsedMs: performance.now() - started };
+    return {
+      total,
+      hits,
+      facets,
+      ...(plan.corrections.length > 0 ? { corrections: plan.corrections } : {}),
+      elapsedMs: performance.now() - started,
+    };
   } finally {
     exec(`DROP TABLE IF EXISTS temp.${MATCH_TABLE}`);
   }
@@ -964,7 +1074,12 @@ function canonicalSort(sort: DredgeSort | undefined): { field: string; direction
 // A worker owns one session and executes serially, so the single fixed match
 // table name is safe. `elapsedMs` always reflects the serving request.
 export class SearchSession {
-  private matchState: { matchExpr: string; rank: boolean; exactExpr: string | null } | null = null;
+  private matchState: {
+    matchExpr: string;
+    rank: boolean;
+    exactExpr: string;
+    variantExpr: string | null;
+  } | null = null;
   private readonly aggregateCache = new Lru<Aggregate>(AGGREGATE_CACHE_SIZE);
   private readonly responseCache = new Lru<DredgeSearchResponse>(RESPONSE_CACHE_SIZE);
   // Unfiltered-browse facet totals: the buckets for the no-query, no-filter case
@@ -988,6 +1103,7 @@ export class SearchSession {
 
   search(request: DredgeSearchRequest): DredgeSearchResponse {
     const started = performance.now();
+    this.ensureVocab();
     const plan = planMatch(this.exec, this.schema, (request.query ?? "").trim());
     const matchExpr = plan?.matchExpr ?? null;
     const facetNames = [
@@ -997,10 +1113,11 @@ export class SearchSession {
 
     const responseKey = JSON.stringify({
       m: matchExpr,
-      // The banding probe is part of what a page of hits is ordered by, so two
+      // The banding probes are part of what a page of hits is ordered by, so two
       // reader inputs that widen to the same expression from different words
       // still get their own response.
       x: plan?.exactExpr ?? null,
+      v: plan?.variantExpr ?? null,
       f: filters,
       fn: facetNames,
       l: Math.max(0, request.limit ?? 20),
@@ -1016,7 +1133,7 @@ export class SearchSession {
 
     const usesFts = plan !== null;
     if (plan) {
-      this.ensureMatchTable(plan.matchExpr, !request.sort, plan.exactExpr);
+      this.ensureMatchTable(plan.matchExpr, !request.sort, plan.exactExpr, plan.variantExpr);
     }
 
     let aggregate: Aggregate;
@@ -1041,6 +1158,7 @@ export class SearchSession {
       total: aggregate.total,
       hits,
       facets: aggregate.facets,
+      ...(plan && plan.corrections.length > 0 ? { corrections: plan.corrections } : {}),
       elapsedMs: performance.now() - started,
     };
     this.responseCache.set(responseKey, response);
@@ -1052,10 +1170,7 @@ export class SearchSession {
   // every keystroke, so the consumer decides when to ask.
   suggest(request: DredgeSuggestRequest): DredgeSuggestResponse {
     const started = performance.now();
-    if (!this.vocabReady) {
-      ensureVocabTable(this.exec);
-      this.vocabReady = true;
-    }
+    this.ensureVocab();
     return {
       suggestions: collectSuggestions(this.exec, request),
       elapsedMs: performance.now() - started,
@@ -1119,17 +1234,33 @@ export class SearchSession {
     this.vocabReady = false;
   }
 
-  private ensureMatchTable(matchExpr: string, rank: boolean, exactExpr: string | null): void {
+  // The vocabulary view backs both suggestion and the out-of-vocabulary test
+  // search planning runs, so it is created once per connection rather than per
+  // request.
+  private ensureVocab(): void {
+    if (!this.vocabReady) {
+      ensureVocabTable(this.exec);
+      this.vocabReady = true;
+    }
+  }
+
+  private ensureMatchTable(
+    matchExpr: string,
+    rank: boolean,
+    exactExpr: string,
+    variantExpr: string | null,
+  ): void {
     if (
       this.matchState &&
       this.matchState.matchExpr === matchExpr &&
       this.matchState.rank === rank &&
-      this.matchState.exactExpr === exactExpr
+      this.matchState.exactExpr === exactExpr &&
+      this.matchState.variantExpr === variantExpr
     ) {
       return;
     }
-    createMatchTable(this.exec, this.schema, matchExpr, rank, exactExpr);
-    this.matchState = { matchExpr, rank, exactExpr };
+    createMatchTable(this.exec, this.schema, matchExpr, rank, exactExpr, variantExpr);
+    this.matchState = { matchExpr, rank, exactExpr, variantExpr };
   }
 }
 

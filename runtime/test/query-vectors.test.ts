@@ -22,6 +22,10 @@ const vectorsPath = resolve(
 interface QueryVector {
   q: string;
   fts: string | null;
+  // Query-time corrections for words the index does not hold, as the search
+  // engine would have computed them from the vocabulary. Eligibility is decided
+  // there; here the lookup is a stub pinning the emitted alternation.
+  corrections?: Record<string, string[]>;
 }
 
 const vectors = JSON.parse(readFileSync(vectorsPath, "utf8")) as QueryVector[];
@@ -33,7 +37,10 @@ describe("buildMatchExpression shared vectors", () => {
 
   for (const vector of vectors) {
     it(`matches vector ${JSON.stringify(vector.q)}`, () => {
-      expect(buildMatchExpression(vector.q)).toBe(vector.fts);
+      const correct = vector.corrections
+        ? (term: string) => vector.corrections![term]
+        : undefined;
+      expect(buildMatchExpression(vector.q, undefined, undefined, correct)).toBe(vector.fts);
     });
   }
 });

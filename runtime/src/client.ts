@@ -20,6 +20,7 @@ export type {
   DredgeFilterValue,
   DredgeRange,
   DredgeHit,
+  DredgeCorrection,
   DredgeFacetBucket,
   DredgeSearchRequest,
   DredgeSearchResponse,

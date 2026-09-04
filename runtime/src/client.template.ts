@@ -79,10 +79,21 @@ export interface DredgeSearchRequest {
   sort?: DredgeSort;
 }
 
+// One word the reader typed that the index does not hold, and the dictionary
+// terms the search was widened to instead.
+export interface DredgeCorrection {
+  // The reader's word, folded the index's way.
+  term: string;
+  // The corrections used, in the order they were ranked.
+  to: string[];
+}
+
 export interface DredgeSearchResponse {
   total: number;
   hits: DredgeResult[];
   facets?: Partial<Record<keyof DredgeFilters, DredgeFacetBucket[]>>;
+  // Present only when at least one term was corrected.
+  corrections?: DredgeCorrection[];
   elapsedMs: number;
 }
 

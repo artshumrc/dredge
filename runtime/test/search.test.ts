@@ -967,6 +967,182 @@ describe("term variant widening", () => {
   });
 });
 
+// Correction is the query-time widening of a word the index does not hold to the
+// nearest words it does. It reads the FTS index's own vocabulary, so nothing
+// about it ships in the artifact. `cartouchr` is on no page and `cartouche` is on
+// 27, so every hit a corrected query returns is one only the correction reached.
+describe("out-of-vocabulary correction", () => {
+  const responseFor = (
+    query: string,
+    request: Partial<DredgeSearchRequest> = {},
+  ): DredgeSearchResponse => {
+    let response!: DredgeSearchResponse;
+    withFixture((exec, schema) => {
+      response = search(exec, schema, { query, limit: 1000, ...request });
+    });
+    return response;
+  };
+
+  const titlesOf = (response: DredgeSearchResponse): string[] =>
+    response.hits.map((hit) => String(hit.title)).sort();
+
+  it("finds the pages the reader's word was a typo for", () => {
+    const corrected = responseFor("cartouchr limestone");
+    const spelled = responseFor("cartouche limestone");
+
+    expect(corrected.total).toBeGreaterThan(0);
+    expect(titlesOf(corrected)).toEqual(titlesOf(spelled));
+    expect(corrected.corrections).toEqual([{ term: "cartouchr", to: ["cartouche"] }]);
+    // Nothing on these pages holds the word the reader typed, so every one of
+    // them is here only through the correction.
+    expect(corrected.hits.map((hit) => hit.band)).toEqual(corrected.hits.map(() => 2));
+  });
+
+  it("sorts the reader's own words first, then variants, then corrections", () => {
+    const response = responseFor("cartouchr OR photographs");
+    const bands = response.hits.map((hit) => Number(hit.band));
+
+    expect(bands).toEqual([...bands].sort((a, b) => a - b));
+    expect(new Set(bands)).toEqual(new Set([0, 1, 2]));
+    expect(response.hits.filter((hit) => hit.band === 0).map((hit) => String(hit.title))).toEqual([
+      "Chamber Survey Notes",
+    ]);
+    expect(
+      response.hits
+        .filter((hit) => hit.band === 1)
+        .map((hit) => String(hit.title))
+        .sort(),
+    ).toEqual(["Glass Plate Negatives", "Photographed Chambers Photographed Again"]);
+  });
+
+  it("leaves a correctly spelled query exactly as it was", () => {
+    const response = responseFor("cartouche limestone");
+
+    expect(response).not.toHaveProperty("corrections");
+    // Neither term is widened by anything, so all three planned expressions are
+    // the reader's own and the banding probe is not emitted at all.
+    expect(response.hits.map((hit) => hit.band)).toEqual(response.hits.map(() => 0));
+  });
+
+  it("leaves the reader's precision tools exact", () => {
+    // A phrase, a `field:` operand, a `near()` operand: none is wideable, so
+    // none is corrected and none finds the pages the corrected word would have.
+    for (const query of [
+      '"cartouchr limestone"',
+      "title:cartouchr limestone",
+      "near(cartouchr limestone, 5)",
+    ]) {
+      const response = responseFor(query);
+      expect(response.total).toBe(0);
+      expect(response).not.toHaveProperty("corrections");
+    }
+  });
+
+  it("never corrects an excluded term", () => {
+    // A guess at a word the index lacks must not be able to remove pages: the
+    // exclusion matches nothing, so the result is the unexcluded query's.
+    const excluded = responseFor("limestone -cartouchr granite");
+    const plain = responseFor("limestone granite");
+
+    expect(excluded).not.toHaveProperty("corrections");
+    expect(titlesOf(excluded)).toEqual(titlesOf(plain));
+    expect(titlesOf(plain).length).toBeGreaterThan(0);
+  });
+
+  it("never offers a term held by a single document", () => {
+    // `photograph`, `photographs` and `photographed` are each on one page, so
+    // the whole of this misspelling's neighbourhood is below the frequency floor.
+    const response = responseFor("photographz limestone");
+
+    expect(response).not.toHaveProperty("corrections");
+    expect(response.total).toBe(0);
+  });
+
+  it("marks the correction that matched", () => {
+    const response = responseFor("chambar survey");
+    const hit = response.hits.find((candidate) => candidate.title === "Chamber Survey Notes");
+
+    expect(response.corrections).toEqual([{ term: "chambar", to: ["chamber"] }]);
+    expect(hit).toBeDefined();
+    expect(
+      (hit!.marks?.title ?? []).map((mark) =>
+        String(hit!.title).slice(mark.start, mark.start + mark.length),
+      ),
+    ).toEqual(["Chamber", "Survey"]);
+  });
+
+  it("corrects against an artifact built before Term Variants existed", () => {
+    const scratch = join(mkdtempSync(join(tmpdir(), "dredge-correct-novariants-")), "novariants.db");
+    copyFileSync(fixtureDbPath(), scratch);
+    const db = new DatabaseSync(scratch);
+    try {
+      db.exec("DROP TABLE dredge_term_variants");
+      const exec = makeNodeSqliteExec(db);
+      const schema = introspectSchema(exec);
+      expect(schema.hasTermVariants).toBe(false);
+
+      const corrected = search(exec, schema, { query: "cartouchr limestone", limit: 1000 });
+      expect(corrected.corrections).toEqual([{ term: "cartouchr", to: ["cartouche"] }]);
+      expect(titlesOf(corrected)).toEqual(titlesOf(responseFor("cartouche limestone")));
+      expect(corrected.hits.map((hit) => hit.band)).toEqual(corrected.hits.map(() => 2));
+    } finally {
+      db.close();
+    }
+  });
+
+  it("bands only where relevance ordering applies", () => {
+    const relevance = responseFor("cartouchr limestone");
+    const sorted = responseFor("cartouchr limestone", { sort: { field: "title" } });
+
+    expect(sorted.total).toBe(relevance.total);
+    expect(sorted.corrections).toEqual(relevance.corrections);
+    for (const hit of sorted.hits) {
+      expect(hit.band).toBe(0);
+    }
+  });
+
+  it("keys a session's caches on the corrected expressions", () => {
+    const db = new DatabaseSync(fixtureDbPath());
+    try {
+      const base = makeNodeSqliteExec(db);
+      let builds = 0;
+      const exec: typeof base = (sql, bind) => {
+        if (sql.startsWith("CREATE TEMP TABLE m ")) {
+          builds += 1;
+        }
+        return base(sql, bind);
+      };
+      const schema = introspectSchema(exec);
+      const session = createSearchSession(exec, schema);
+
+      const corrected = session.search({ query: "cartouchr limestone", limit: 1000 });
+      // The same match set reached without correction: the spelled query must
+      // not be served the corrected query's table or its cached response.
+      const spelled = session.search({ query: "cartouche limestone", limit: 1000 });
+      // A different typo for the same word: same corrections, different reader
+      // word, so the two responses may not collapse into one another.
+      const other = session.search({ query: "cartouchw limestone", limit: 1000 });
+      expect(builds).toBe(3);
+
+      expect(spelled.total).toBe(corrected.total);
+      expect(spelled).not.toHaveProperty("corrections");
+      expect(other.corrections).toEqual([{ term: "cartouchw", to: ["cartouche"] }]);
+      expect(corrected.corrections).toEqual([{ term: "cartouchr", to: ["cartouche"] }]);
+
+      // An unchanged triple of expressions reuses the match table: the deeper
+      // page rebuilds nothing.
+      session.search({ query: "cartouchw limestone", limit: 5, offset: 3 });
+      expect(builds).toBe(3);
+      expect(session.search({ query: "cartouchr limestone", limit: 1000 })).toEqual({
+        ...corrected,
+        elapsedMs: expect.any(Number),
+      });
+    } finally {
+      db.close();
+    }
+  });
+});
+
 // Highlighting is a function over the response, never over the index: `snippet()`
 // and `highlight()` return NULL against a contentless index, so a hit's own title
 // and description are the whole of the text there is to mark. The marks are

@@ -7,7 +7,7 @@
 // than no mark. Marks are spans, never markup: Dredge does not own the
 // consumer's DOM.
 
-import type { QueryNode, TokenSpan, VariantLookup } from "./query";
+import type { CorrectionLookup, QueryNode, TokenSpan, VariantLookup } from "./query";
 import { splitTokenParts, tokenSpans } from "./query";
 
 export interface DredgeMark {
@@ -64,26 +64,33 @@ function foldText(source: string): FoldedText {
 }
 
 // Every surface form the query could have matched, in the same shapes the
-// emitter matches on: a wideable term plus its Variant Group, an identifier's
-// three spellings, a phrase's adjacent terms. The right side of an exclusion is
-// never collected — it is not why the row is here, and cannot be on it.
-export function markForms(node: QueryNode, widen?: VariantLookup): MarkForm[] {
+// emitter matches on: a wideable term plus its Variant Group and its
+// corrections, an identifier's three spellings, a phrase's adjacent terms. The
+// right side of an exclusion is never collected — it is not why the row is here,
+// and cannot be on it.
+export function markForms(
+  node: QueryNode,
+  widen?: VariantLookup,
+  correct?: CorrectionLookup,
+): MarkForm[] {
   const forms: MarkForm[] = [];
-  collectForms(node, widen, forms);
+  collectForms(node, widen, correct, forms);
   return forms;
 }
 
 function collectForms(
   node: QueryNode,
   widen: VariantLookup | undefined,
+  correct: CorrectionLookup | undefined,
   forms: MarkForm[],
 ): void {
   switch (node.kind) {
     case "term": {
       pushForm(forms, [node.value], node.prefix);
-      const variants = node.wideable && widen ? widen(node.value) : undefined;
-      for (const variant of variants ?? []) {
-        pushForm(forms, [variant], node.prefix);
+      if (node.wideable) {
+        for (const form of [...(widen?.(node.value) ?? []), ...(correct?.(node.value) ?? [])]) {
+          pushForm(forms, [form], node.prefix);
+        }
       }
       return;
     }
@@ -105,14 +112,14 @@ function collectForms(
     case "and":
     case "or":
       for (const child of node.children) {
-        collectForms(child, widen, forms);
+        collectForms(child, widen, correct, forms);
       }
       return;
     case "scoped":
-      collectForms(node.child, widen, forms);
+      collectForms(node.child, widen, correct, forms);
       return;
     case "not":
-      collectForms(node.left, widen, forms);
+      collectForms(node.left, widen, correct, forms);
       return;
   }
 }
