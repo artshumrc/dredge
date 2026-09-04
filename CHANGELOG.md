@@ -6,6 +6,8 @@ All notable changes to Dredge are documented here. This project adheres to
 
 ## Unreleased
 
+## 0.4.0 — 2026-09-04
+
 ### A misspelled word finds the pages that hold the right one
 
 A reader who types `cartouchr` no longer gets nothing. When a word is absent from
