@@ -830,6 +830,18 @@ describe("term variant widening", () => {
     return titles;
   };
 
+  // Titles reached by the reader's own word or a Term Variant of it, leaving out
+  // pages a correction alone reached.
+  const variantTitlesFor = (query: string): string[] => {
+    let titles: string[] = [];
+    withFixture((exec, schema) => {
+      titles = search(exec, schema, { query, limit: 1000 })
+        .hits.filter((hit) => Number(hit.band) <= 1)
+        .map((hit) => String(hit.title));
+    });
+    return titles;
+  };
+
   it("returns a term's whole Variant Group from a single search", () => {
     // `photographs` is on one page; the other two hold only other forms, and
     // neither is a prefix of the query, so only widening can reach them.
@@ -846,9 +858,12 @@ describe("term variant widening", () => {
 
   it("reaches declared spelling variants and synonyms", () => {
     // Neither `ramses` nor `khufu` appears anywhere in the corpus: the group is
-    // declared in config, so the only hit is the other member's page.
-    expect(titlesFor("ramses")).toEqual(["Ramesses Inscription"]);
-    expect(titlesFor("khufu")).toEqual(["Cheops Plateau"]);
+    // declared in config, so the only widened hit is the other member's page.
+    // `ramses` is also absent from the index's vocabulary, so the correction
+    // pass reaches a distant page of its own at band 2; the variant's page is
+    // what widening owes the reader.
+    expect(variantTitlesFor("ramses")).toEqual(["Ramesses Inscription"]);
+    expect(variantTitlesFor("khufu")).toEqual(["Cheops Plateau"]);
   });
 
   it("matches a quoted term only in the form the reader typed", () => {
@@ -1059,6 +1074,16 @@ describe("out-of-vocabulary correction", () => {
     for (const query of ["ca", "zq"]) {
       expect(responseFor(query)).not.toHaveProperty("corrections");
     }
+  });
+
+  it("corrects a typo in the reader's first letter", () => {
+    const corrected = responseFor("kartouche limestone");
+    const spelled = responseFor("cartouche limestone");
+
+    expect(corrected.total).toBeGreaterThan(0);
+    expect(titlesOf(corrected)).toEqual(titlesOf(spelled));
+    expect(corrected.corrections).toEqual([{ term: "kartouche", to: ["cartouche"] }]);
+    expect(corrected.hits.map((hit) => hit.band)).toEqual(corrected.hits.map(() => 2));
   });
 
   it("leaves the reader's precision tools exact", () => {
@@ -1943,6 +1968,24 @@ describe("suggestions from the index vocabulary", () => {
       expect(suggestions[0].distance).toBe(1);
       // Ranking is distance first, so nothing further away may precede it.
       expect(suggestions.every((s) => s.distance >= suggestions[0].distance)).toBe(true);
+    });
+  });
+
+  it("corrects a typo in the first letter of a long enough word", () => {
+    withFixture((exec) => {
+      const { suggestions } = suggest(exec, { term: "kartouche", kind: "correction" });
+
+      expect(suggestions[0].term).toBe("cartouche");
+      expect(suggestions[0].distance).toBe(1);
+    });
+  });
+
+  it("keeps the first letter of a short word exact", () => {
+    withFixture((exec) => {
+      // `the` is in the fixture's vocabulary and `zhe` is one edit from it, but
+      // at three code points a changed first letter is not treated as a typo:
+      // too much of the dictionary is within one edit of a word that short.
+      expect(suggest(exec, { term: "zhe", kind: "correction" }).suggestions).toEqual([]);
     });
   });
 

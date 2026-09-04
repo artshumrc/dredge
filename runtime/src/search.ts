@@ -870,9 +870,16 @@ const VOCAB_TABLE = "dredge_vocab";
 const MIN_DOCUMENT_FREQUENCY = 2;
 
 // Leading characters a correction candidate must share with what the reader
-// typed. One cuts the vocabulary by an order of magnitude while still admitting
-// a typo anywhere after the first character.
+// typed. It applies only to typed terms shorter than
+// `CORRECTION_WIDE_SCAN_LENGTH`: a short word with its first letter changed is
+// nearer to too much of the dictionary to guess from, while a longer word
+// carries enough of the reader's intent in the rest of its letters that the
+// whole length window can be scanned.
 const CORRECTION_PREFIX_LENGTH = 1;
+
+// Typed length at and above which the leading-character filter is dropped, so
+// that a typo in the first letter is correctable.
+const CORRECTION_WIDE_SCAN_LENGTH = 4;
 
 const SUGGESTION_LIMIT = 10;
 
@@ -925,27 +932,35 @@ function ensureVocabTable(exec: Exec): void {
 }
 
 // The nearest corpus terms to a misspelling. Candidates are narrowed in SQL by
-// leading character, length window, and the document-frequency floor *before*
-// any distance is computed; ranking is by distance, then by document frequency,
-// because at equal distance the commoner word is the better guess.
+// length window and the document-frequency floor — and, for a short typed term,
+// by leading character — *before* any distance is computed; ranking is by
+// distance, then by document frequency, because at equal distance the commoner
+// word is the better guess.
 function corrections(exec: Exec, term: string, limit: number): DredgeSuggestion[] {
   const typed = Array.from(term);
   const max = maxEditDistance(typed.length);
+  const wide = typed.length >= CORRECTION_WIDE_SCAN_LENGTH;
   const prefix = typed.slice(0, CORRECTION_PREFIX_LENGTH).join("");
-  const rows = exec(
-    `SELECT term, doc FROM temp.${VOCAB_TABLE} ` +
-      `WHERE doc >= ? AND term >= ? AND term < ? AND substr(term, 1, ?) = ? ` +
-      `AND length(term) BETWEEN ? AND ?`,
-    [
-      MIN_DOCUMENT_FREQUENCY,
-      prefix,
-      prefixUpperBound(prefix),
-      prefix.length,
-      prefix,
-      typed.length - max,
-      typed.length + max,
-    ],
-  );
+  const rows = wide
+    ? exec(
+        `SELECT term, doc FROM temp.${VOCAB_TABLE} ` +
+          `WHERE doc >= ? AND length(term) BETWEEN ? AND ?`,
+        [MIN_DOCUMENT_FREQUENCY, typed.length - max, typed.length + max],
+      )
+    : exec(
+        `SELECT term, doc FROM temp.${VOCAB_TABLE} ` +
+          `WHERE doc >= ? AND term >= ? AND term < ? AND substr(term, 1, ?) = ? ` +
+          `AND length(term) BETWEEN ? AND ?`,
+        [
+          MIN_DOCUMENT_FREQUENCY,
+          prefix,
+          prefixUpperBound(prefix),
+          prefix.length,
+          prefix,
+          typed.length - max,
+          typed.length + max,
+        ],
+      );
 
   const scored: DredgeSuggestion[] = [];
   for (const row of rows) {
