@@ -5,6 +5,7 @@ import {
   boot,
   closeDatabase,
   getExec,
+  isDatabaseCached,
   loadValidatedManifest,
   setConnectionCacheClearer,
   setSessionCacheClearer,
@@ -27,6 +28,7 @@ type WorkerRequest =
   | { type: "init"; id: number; manifestUrl: string; reset?: boolean }
   | { type: "search"; id: number; request: DredgeSearchRequest }
   | { type: "suggest"; id: number; request: DredgeSuggestRequest }
+  | { type: "isCached"; id: number; manifestUrl: string }
   | { type: "destroy"; id: number };
 
 type WorkerResponse =
@@ -34,6 +36,7 @@ type WorkerResponse =
   | { type: "ready"; id: number }
   | { type: "searchResult"; id: number; response: DredgeSearchResponse }
   | { type: "suggestResult"; id: number; response: DredgeSuggestResponse }
+  | { type: "cachedResult"; id: number; cached: boolean }
   | { type: "error"; id?: number; error: DredgeError };
 
 // The active session: a leader that owns the database, or a follower relaying to
@@ -130,6 +133,12 @@ self.onmessage = async (event: MessageEvent<WorkerRequest>) => {
     } catch (error) {
       post({ type: "error", id: message.id, error: toDredgeError(error) });
     }
+    return;
+  }
+
+  if (message.type === "isCached") {
+    const cached = session !== undefined || (await isDatabaseCached(browserBootEnv, message.manifestUrl));
+    post({ type: "cachedResult", id: message.id, cached });
     return;
   }
 

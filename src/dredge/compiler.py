@@ -27,11 +27,11 @@ import brotli
 
 from .progress import CompileProgress
 
-DB_SCHEMA_VERSION = 3
+DB_SCHEMA_VERSION = 4
 MANIFEST_VERSION = 1
 # Oldest Runtime that can read what this compiler emits. Bump only when a
 # format change actually breaks older Runtimes, not on every release.
-RUNTIME_MIN_VERSION = "0.3.0"
+RUNTIME_MIN_VERSION = "0.5.0"
 SQLITE_PAGE_SIZE = 16_384
 DB_COMPRESSION = "brotli"
 BROTLI_MIN_QUALITY = 0
@@ -83,6 +83,7 @@ TOKEN_RE = re.compile(r"[\w]+", re.UNICODE)
 
 TOP_LEVEL_KEYS = {
     "$schema",
+    "source",
     "source_dir",
     "output_dir",
     "base_url",
@@ -93,6 +94,7 @@ TOP_LEVEL_KEYS = {
     "search_weights",
     "facets",
     "store_fields",
+    "sort_fields",
     "boosts",
     "result_fields",
     "composite_indices",
@@ -101,18 +103,33 @@ TOP_LEVEL_KEYS = {
     "variant_generation",
     "synonym_groups",
     "suppressed_variants",
+    "index",
 }
+# Keys that describe HTML extraction, refused for record input.
+HTML_ONLY_KEYS = (
+    "source_dir",
+    "base_url",
+    "include",
+    "exclude",
+    "selectors",
+    "allow_output_in_source",
+)
+SOURCE_TYPES = {"html", "jsonl"}
+RECORD_KEYS = {"id", "url", "fields", "facets", "sort", "store"}
+INDEX_KEYS = {"positions"}
 SELECTOR_KEYS = {"title", "body", "description"}
 FACET_KEYS = {"type", "source", "required"}
 CLIENT_KEYS = {"out", "worker_url"}
 FACET_TYPES = {"string", "string_array", "integer", "number", "boolean", "date"}
-STORE_FIELD_TYPES = {"string", "integer", "number", "boolean", "date"}
+STORE_FIELD_TYPES = {"string", "integer", "number", "boolean", "date", "json"}
+SORT_FIELD_TYPES = {"string", "integer", "number", "date"}
 SCALAR_SQL_TYPES = {
     "string": "TEXT",
     "integer": "INTEGER",
     "number": "REAL",
     "boolean": "INTEGER",
     "date": "TEXT",
+    "json": "TEXT",
 }
 
 
@@ -340,6 +357,7 @@ class DredgeConfig:
     search_columns: tuple[SearchColumnConfig, ...]
     facets: tuple[FacetConfig, ...]
     store_fields: tuple[FacetConfig, ...]
+    sort_fields: tuple[FacetConfig, ...]
     boosts: tuple[ValueBoostConfig | RecencyBoostConfig, ...]
     result_fields: tuple[str, ...]
     composite_indices: tuple[tuple[str, ...], ...]
@@ -349,6 +367,11 @@ class DredgeConfig:
     synonym_groups: tuple[tuple[str, ...], ...]
     suppressed_variants: tuple[tuple[str, str], ...]
     config_hash: str
+    # Set for record input (``source.type == "jsonl"``), which replaces HTML
+    # discovery and extraction; ``source_dir`` is then the file's directory.
+    records_path: Path | None = None
+    # False builds the index without word positions (FTS5 ``detail=column``).
+    positions: bool = True
 
     @property
     def facet_map(self) -> dict[str, FacetConfig]:
@@ -360,7 +383,10 @@ class DredgeConfig:
 
     @property
     def field_map(self) -> dict[str, FacetConfig]:
-        return {field.name: field for field in (*self.facets, *self.store_fields)}
+        return {
+            field.name: field
+            for field in (*self.facets, *self.store_fields, *self.sort_fields)
+        }
 
     @property
     def scalar_facets(self) -> tuple[FacetConfig, ...]:
@@ -406,6 +432,9 @@ class ExtractedDocument:
     scalar_facets: dict[str, str | int | float | None]
     array_facets: dict[str, tuple[str, ...]]
     store_fields: dict[str, str | int | float | None]
+    sort_fields: dict[str, str | int | float | None] = dataclass_field(
+        default_factory=dict
+    )
 
 
 @dataclass(frozen=True)
@@ -594,39 +623,53 @@ def load_config(config_path: Path) -> DredgeConfig:
         )
 
     base_dir = path.parent
-    source_dir = _required_path(raw, "source_dir", base_dir)
+    records_path = _load_source(raw, base_dir)
+    records = records_path is not None
     output_dir = _required_path(raw, "output_dir", base_dir)
 
-    if not source_dir.exists() or not source_dir.is_dir():
-        raise BuildError(
-            "CONFIG_INVALID", f"source_dir must be an existing directory: {source_dir}"
-        )
+    if records:
+        source_dir = records_path.parent
+        allow_output_in_source = False
+    else:
+        source_dir = _required_path(raw, "source_dir", base_dir)
+        if not source_dir.exists() or not source_dir.is_dir():
+            raise BuildError(
+                "CONFIG_INVALID", f"source_dir must be an existing directory: {source_dir}"
+            )
 
-    allow_output_in_source = _optional_bool(raw, "allow_output_in_source", False)
-    if _same_or_child(output_dir, source_dir) and not allow_output_in_source:
-        raise BuildError(
-            "CONFIG_INVALID",
-            "output_dir must be outside source_dir unless allow_output_in_source is true: "
-            f"source_dir={source_dir}, output_dir={output_dir}",
-        )
+        allow_output_in_source = _optional_bool(raw, "allow_output_in_source", False)
+        if _same_or_child(output_dir, source_dir) and not allow_output_in_source:
+            raise BuildError(
+                "CONFIG_INVALID",
+                "output_dir must be outside source_dir unless allow_output_in_source is true: "
+                f"source_dir={source_dir}, output_dir={output_dir}",
+            )
 
     base_url = _optional_string(raw, "base_url", "/")
     include = tuple(_optional_string_list(raw, "include", ["**/*.html"]))
     exclude = tuple(_optional_string_list(raw, "exclude", []))
     selectors = _load_selectors(raw)
-    search_fields = tuple(_load_search_fields(raw))
+    search_fields = tuple(
+        _load_record_search_fields(raw) if records else _load_search_fields(raw)
+    )
     search_columns = _build_search_columns(search_fields, raw)
-    facets = _load_facets(raw)
-    store_fields = _load_store_fields(raw)
+    facets = _load_facets(raw, records=records)
+    store_fields = _load_store_fields(raw, records=records)
+    sort_fields = _load_sort_fields(raw, records=records)
     facet_map = {facet.name: facet for facet in facets}
     store_field_map = {field.name: field for field in store_fields}
-    collisions = sorted(set(facet_map) & set(store_field_map))
-    if collisions:
-        raise BuildError(
-            "CONFIG_INVALID",
-            f"facets and store_fields share field name(s): {', '.join(collisions)}",
-        )
-    field_map = {**facet_map, **store_field_map}
+    sort_field_map = {field.name: field for field in sort_fields}
+    for left, right, names in (
+        ("facets", "store_fields", set(facet_map) & set(store_field_map)),
+        ("facets", "sort_fields", set(facet_map) & set(sort_field_map)),
+        ("store_fields", "sort_fields", set(store_field_map) & set(sort_field_map)),
+    ):
+        if names:
+            raise BuildError(
+                "CONFIG_INVALID",
+                f"{left} and {right} share field name(s): {', '.join(sorted(names))}",
+            )
+    field_map = {**facet_map, **store_field_map, **sort_field_map}
     boosts = _load_boosts(raw, facet_map, store_field_map)
     result_fields = tuple(
         _optional_string_list(raw, "result_fields", ["title", "url", "description"])
@@ -637,10 +680,15 @@ def load_config(config_path: Path) -> DredgeConfig:
     variant_generation = _optional_bool(raw, "variant_generation", True)
     synonym_groups = _load_synonym_groups(raw)
     suppressed_variants = _load_suppressed_variants(raw)
+    positions = _load_index_positions(raw)
 
     effective_config = {
         "$schema": raw.get("$schema"),
-        "source_dir": raw["source_dir"],
+        **(
+            {"source": {"type": "jsonl", "path": raw["source"]["path"]}}
+            if records
+            else {"source_dir": raw["source_dir"]}
+        ),
         "output_dir": raw["output_dir"],
         "base_url": base_url,
         "include": list(include),
@@ -675,6 +723,15 @@ def load_config(config_path: Path) -> DredgeConfig:
         "synonym_groups": [list(group) for group in synonym_groups],
         "suppressed_variants": [list(pair) for pair in suppressed_variants],
     }
+    # Added only where set, so a config that uses neither hashes as it did
+    # before they existed.
+    if sort_fields:
+        effective_config["sort_fields"] = {
+            field.name: {"type": field.type, "required": field.required}
+            for field in sort_fields
+        }
+    if not positions:
+        effective_config["index"] = {"positions": False}
     config_hash = _sha256_text(
         json.dumps(
             effective_config, ensure_ascii=False, sort_keys=True, separators=(",", ":")
@@ -694,6 +751,7 @@ def load_config(config_path: Path) -> DredgeConfig:
         search_columns=search_columns,
         facets=facets,
         store_fields=store_fields,
+        sort_fields=sort_fields,
         boosts=boosts,
         result_fields=result_fields,
         composite_indices=composite_indices,
@@ -703,7 +761,61 @@ def load_config(config_path: Path) -> DredgeConfig:
         synonym_groups=synonym_groups,
         suppressed_variants=suppressed_variants,
         config_hash=config_hash,
+        records_path=records_path,
+        positions=positions,
     )
+
+
+def _load_source(raw: dict[str, Any], base_dir: Path) -> Path | None:
+    """The records file a ``jsonl`` source names, or None for HTML input."""
+    value = raw.get("source")
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise BuildError("CONFIG_INVALID", "source must be an object")
+    unknown = sorted(set(value) - {"type", "path"})
+    if unknown:
+        raise BuildError(
+            "CONFIG_INVALID", f"unknown key(s) on source: {', '.join(unknown)}"
+        )
+    source_type = value.get("type")
+    if source_type not in SOURCE_TYPES:
+        raise BuildError(
+            "CONFIG_INVALID",
+            f"source.type must be one of {', '.join(sorted(SOURCE_TYPES))}, "
+            f"got {source_type!r}",
+        )
+    if source_type == "html":
+        if "path" in value:
+            raise BuildError(
+                "CONFIG_INVALID", "source.path applies only to jsonl; use source_dir"
+            )
+        return None
+    html_keys = [key for key in HTML_ONLY_KEYS if key in raw]
+    if html_keys:
+        raise BuildError(
+            "CONFIG_INVALID",
+            f"{', '.join(html_keys)} appl{'ies' if len(html_keys) == 1 else 'y'} "
+            "only to HTML input, not a jsonl source",
+        )
+    records_path = _required_path(value, "path", base_dir)
+    if not records_path.is_file():
+        raise BuildError(
+            "CONFIG_INVALID", f"source.path must be an existing file: {records_path}"
+        )
+    return records_path
+
+
+def _load_index_positions(raw: dict[str, Any]) -> bool:
+    value = raw.get("index", {})
+    if not isinstance(value, dict):
+        raise BuildError("CONFIG_INVALID", "index must be an object")
+    unknown = sorted(set(value) - INDEX_KEYS)
+    if unknown:
+        raise BuildError(
+            "CONFIG_INVALID", f"unknown key(s) on index: {', '.join(unknown)}"
+        )
+    return _optional_bool(value, "positions", True)
 
 
 def check_sqlite_capabilities() -> None:
@@ -857,14 +969,21 @@ def _compile_site(
         config = validate_config(config_path)
     with metrics.phase("discovery"):
         ui.set_phase("discovery")
-        candidates, skipped = discover_html_files(config)
-    metrics.candidate_count = len(candidates)
-    if not candidates:
+        if config.records_path is None:
+            candidates, skipped = discover_html_files(config)
+            total = len(candidates)
+        else:
+            candidates, skipped = (), ()
+            total = _count_records(config.records_path)
+    metrics.candidate_count = total
+    if not total:
         raise BuildError(
             "DISCOVERY_NO_FILES",
-            f"no HTML files matched include/exclude patterns in {config.source_dir}",
+            f"no records in {config.records_path}"
+            if config.records_path
+            else f"no HTML files matched include/exclude patterns in {config.source_dir}",
         )
-    resolved_jobs = _resolve_jobs(jobs, len(candidates))
+    resolved_jobs = _resolve_jobs(jobs, total)
 
     config.output_dir.mkdir(parents=True, exist_ok=True)
     temp_dir = Path(tempfile.mkdtemp(prefix=".dredge-build-", dir=config.output_dir))
@@ -895,18 +1014,27 @@ def _compile_site(
                 if ui.enabled
                 else _ProgressReporter(
                     progress_stream,
-                    total_documents=len(candidates),
+                    total_documents=total,
                     build_db_path=build_db_path,
                 )
             )
-            files_advance = ui.begin_files(len(candidates))
+            files_advance = ui.begin_files(total)
 
             connection.execute("BEGIN")
             ingest_started_at = time.perf_counter()
             with metrics.phase("extraction_ingest"):
                 ui.set_phase("extraction_ingest")
-                extractions = _iter_extractions(candidates, config, resolved_jobs)
-                for index, (candidate, document, warning_records) in enumerate(
+                extractions = (
+                    _iter_records(config)
+                    if config.records_path
+                    else (
+                        (document, records)
+                        for _, document, records in _iter_extractions(
+                            candidates, config, resolved_jobs
+                        )
+                    )
+                )
+                for index, (document, warning_records) in enumerate(
                     extractions, start=1
                 ):
                     for record in warning_records:
@@ -960,11 +1088,11 @@ def _compile_site(
                 final_db_bytes = _path_size(build_db_path)
                 if reporter is not None:
                     reporter.maybe_report(
-                        len(candidates), build_db_bytes=final_db_bytes
+                        total, build_db_bytes=final_db_bytes
                     )
-                files_advance(len(candidates), final_db_bytes)
+                files_advance(total, final_db_bytes)
             metrics.record_ingest(
-                documents=len(candidates),
+                documents=total,
                 seconds=time.perf_counter() - ingest_started_at,
                 build_db_path=build_db_path,
             )
@@ -1022,7 +1150,7 @@ def _compile_site(
                 "db_compressed_bytes": db_compressed_bytes,
                 "db_compression": DB_COMPRESSION,
                 "sqlite_page_size": SQLITE_PAGE_SIZE,
-                "page_count": len(candidates),
+                "page_count": total,
                 "config_hash": config.config_hash,
                 "runtime_min_version": RUNTIME_MIN_VERSION,
             }
@@ -1046,7 +1174,7 @@ def _compile_site(
         warning_tuple = warnings.to_warnings()
         metrics_payload = metrics.to_payload(
             config=config,
-            page_count=len(candidates),
+            page_count=total,
             skipped_count=len(skipped),
             warning_count=len(warning_tuple),
             db_path=db_path,
@@ -1065,7 +1193,7 @@ def _compile_site(
             compressed_db_path=compressed_db_path,
             manifest_path=manifest_path,
             manifest=manifest,
-            page_count=len(candidates),
+            page_count=total,
             client_path=client_path,
             asset_paths=asset_paths,
             warnings=warning_tuple,
@@ -1142,6 +1270,33 @@ def _load_search_fields(raw: dict[str, Any]) -> list[SearchFieldConfig]:
             name = _validate_search_column_name(name, index, taken)
             taken.add(name)
         fields.append(SearchFieldConfig(source=source.strip(), name=name))
+    return fields
+
+
+def _load_record_search_fields(raw: dict[str, Any]) -> list[SearchFieldConfig]:
+    """A record's named Search Columns, beyond ``title`` and ``body``.
+
+    Each entry is a name, or ``{"name": ...}``; the record's ``fields`` object
+    supplies the text under that name, so there is no source to extract from.
+    """
+    value = raw.get("search_fields", [])
+    if not isinstance(value, list):
+        raise BuildError("CONFIG_INVALID", "search_fields must be an array")
+    fields: list[SearchFieldConfig] = []
+    taken: set[str] = set()
+    for index, item in enumerate(value, start=1):
+        if isinstance(item, dict):
+            unknown = sorted(set(item) - {"name"})
+            if unknown:
+                raise BuildError(
+                    "CONFIG_INVALID",
+                    f"unknown key(s) on search_fields[{index}]: {', '.join(unknown)}; "
+                    "a jsonl source names its fields and extracts nothing",
+                )
+            item = item.get("name")
+        name = _validate_search_column_name(item, index, taken)
+        taken.add(name)
+        fields.append(SearchFieldConfig(source=f"fields.{name}", name=name))
     return fields
 
 
@@ -1400,7 +1555,23 @@ def _boosts_as_config(
     return resolved
 
 
-def _load_facets(raw: dict[str, Any]) -> tuple[FacetConfig, ...]:
+def _record_field_source(
+    label: str, name: str, field_raw: dict[str, Any], records: bool, section: str
+) -> str | None:
+    """A record field reads its value from the record itself, so it takes no
+    ``source``; returns the record path it reads from, or None for HTML."""
+    if not records:
+        return None
+    if "source" in field_raw:
+        raise BuildError(
+            "CONFIG_INVALID",
+            f"{label} {name!r} takes no source with a jsonl source; "
+            f"its value is the record's {section}.{name}",
+        )
+    return f"{section}.{name}"
+
+
+def _load_facets(raw: dict[str, Any], *, records: bool = False) -> tuple[FacetConfig, ...]:
     value = raw.get("facets", {})
     if not isinstance(value, dict):
         raise BuildError("CONFIG_INVALID", "facets must be an object")
@@ -1426,7 +1597,8 @@ def _load_facets(raw: dict[str, Any]) -> tuple[FacetConfig, ...]:
             raise BuildError(
                 "CONFIG_INVALID", f"facet {name!r} has unsupported type: {facet_type!r}"
             )
-        source = facet_raw.get("source")
+        record_source = _record_field_source("facet", name, facet_raw, records, "facets")
+        source = record_source or facet_raw.get("source")
         if not isinstance(source, str) or not source.strip():
             raise BuildError(
                 "CONFIG_INVALID", f"facet {name!r} source must be a non-empty string"
@@ -1436,9 +1608,10 @@ def _load_facets(raw: dict[str, Any]) -> tuple[FacetConfig, ...]:
             raise BuildError(
                 "CONFIG_INVALID", f"facet {name!r} required must be a boolean"
             )
-        _validate_selector_source(
-            source.strip(), f"facets.{name}.source", allow_direct_attribute=True
-        )
+        if not record_source:
+            _validate_selector_source(
+                source.strip(), f"facets.{name}.source", allow_direct_attribute=True
+            )
         facets.append(
             FacetConfig(
                 name=name, type=facet_type, source=source.strip(), required=required
@@ -1447,46 +1620,77 @@ def _load_facets(raw: dict[str, Any]) -> tuple[FacetConfig, ...]:
     return tuple(facets)
 
 
-def _load_store_fields(raw: dict[str, Any]) -> tuple[FacetConfig, ...]:
-    value = raw.get("store_fields", {})
+def _load_store_fields(
+    raw: dict[str, Any], *, records: bool = False
+) -> tuple[FacetConfig, ...]:
+    return _load_record_fields(
+        raw, "store_fields", "store field", STORE_FIELD_TYPES, records, "store"
+    )
+
+
+def _load_sort_fields(
+    raw: dict[str, Any], *, records: bool = False
+) -> tuple[FacetConfig, ...]:
+    """Fields a record carries only to be ordered by: indexed for sorting, but
+    never filtered, counted, or searched."""
+    if "sort_fields" in raw and not records:
+        raise BuildError(
+            "CONFIG_INVALID", "sort_fields applies only to a jsonl source"
+        )
+    return _load_record_fields(
+        raw, "sort_fields", "sort field", SORT_FIELD_TYPES, records, "sort"
+    )
+
+
+def _load_record_fields(
+    raw: dict[str, Any],
+    key: str,
+    label: str,
+    types: set[str],
+    records: bool,
+    section: str,
+) -> tuple[FacetConfig, ...]:
+    value = raw.get(key, {})
     if not isinstance(value, dict):
-        raise BuildError("CONFIG_INVALID", "store_fields must be an object")
+        raise BuildError("CONFIG_INVALID", f"{key} must be an object")
 
     fields: list[FacetConfig] = []
     for name in sorted(value):
         if not IDENTIFIER_RE.match(name):
             raise BuildError(
                 "CONFIG_INVALID",
-                f"store field name must match {IDENTIFIER_RE.pattern}: {name!r}",
+                f"{label} name must match {IDENTIFIER_RE.pattern}: {name!r}",
             )
         field_raw = value[name]
         if not isinstance(field_raw, dict):
-            raise BuildError("CONFIG_INVALID", f"store field {name!r} must be an object")
+            raise BuildError("CONFIG_INVALID", f"{label} {name!r} must be an object")
         unknown = sorted(set(field_raw) - FACET_KEYS)
         if unknown:
             raise BuildError(
                 "CONFIG_INVALID",
-                f"unknown key(s) on store field {name!r}: {', '.join(unknown)}",
+                f"unknown key(s) on {label} {name!r}: {', '.join(unknown)}",
             )
         field_type = field_raw.get("type")
-        if field_type not in STORE_FIELD_TYPES:
+        if field_type not in types:
             raise BuildError(
                 "CONFIG_INVALID",
-                f"store field {name!r} has unsupported type: {field_type!r}",
+                f"{label} {name!r} has unsupported type: {field_type!r}",
             )
-        source = field_raw.get("source")
+        record_source = _record_field_source(label, name, field_raw, records, section)
+        source = record_source or field_raw.get("source")
         if not isinstance(source, str) or not source.strip():
             raise BuildError(
-                "CONFIG_INVALID", f"store field {name!r} source must be a non-empty string"
+                "CONFIG_INVALID", f"{label} {name!r} source must be a non-empty string"
             )
         required = field_raw.get("required", False)
         if not isinstance(required, bool):
             raise BuildError(
-                "CONFIG_INVALID", f"store field {name!r} required must be a boolean"
+                "CONFIG_INVALID", f"{label} {name!r} required must be a boolean"
             )
-        _validate_selector_source(
-            source.strip(), f"store_fields.{name}.source", allow_direct_attribute=True
-        )
+        if not record_source:
+            _validate_selector_source(
+                source.strip(), f"{key}.{name}.source", allow_direct_attribute=True
+            )
         fields.append(
             FacetConfig(name=name, type=field_type, source=source.strip(), required=required)
         )
@@ -1674,7 +1878,7 @@ def _documents_column_defs(config: DredgeConfig) -> list[str]:
     ]
     store_columns = [
         f"{_quote_identifier(field.name)} {SCALAR_SQL_TYPES[field.type]}"
-        for field in config.store_fields
+        for field in (*config.store_fields, *config.sort_fields)
     ]
     return [
         "id INTEGER PRIMARY KEY",
@@ -1701,6 +1905,7 @@ def _create_dredge_fields_table(
         [
             *((facet.name, "facet", facet.type) for facet in config.facets),
             *((field.name, "store", field.type) for field in config.store_fields),
+            *((field.name, "sort", field.type) for field in config.sort_fields),
         ],
     )
 
@@ -1792,9 +1997,12 @@ def _create_tables(connection: sqlite3.Connection, config: DredgeConfig) -> None
     connection.execute(f"CREATE TABLE documents ({', '.join(document_columns)}) STRICT")
     _create_dredge_fields_table(connection, config)
     fts_columns = ", ".join(column.name for column in config.search_columns)
+    # Without positions FTS5 keeps only which columns hold each term, which
+    # costs a fraction of the bytes but cannot answer phrase or NEAR queries.
+    detail = "" if config.positions else ", detail=column"
     connection.execute(
         "CREATE VIRTUAL TABLE documents_fts USING fts5("
-        f"{fts_columns}, content='', tokenize='{FTS_TOKENIZER}')"
+        f"{fts_columns}, content='', tokenize='{FTS_TOKENIZER}'{detail})"
     )
     _create_search_columns_table(connection, config)
     _create_boosts_table(connection, config)
@@ -1824,7 +2032,7 @@ def _create_indexes(connection: sqlite3.Connection, config: DredgeConfig) -> Non
             f"ON {table_name}(value, document_id)"
         )
 
-    for facet in config.scalar_facets:
+    for facet in (*config.scalar_facets, *config.sort_fields):
         connection.execute(
             f"CREATE INDEX {_quote_identifier(f'documents_{facet.name}_idx')} "
             f"ON documents({_quote_identifier(facet.name)}, id)"
@@ -1841,7 +2049,7 @@ def _create_indexes(connection: sqlite3.Connection, config: DredgeConfig) -> Non
 def _document_insert_sql(config: DredgeConfig) -> str:
     columns = ["id", "url", "title", "description"] + [
         facet.name for facet in config.scalar_facets
-    ] + [field.name for field in config.store_fields]
+    ] + [field.name for field in (*config.store_fields, *config.sort_fields)]
     placeholders = ", ".join("?" for _ in columns)
     sql_columns = ", ".join(_quote_identifier(column) for column in columns)
     return f"INSERT INTO documents ({sql_columns}) VALUES ({placeholders})"
@@ -1883,6 +2091,7 @@ def _queue_document_insert(
         document.scalar_facets.get(facet.name) for facet in config.scalar_facets
     )
     values.extend(document.store_fields.get(field.name) for field in config.store_fields)
+    values.extend(document.sort_fields.get(field.name) for field in config.sort_fields)
     batches.documents.append(tuple(values))
     batches.fts.append(
         (
@@ -2129,6 +2338,169 @@ def _extract_document(
     )
 
 
+def _count_records(path: Path) -> int:
+    with path.open(encoding="utf-8") as handle:
+        return sum(1 for line in handle if line.strip())
+
+
+def _iter_records(
+    config: DredgeConfig,
+) -> Iterator[tuple[ExtractedDocument, list[dict[str, Any]]]]:
+    """Yield ``(document, warning_records)`` for each line of a jsonl source.
+
+    A record is already structured, so nothing is extracted: each of its
+    sections is checked against the fields the config declares, and anything
+    undeclared fails the build rather than being silently dropped.
+    """
+    path = config.records_path
+    assert path is not None
+    seen_ids: dict[str, int] = {}
+    seen_urls: dict[str, int] = {}
+    document_id = 0
+    with path.open(encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            document_id += 1
+            where = f"{path}:{line_number}"
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise BuildError(
+                    "RECORD_INVALID", f"invalid JSON at {where}: {error.msg}", path=path
+                ) from error
+            sink = _DocumentWarnings()
+            document = _record_document(document_id, record, config, where, sink)
+            for seen, key, value in (
+                (seen_ids, "id", str(record["id"])),
+                (seen_urls, "url", document.url),
+            ):
+                if value in seen:
+                    raise BuildError(
+                        "RECORD_DUPLICATE",
+                        f"record {key} {value!r} at {where} repeats line {seen[value]}",
+                        path=path,
+                    )
+                seen[value] = line_number
+            yield document, sink.records
+
+
+def _record_document(
+    document_id: int,
+    record: Any,
+    config: DredgeConfig,
+    where: str,
+    warnings: _DocumentWarnings,
+) -> ExtractedDocument:
+    path = config.records_path
+    assert path is not None
+
+    def invalid(message: str) -> BuildError:
+        return BuildError("RECORD_INVALID", f"{message} at {where}", path=path)
+
+    if not isinstance(record, dict):
+        raise invalid("a record must be a JSON object")
+    unknown = sorted(set(record) - RECORD_KEYS)
+    if unknown:
+        raise invalid(f"unknown record key(s) {', '.join(unknown)}")
+    record_id = record.get("id")
+    if isinstance(record_id, bool) or not isinstance(record_id, (str, int)) or record_id == "":
+        raise invalid("record id must be a non-empty string or an integer")
+    url = record.get("url")
+    if not isinstance(url, str) or not url.strip():
+        raise invalid("record url must be a non-empty string")
+
+    def section(name: str, declared: Sequence[str]) -> dict[str, Any]:
+        value = record.get(name, {})
+        if not isinstance(value, dict):
+            raise invalid(f"record {name} must be an object")
+        undeclared = sorted(set(value) - set(declared))
+        if undeclared:
+            raise invalid(f"record {name} holds undeclared key(s) {', '.join(undeclared)}")
+        return value
+
+    fields = section("fields", [column.name for column in config.search_columns])
+    texts: dict[str, str] = {}
+    for column in config.search_columns:
+        text = fields.get(column.name)
+        if text is not None and not isinstance(text, str):
+            raise invalid(f"record fields.{column.name} must be a string")
+        texts[column.name] = _normalize_text(text or "")
+
+    title = texts["title"]
+    if not title:
+        title = url
+        warnings.add(
+            code="FIELD_MISSING",
+            message="record has no title; using URL as title",
+            path=path,
+            field="title",
+        )
+
+    def scalar(field: FacetConfig, value: Any) -> str | int | float | None:
+        if value is None:
+            if field.required:
+                raise BuildError(
+                    "FIELD_REQUIRED_MISSING",
+                    f"missing required field {field.source!r} at {where}",
+                    path=path,
+                    field=field.name,
+                )
+            return None
+        if field.type == "json":
+            return _json_text(value)
+        if isinstance(value, (dict, list)):
+            raise invalid(f"record {field.source} must be a single value")
+        text = str(value).lower() if isinstance(value, bool) else str(value)
+        return _coerce_scalar_facet(field, text, path)
+
+    facet_values = section("facets", [facet.name for facet in config.facets])
+    scalar_facets: dict[str, str | int | float | None] = {}
+    array_facets: dict[str, tuple[str, ...]] = {}
+    for facet in config.facets:
+        value = facet_values.get(facet.name)
+        if not facet.is_array:
+            scalar_facets[facet.name] = scalar(facet, value)
+            continue
+        items = [] if value is None else value if isinstance(value, list) else [value]
+        if not all(isinstance(item, str) for item in items):
+            raise invalid(f"record {facet.source} must be a string or an array of strings")
+        values = tuple(sorted({text for item in items if (text := _normalize_text(item))}))
+        if facet.required and not values:
+            raise BuildError(
+                "FACET_REQUIRED_MISSING",
+                f"missing required facet {facet.source!r} at {where}",
+                path=path,
+                field=facet.name,
+            )
+        array_facets[facet.name] = values
+
+    store_values = section("store", [field.name for field in config.store_fields])
+    sort_values = section("sort", [field.name for field in config.sort_fields])
+    return ExtractedDocument(
+        id=document_id,
+        url=url.strip(),
+        title=title,
+        description=None,
+        body=texts["body"],
+        search_columns={name: texts[name] for name in config.named_search_columns},
+        scalar_facets=scalar_facets,
+        array_facets=array_facets,
+        store_fields={
+            field.name: scalar(field, store_values.get(field.name))
+            for field in config.store_fields
+        },
+        sort_fields={
+            field.name: scalar(field, sort_values.get(field.name))
+            for field in config.sort_fields
+        },
+    )
+
+
+def _json_text(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
 def _remove_non_indexable_content(tree: HTMLParser) -> None:
     for tag in tree.css("script, style, noscript, template"):
         tag.decompose()
@@ -2222,6 +2594,18 @@ def _coerce_scalar_facet(
             selector=facet.source,
             value=value,
         )
+    if facet.type == "json":
+        try:
+            return _json_text(json.loads(value))
+        except ValueError as error:
+            raise BuildError(
+                "FACET_VALUE_INVALID",
+                f"invalid JSON value for field {facet.name!r} in {path}: {value!r}",
+                path=path,
+                field=facet.name,
+                selector=facet.source,
+                value=value,
+            ) from error
     if facet.type == "date":
         try:
             return date.fromisoformat(text).isoformat()
@@ -2474,8 +2858,9 @@ def _payload_search_column_stats(
         "fts5vocab('main', 'documents_fts', 'col')"
     )
     try:
+        # An index without positions counts no occurrences, only postings.
         counts = {
-            str(row[0]): (int(row[1]), int(row[2]), int(row[3]))
+            str(row[0]): (int(row[1]), int(row[2]), None if row[3] is None else int(row[3]))
             for row in connection.execute(
                 "SELECT col, COUNT(*), SUM(doc), SUM(cnt) "
                 "FROM temp.dredge_column_vocab GROUP BY col"

@@ -123,7 +123,7 @@ type ChannelMessage =
 
 const DEFAULT_RELAY_TIMEOUT_MS = 10_000;
 
-function lockName(sha: string): string {
+export function lockName(sha: string): string {
   return `dredge-leader-${sha}`;
 }
 

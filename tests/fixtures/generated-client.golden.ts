@@ -88,12 +88,29 @@ export interface DredgeCorrection {
   to: string[];
 }
 
+// One word of the reader's query, and the index terms it matched once Variant
+// Groups and corrections were applied, all folded the index's way.
+export interface DredgeResolvedTerm {
+  term: string;
+  // The reader's own term first, then its Variant Group, then its corrections.
+  forms: string[];
+  // Whether every form also matched as a prefix: the word still being typed.
+  prefix: boolean;
+}
+
 export interface DredgeSearchResponse {
   total: number;
   hits: DredgeResult[];
   facets?: Partial<Record<keyof DredgeFilters, DredgeFacetBucket[]>>;
   // Present only when at least one term was corrected.
   corrections?: DredgeCorrection[];
+  // Every term the reader typed outside a quoted phrase, resolved.
+  terms: DredgeResolvedTerm[];
+  // The reader's quoted phrases of more than one term, as term lists.
+  phrases: string[][];
+  // Phrases and `near()` groups an index without positions matched as all of
+  // their terms anywhere, for the client to verify. Present only when any are.
+  unverifiedPhrases?: string[][];
   elapsedMs: number;
 }
 
@@ -168,6 +185,7 @@ export type DredgeWorkerRequest =
   | { type: "init"; id: number; manifestUrl: string }
   | { type: "search"; id: number; request: DredgeSearchRequest }
   | { type: "suggest"; id: number; request: DredgeSuggestRequest }
+  | { type: "isCached"; id: number; manifestUrl: string }
   | { type: "destroy"; id: number };
 
 export type DredgeWorkerResponse =
@@ -175,6 +193,7 @@ export type DredgeWorkerResponse =
   | { type: "ready"; id: number }
   | { type: "searchResult"; id: number; response: DredgeSearchResponse }
   | { type: "suggestResult"; id: number; response: DredgeSuggestResponse }
+  | { type: "cachedResult"; id: number; cached: boolean }
   | { type: "error"; id?: number; error: DredgeError };
 
 export interface DredgeClientOptions {
@@ -186,7 +205,14 @@ export interface DredgeClientOptions {
 type PendingRequest =
   | { kind: "init"; resolve: () => void; reject: (error: DredgeClientError) => void }
   | { kind: "search"; resolve: (response: DredgeSearchResponse) => void; reject: (error: DredgeClientError) => void }
-  | { kind: "suggest"; resolve: (response: DredgeSuggestResponse) => void; reject: (error: DredgeClientError) => void };
+  | { kind: "suggest"; resolve: (response: DredgeSuggestResponse) => void; reject: (error: DredgeClientError) => void }
+  | { kind: "cached"; resolve: (cached: boolean) => void; reject: (error: DredgeClientError) => void };
+
+// The worker resolves URLs against its own location, so a page-relative
+// manifest URL is made absolute before it crosses over.
+function pageUrl(url: string): string {
+  return typeof location === "undefined" ? url : new URL(url, location.href).toString();
+}
 
 export class DredgeClientError extends Error {
   readonly code: DredgeErrorCode | string;
@@ -231,7 +257,7 @@ export class DredgeSearchClient {
 
   constructor(options: DredgeClientOptions = {}) {
     this.workerUrl = options.workerUrl ?? DEFAULT_WORKER_URL;
-    this.manifestUrl = options.manifestUrl ?? DEFAULT_MANIFEST_URL;
+    this.manifestUrl = pageUrl(options.manifestUrl ?? DEFAULT_MANIFEST_URL);
     this.workerFactory = options.workerFactory;
   }
 
@@ -332,6 +358,21 @@ export class DredgeSearchClient {
     });
   }
 
+  // Whether a usable database is already in OPFS (or open in another tab), so
+  // that searching would not download it. Downloads nothing itself.
+  isCached(): Promise<boolean> {
+    if (this.status === "ready") {
+      return Promise.resolve(true);
+    }
+    const worker = this.ensureWorker();
+    const id = this.allocateRequestId();
+    return new Promise<boolean>((resolve, reject) => {
+      this.pending.set(id, { kind: "cached", resolve, reject });
+      const message: DredgeWorkerRequest = { type: "isCached", id, manifestUrl: this.manifestUrl };
+      worker.postMessage(message);
+    });
+  }
+
   destroy(): void {
     if (this.worker) {
       const message: DredgeWorkerRequest = { type: "destroy", id: this.allocateRequestId() };
@@ -396,6 +437,15 @@ export class DredgeSearchClient {
         }
       }
       this.fail(message.error);
+      return;
+    }
+
+    if (message.type === "cachedResult") {
+      const pending = this.pending.get(message.id);
+      if (pending?.kind === "cached") {
+        this.pending.delete(message.id);
+        pending.resolve(message.cached);
+      }
       return;
     }
 

@@ -35,7 +35,7 @@ def test_compile_fixture_site_and_query_results(tmp_path: Path) -> None:
     )
     assert "range_required" not in result.manifest
     assert "range_block_bytes" not in result.manifest
-    assert result.manifest["db_schema_version"] == 3
+    assert result.manifest["db_schema_version"] == 4
 
     decompressed = brotli.decompress(result.compressed_db_path.read_bytes())
     assert decompressed == result.db_path.read_bytes()

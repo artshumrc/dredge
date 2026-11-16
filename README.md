@@ -53,7 +53,7 @@ Indexing a static site and wiring search into its pages is three steps:
    console.log(response.total, response.hits, response.facets);
    ```
 
-The first `search` call lazily boots the worker; there is no separate setup step. Subscribe with `client.onStatus(listener)` to observe boot progress (`downloading_db` → `opening_db` → `ready`); searches resolve once the status reaches `ready`. Rapid consecutive `search` calls coalesce latest-wins, so intermediate keystrokes never reach the worker.
+The first `search` call lazily boots the worker; there is no separate setup step. `client.isCached()` says, without downloading anything, whether the database is already in OPFS (or open in another tab), so a page can search only when that is cheap. To serve the compiled directory under another path, pass `workerUrl` and `manifestUrl` (`/bta/dredge/dredge-worker.js`); the worker finds its WASM beside itself. Subscribe with `client.onStatus(listener)` to observe boot progress (`downloading_db` → `opening_db` → `ready`); searches resolve once the status reaches `ready`. Rapid consecutive `search` calls coalesce latest-wins, so intermediate keystrokes never reach the worker.
 
 ## Configuration
 
@@ -118,7 +118,7 @@ Keys:
 - `search_weights`: bm25 weight per Search Column. Keys are `title`, `body`, or any name declared in `search_fields`; values are finite non-negative numbers. Defaults are `title` 10.0, `body` 1.0, and 1.0 for a named Search Column. Every extra Search Column costs roughly 16–20 bytes per document in the shipped index, which the payload report prices per column.
 - `boosts`: optional relevance multipliers per scalar Facet. Each entry declares exactly one shape: `values`, mapping Facet values to multipliers, or `recency`, a curve over a `date` Facet (`max`, the lift a page dated today receives, default 2.0; `half_life_days`, how fast that lift halves, default 730). Multipliers are finite and positive, and multiply rather than add — bm25 ranks are negative, so above 1 moves a page toward the front. Boosting is **ordering only**: the total, every Facet count, and each hit's `score` are unaffected, exact matches still lead their variants, and an explicit `sort` ignores boosts entirely. Boosting a Store Field, an array Facet, or an unknown field fails the build (`CONFIG_INVALID`).
 - `facets`: named fields extracted per page, indexed, filterable, and countable at query time. Supported types are `string`, `string_array`, `integer`, `number`, `boolean`, and `date`.
-- `store_fields`: named fields carried into search results but never indexed, filtered, or counted. Scalar types only — `string_array` must stay a Facet.
+- `store_fields`: named fields carried into search results but never indexed, filtered, or counted. Scalar types plus `json`, which returns whatever JSON was stored — `string_array` must stay a Facet.
 - `result_fields`: fields returned with each hit. May reference built-ins, Facets, and Store Fields.
 - `composite_indices`: optional Facet combinations to index together for common filters.
 - `client`: optional generated TypeScript client destination and worker URL.
@@ -126,8 +126,43 @@ Keys:
 - `variant_generation`: set to `false` to stop deriving Term Variants from the corpus's own terms. Defaults to `true`; turn it off for a corpus in a language the English stemmer does not serve.
 - `synonym_groups`: arrays of terms declared equivalent, merged into the generated groups. Members need not share a stem, so `["khufu", "cheops"]` works.
 - `suppressed_variants`: term pairs removed from the merged result, so an over-eager stem like `["statue", "status"]` never ships.
+- `index`: `{ "positions": false }` builds the index without word positions (FTS5 `detail=column`), a fraction of the bytes for a large body of text. See [Indexes without positions](#indexes-without-positions).
+- `source`: `{ "type": "jsonl", "path": "records.jsonl" }` reads structured records instead of HTML. See [Record input](#record-input).
 
 Every field has an explicit **role**. A Facet is indexed, filterable, and countable. A Store Field is carried into results but never indexed, filtered, or counted — use it for display-only data (image URLs, thumbnails) so it stops costing index bytes. Facets and Store Fields share one namespace; a name may not be both, and `result_fields` may reference either role. Filtering or counting on a Store Field fails loudly (`FILTER_INVALID`) rather than scanning the whole table.
+
+### Record input
+
+A site whose data is already structured can skip HTML. With a `jsonl` source each line of the file is one record:
+
+```json
+{ "id": "bta-1", "url": "/collection/bta-1",
+  "fields": { "title": "…", "corpus_title": "…", "body": "…" },
+  "facets": { "place": "Georgia", "curator_tags": ["schools"], "year_start": 1950 },
+  "sort": { "title_sort": "…" },
+  "store": { "thumb": "…", "pages": [1, 2, 3] } }
+```
+
+```json
+{
+  "source": { "type": "jsonl", "path": "records.jsonl" },
+  "output_dir": "search",
+  "search_fields": ["corpus_title"],
+  "search_weights": { "title": 3, "corpus_title": 2, "body": 1 },
+  "facets": { "place": { "type": "string" }, "curator_tags": { "type": "string_array" }, "year_start": { "type": "integer" } },
+  "sort_fields": { "title_sort": { "type": "string" } },
+  "store_fields": { "thumb": { "type": "string" }, "pages": { "type": "json" } }
+}
+```
+
+- `fields` holds the text of each Search Column: `title` and `body` always, and each name in `search_fields`, which for records is a list of names.
+- `facets`, `store_fields` and the record-only `sort_fields` take no `source`; a record's own section supplies the value. A Sort Field is indexed for ordering only, never filtered, counted, or searched.
+- Every key a record holds must be declared, and record `id`s and `url`s must be unique, or the build fails. `description` is always empty.
+- The HTML keys (`source_dir`, `base_url`, `include`, `exclude`, `selectors`, `allow_output_in_source`) are refused.
+
+### Indexes without positions
+
+`"index": { "positions": false }` keeps only which columns hold each term. Quoted phrases and `near()` then match as all of their terms anywhere, and the response lists each one in `unverifiedPhrases` for the page to verify against its own text. Ranking reads which columns a term appears in, weighted by Search Column and idf, since FTS5's `bm25()` scores every row 0 without positions.
 
 ## Query language
 
@@ -211,6 +246,14 @@ artifact:
 ```ts
 const response = await client.search({ query: "cartouchr limestone", correct: false });
 ```
+
+Every response also reports the query as the index read it, so a page matching text itself
+agrees with the match set: `terms` lists each word with the index terms it matched (`forms`:
+its own, its Variant Group's, its corrections') and whether it matched as a prefix, and
+`phrases` lists each quoted phrase as its terms. The client exports the index's tokenization
+to match with: `tokenize(text)` returns each term with its offsets, `normalize(text)` the
+terms alone (`normalize("Café TEACHERS")` is `cafe teachers`), and `stemVariant(term)` the
+stem the Compiler groups Term Variants by.
 
 A term can also be asked about rather than searched for. `client.suggest({ term, kind })`
 answers `"correction"` with the nearest terms by edit distance and `"completion"` with the
@@ -331,4 +374,4 @@ pnpm run vendor
 
 ## Vocabulary
 
-Project vocabulary is defined in `CONTEXT.md`. Use those terms when discussing Dredge internals: Facet, Store Field, Field, Field Role, Database Artifact, Boot, Manifest, Runtime, Compiler, Search Column, Boost, Term Variant (and Variant Group), Query AST, Correction, and Suggestion Context.
+Project vocabulary is defined in `CONTEXT.md`. Use those terms when discussing Dredge internals: Facet, Store Field, Sort Field, Field, Field Role, Record, Database Artifact, Boot, Manifest, Runtime, Compiler, Search Column, Boost, Term Variant (and Variant Group), Query AST, Correction, and Suggestion Context.

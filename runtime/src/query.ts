@@ -570,22 +570,31 @@ function ftsPrefixTerm(token: string): string {
   return `${ftsExactTerm(token)}*`;
 }
 
-function ftsPhrase(subterms: string[], termExpr: (token: string) => string): string {
-  return subterms.map(termExpr).join(" + ");
+// Without positions an index cannot test adjacency, so a phrase degrades to all
+// of its terms, parenthesised to stay one operand wherever it sits.
+function ftsPhrase(
+  subterms: string[],
+  termExpr: (token: string) => string,
+  positions: boolean,
+): string {
+  if (positions || subterms.length === 1) {
+    return subterms.map(termExpr).join(" + ");
+  }
+  return `(${subterms.map(termExpr).join(" AND ")})`;
 }
 
 // A catalogue identifier matches its compact spelling, its spaced spelling, and
 // its letter/digit split, so `G7510`, `G 7510` and `A644_NS` all find the same
 // record.
-function emitIdentifier(subterms: string[], prefix: boolean): string {
+function emitIdentifier(subterms: string[], prefix: boolean, positions: boolean): string {
   const termExpr = prefix ? ftsPrefixTerm : ftsExactTerm;
   const expressions = [termExpr(subterms.join(""))];
   if (subterms.length > 1) {
-    expressions.push(ftsPhrase(subterms, termExpr));
+    expressions.push(ftsPhrase(subterms, termExpr, positions));
   }
   const tokenParts = splitTokenParts(subterms);
   if (tokenParts.length > 1 && tokenParts.join("\0") !== subterms.join("\0")) {
-    expressions.push(ftsPhrase(tokenParts, termExpr));
+    expressions.push(ftsPhrase(tokenParts, termExpr, positions));
   }
   const deduped = [...new Set(expressions)];
   return deduped.length === 1 ? deduped[0] : `(${deduped.join(" OR ")})`;
@@ -603,17 +612,22 @@ export type VariantLookup = (term: string) => readonly string[] | undefined;
 // there, so a term reaching this lookup is already known to be correctable.
 export type CorrectionLookup = VariantLookup;
 
+// How a Query AST is emitted. `positions` is false for an index built without
+// word positions, which FTS5 refuses phrase and NEAR queries against.
+export interface EmitOptions {
+  widen?: VariantLookup;
+  correct?: CorrectionLookup;
+  positions?: boolean;
+}
+
 // FTS5 binds NOT tighter than AND, and AND tighter than OR, so a node is
 // parenthesised only where the emitted string would otherwise regroup.
-function emitOperand(
-  node: QueryNode,
-  looserThan: "and" | "not",
-  widen?: VariantLookup,
-  correct?: CorrectionLookup,
-): string {
+function emitOperand(node: QueryNode, looserThan: "and" | "not", options: EmitOptions): string {
   const needsParens =
-    node.kind === "or" || (looserThan === "not" && (node.kind === "and" || node.kind === "not"));
-  const emitted = emitNode(node, widen, correct);
+    node.kind === "or" ||
+    (looserThan === "not" && (node.kind === "and" || node.kind === "not")) ||
+    (node.kind === "near" && options.positions === false);
+  const emitted = emitNode(node, options);
   return needsParens ? `(${emitted})` : emitted;
 }
 
@@ -625,8 +639,7 @@ function emitOperand(
 // the query, not of the forms it widened to.
 function emitTerm(
   node: Extract<QueryNode, { kind: "term" }>,
-  widen?: VariantLookup,
-  correct?: CorrectionLookup,
+  { widen, correct }: EmitOptions,
 ): string {
   const termExpr = node.prefix ? ftsPrefixTerm : ftsExactTerm;
   const widened = node.wideable
@@ -638,29 +651,34 @@ function emitTerm(
   return `(${[node.value, ...widened].map(termExpr).join(" OR ")})`;
 }
 
-function emitNode(node: QueryNode, widen?: VariantLookup, correct?: CorrectionLookup): string {
+function emitNode(node: QueryNode, options: EmitOptions): string {
+  const positions = options.positions ?? true;
   switch (node.kind) {
     case "term":
-      return emitTerm(node, widen, correct);
+      return emitTerm(node, options);
     case "identifier":
-      return emitIdentifier(node.subterms, node.prefix);
+      return emitIdentifier(node.subterms, node.prefix, positions);
     case "phrase":
-      return ftsPhrase(node.terms, ftsExactTerm);
-    case "near":
-      return `NEAR(${node.children.map((child) => emitNode(child)).join(" ")}, ${node.distance})`;
+      return ftsPhrase(node.terms, ftsExactTerm, positions);
+    case "near": {
+      const operands = node.children.map((child) => emitNode(child, { positions }));
+      return positions
+        ? `NEAR(${operands.join(" ")}, ${node.distance})`
+        : operands.join(" AND ");
+    }
     case "scoped":
-      return `{${node.column}}:${emitOperand(node.child, "not", widen, correct)}`;
+      return `{${node.column}}:${emitOperand(node.child, "not", options)}`;
     case "and":
-      return node.children.map((child) => emitOperand(child, "and", widen, correct)).join(" AND ");
+      return node.children.map((child) => emitOperand(child, "and", options)).join(" AND ");
     case "or":
-      return node.children.map((child) => emitNode(child, widen, correct)).join(" OR ");
+      return node.children.map((child) => emitNode(child, options)).join(" OR ");
     case "not":
       // An exclusion widens through its Variant Group as any term does, but is
       // never corrected: a guess at a word the index lacks must not be able to
       // remove pages the reader asked for.
       return (
-        `${emitOperand(node.left, "not", widen, correct)} ` +
-        `NOT ${emitOperand(node.right, "not", widen)}`
+        `${emitOperand(node.left, "not", options)} ` +
+        `NOT ${emitOperand(node.right, "not", { ...options, correct: undefined })}`
       );
   }
 }
@@ -669,12 +687,8 @@ function emitNode(node: QueryNode, widen?: VariantLookup, correct?: CorrectionLo
 // supplied lookups give it: with neither `widen` nor `correct` the expression is
 // the reader's own terms and nothing else, which is the narrowest width the
 // banding probes evaluate.
-export function emitMatchExpression(
-  node: QueryNode,
-  widen?: VariantLookup,
-  correct?: CorrectionLookup,
-): string {
-  return emitNode(node, widen, correct);
+export function emitMatchExpression(node: QueryNode, options: EmitOptions = {}): string {
+  return emitNode(node, options);
 }
 
 export function buildMatchExpression(
@@ -684,5 +698,5 @@ export function buildMatchExpression(
   correct?: CorrectionLookup,
 ): string | null {
   const node = parseQuery(query, columns);
-  return node === null ? null : emitMatchExpression(node, widen, correct);
+  return node === null ? null : emitMatchExpression(node, { widen, correct });
 }
