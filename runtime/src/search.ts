@@ -1,8 +1,15 @@
 import type { Exec } from "./db";
 import type { DredgeMarks, MarkForms } from "./highlight";
 import { foldTerm, markFields, markForms } from "./highlight";
-import type { CorrectionLookup, ParseQueryOptions, QueryNode, VariantLookup } from "./query";
+import type {
+  CorrectionLookup,
+  EmitOptions,
+  ParseQueryOptions,
+  QueryNode,
+  VariantLookup,
+} from "./query";
 import { emitMatchExpression, ftsExactTerm, parseQuery } from "./query";
+import { normalize } from "./tokenize";
 
 export { buildMatchExpression, emitMatchExpression, parseQuery } from "./query";
 export type { CorrectionLookup, QueryNode, VariantLookup } from "./query";
@@ -52,8 +59,17 @@ export interface DredgeFacetBucket {
   count: number;
 }
 
+// A Store Field of type `json` comes back as whatever JSON the Compiler stored.
+export type DredgeJsonValue =
+  | string
+  | number
+  | boolean
+  | null
+  | DredgeJsonValue[]
+  | { [key: string]: DredgeJsonValue };
+
 export interface DredgeHit {
-  [field: string]: string | number | boolean | null | DredgeMarks | undefined;
+  [field: string]: DredgeJsonValue | DredgeMarks | undefined;
   // Where the reader's terms — including the variants that actually matched —
   // fall in this hit's text fields. Absent when nothing matched, and never
   // markup: the consumer renders the spans into its own DOM.
@@ -70,12 +86,32 @@ export interface DredgeCorrection {
   to: string[];
 }
 
+// One word of the reader's query, and the index terms it matched once Variant
+// Groups and corrections were applied, all folded the index's way. A client
+// matching text itself (`tokenize`) can then agree with the match set.
+export interface DredgeResolvedTerm {
+  term: string;
+  // The reader's own term first, then its Variant Group, then its corrections.
+  forms: string[];
+  // Whether every form also matched as a prefix: the word still being typed.
+  prefix: boolean;
+}
+
 export interface DredgeSearchResponse {
   total: number;
   hits: DredgeHit[];
   facets?: Record<string, DredgeFacetBucket[]>;
   // Present only when at least one term was corrected.
   corrections?: DredgeCorrection[];
+  // Every term the reader typed outside a quoted phrase, resolved. Excluded
+  // terms are left out: they are not why a hit matched.
+  terms: DredgeResolvedTerm[];
+  // The reader's quoted phrases of more than one term, as term lists.
+  phrases: string[][];
+  // Phrases and `near()` groups an index built without positions matched as
+  // all of their terms anywhere, so their hits are candidates the client must
+  // verify. Present only when there are any.
+  unverifiedPhrases?: string[][];
   elapsedMs: number;
 }
 
@@ -118,7 +154,7 @@ export class DredgeQueryError extends Error {
 }
 
 interface FieldInfo {
-  role: "facet" | "store";
+  role: "facet" | "store" | "sort";
   type: string;
 }
 
@@ -165,6 +201,10 @@ export interface SchemaInfo {
   // declared none. Read unconditionally: the compiler writes the table into
   // every artifact, and an older one is refused at Boot on its schema version.
   boosts: Boost[];
+  // False for an index built without word positions (`detail=column`), which
+  // cannot evaluate phrases or `near()` and whose bm25() is always zero.
+  positions: boolean;
+  documentCount: number;
 }
 
 function quoteIdentifier(name: string): string {
@@ -181,7 +221,7 @@ export function introspectSchema(exec: Exec): SchemaInfo {
   const fieldRows = exec("SELECT name, role, type FROM dredge_fields ORDER BY name");
   for (const row of fieldRows) {
     const role = String(row[1]);
-    if (role !== "facet" && role !== "store") {
+    if (role !== "facet" && role !== "store" && role !== "sort") {
       throw new DredgeQueryError(
         "QUERY_INVALID",
         `Database field ${String(row[0])} has invalid role ${role}.`,
@@ -207,6 +247,10 @@ export function introspectSchema(exec: Exec): SchemaInfo {
     `SELECT name, weight FROM ${SEARCH_COLUMNS_TABLE} ORDER BY position`,
   ).map((row) => ({ name: String(row[0]), weight: Number(row[1]) }));
 
+  const ftsSql = String(
+    exec("SELECT sql FROM sqlite_master WHERE name = 'documents_fts'")[0]?.[0] ?? "",
+  );
+
   return {
     scalarColumns,
     arrayFacets,
@@ -215,6 +259,8 @@ export function introspectSchema(exec: Exec): SchemaInfo {
     hasTermVariants: variantTable.length > 0,
     searchColumns,
     boosts: readBoosts(exec),
+    positions: !/\bdetail\s*=\s*'?column/i.test(ftsSql),
+    documentCount: Number(exec("SELECT count(*) FROM documents")[0]?.[0] ?? 0),
   };
 }
 
@@ -559,6 +605,120 @@ interface MatchPlan {
   // The surface forms to mark on each hit — the reader's own terms plus whatever
   // widening added, so the marking cannot contradict the match set.
   markForms: MarkForms;
+  // Without positions, the expressions relevance is scored over (see
+  // `positionlessRank`); empty for an index with positions.
+  rankUnits: string[];
+  resolved: ResolvedQuery;
+}
+
+interface ResolvedQuery {
+  terms: DredgeResolvedTerm[];
+  phrases: string[][];
+  unverifiedPhrases: string[][];
+}
+
+function words(values: string[]): string[] {
+  return values.map(normalize).filter((value) => value.length > 0);
+}
+
+// The reader's query as index terms, so a client can match text exactly as the
+// index matched it. Mirrors the shapes the emitter widens: only wideable terms
+// take variants and corrections, and nothing right of an exclusion counts.
+function resolveQuery(
+  node: QueryNode,
+  options: EmitOptions,
+  resolved: ResolvedQuery = { terms: [], phrases: [], unverifiedPhrases: [] },
+): ResolvedQuery {
+  const addTerm = (value: string, prefix: boolean, widened: readonly string[] = []) => {
+    const term = normalize(value);
+    if (!term) {
+      return;
+    }
+    const existing = resolved.terms.find((entry) => entry.term === term && entry.prefix === prefix);
+    const forms = existing?.forms ?? [term];
+    for (const form of widened.map(normalize)) {
+      if (form && !forms.includes(form)) {
+        forms.push(form);
+      }
+    }
+    if (!existing) {
+      resolved.terms.push({ term, forms, prefix });
+    }
+  };
+  switch (node.kind) {
+    case "term":
+      addTerm(
+        node.value,
+        node.prefix,
+        node.wideable
+          ? [...(options.widen?.(node.value) ?? []), ...(options.correct?.(node.value) ?? [])]
+          : [],
+      );
+      break;
+    case "identifier":
+      addTerm(node.subterms.join(""), node.prefix);
+      break;
+    case "phrase": {
+      const terms = words(node.terms);
+      if (terms.length === 1) {
+        addTerm(terms[0], false);
+      } else if (terms.length > 1) {
+        resolved.phrases.push(terms);
+        if (options.positions === false) {
+          resolved.unverifiedPhrases.push(terms);
+        }
+      }
+      break;
+    }
+    case "near": {
+      for (const child of node.children) {
+        resolveQuery(child, { positions: options.positions }, resolved);
+      }
+      if (options.positions === false) {
+        const operands = node.children.flatMap((child) =>
+          child.kind === "phrase" ? child.terms : child.kind === "term" ? [child.value] : [],
+        );
+        resolved.unverifiedPhrases.push(words(operands));
+      }
+      break;
+    }
+    case "scoped":
+      resolveQuery(node.child, options, resolved);
+      break;
+    case "and":
+    case "or":
+      for (const child of node.children) {
+        resolveQuery(child, options, resolved);
+      }
+      break;
+    case "not":
+      resolveQuery(node.left, options, resolved);
+      break;
+  }
+  return resolved;
+}
+
+// The expressions an index without positions scores relevance over: one per
+// positive leaf, emitted at full width, with a phrase or `near()` contributing
+// each of its words. A `field:` scope stays on its unit so the column filters
+// applied at scoring intersect with it.
+function rankUnits(node: QueryNode, options: EmitOptions, scope = ""): string[] {
+  switch (node.kind) {
+    case "term":
+    case "identifier":
+      return [`${scope}(${emitMatchExpression(node, options)})`];
+    case "phrase":
+      return node.terms.map((term) => `${scope}${ftsExactTerm(term)}`);
+    case "near":
+      return node.children.flatMap((child) => rankUnits(child, { positions: false }, scope));
+    case "scoped":
+      return rankUnits(node.child, options, `{${node.column}}:`);
+    case "and":
+    case "or":
+      return node.children.flatMap((child) => rankUnits(child, options, scope));
+    case "not":
+      return rankUnits(node.left, options, scope);
+  }
 }
 
 interface PlanMatchOptions extends ParseQueryOptions {
@@ -585,9 +745,10 @@ function planMatch(
   if (node === null) {
     return null;
   }
-  const exactExpr = emitMatchExpression(node);
+  const positions = schema.positions;
+  const exactExpr = emitMatchExpression(node, { positions });
   const widen = schema.hasTermVariants ? variantLookup(exec) : undefined;
-  const variantExpr = widen ? emitMatchExpression(node, widen) : exactExpr;
+  const variantExpr = widen ? emitMatchExpression(node, { widen, positions }) : exactExpr;
   const planned = (options.correct ?? true) ? planCorrections(exec, node) : [];
   // Usually the two widenings touch different terms, Variant Groups being keyed
   // on terms the index holds. A group member declared in config but absent from
@@ -596,12 +757,15 @@ function planMatch(
   const byTerm = new Map(planned.map((correction) => [correction.term, correction.to]));
   const correct: CorrectionLookup | undefined =
     byTerm.size > 0 ? (term) => byTerm.get(foldTerm(term)) : undefined;
+  const full: EmitOptions = { widen, correct, positions };
   return {
     exactExpr,
     variantExpr: variantExpr === exactExpr ? null : variantExpr,
-    matchExpr: correct ? emitMatchExpression(node, widen, correct) : variantExpr,
+    matchExpr: correct ? emitMatchExpression(node, full) : variantExpr,
     corrections: planned,
     markForms: markForms(node, widen, correct),
+    rankUnits: positions ? [] : [...new Set(rankUnits(node, full))],
+    resolved: resolveQuery(node, full),
   };
 }
 
@@ -656,16 +820,19 @@ function bandExpression(
 function createMatchTable(
   exec: Exec,
   schema: SchemaInfo,
-  matchExpr: string,
+  plan: Pick<MatchPlan, "matchExpr" | "exactExpr" | "variantExpr" | "rankUnits">,
   rank: boolean,
-  exactExpr: string,
-  variantExpr: string | null,
 ): void {
+  const { matchExpr, exactExpr, variantExpr } = plan;
   const rankColumns: string[] = [];
   const bind: unknown[] = [];
   if (rank) {
-    const weights = schema.searchColumns.map((column) => column.weight).join(", ");
-    rankColumns.push(`bm25(documents_fts, ${weights}) AS rank`);
+    if (schema.positions) {
+      const weights = schema.searchColumns.map((column) => column.weight).join(", ");
+      rankColumns.push(`bm25(documents_fts, ${weights}) AS rank`);
+    } else {
+      rankColumns.push(positionlessRank(exec, schema, plan.rankUnits, bind));
+    }
     rankColumns.push(bandExpression(matchExpr, exactExpr, variantExpr, bind));
   }
   const scalarColumns = schema.scalarColumns.map((name) => `d.${quoteIdentifier(name)}`);
@@ -678,6 +845,39 @@ function createMatchTable(
       `WHERE documents_fts MATCH ?`,
     bind,
   );
+}
+
+// FTS5's bm25() reads term frequencies by re-tokenizing a row's text, which a
+// contentless index without positions does not have, so it scores every row 0.
+// This stands in for it with what such an index does hold — which columns each
+// term appears in — scoring a row as the sum, over the query's units, of the
+// unit's bm25 idf times the weights of the columns it appears in. Ranks stay
+// negative, best first, as bm25's are.
+function positionlessRank(
+  exec: Exec,
+  schema: SchemaInfo,
+  units: string[],
+  bind: unknown[],
+): string {
+  const total = schema.documentCount;
+  const parts: string[] = [];
+  for (const unit of units) {
+    const matching = Number(
+      exec("SELECT count(*) FROM documents_fts WHERE documents_fts MATCH ?", [unit])[0]?.[0] ?? 0,
+    );
+    // bm25()'s own idf, floored as FTS5 floors it so a very common term still
+    // ranks a little rather than not at all.
+    const idf = Math.max(1e-6, Math.log((total - matching + 0.5) / (matching + 0.5)));
+    for (const column of schema.searchColumns) {
+      if (column.weight > 0) {
+        parts.push(
+          "? * (f.rowid IN (SELECT rowid FROM documents_fts WHERE documents_fts MATCH ?))",
+        );
+        bind.push(idf * column.weight, `{${column.name}}:(${unit})`);
+      }
+    }
+  }
+  return parts.length > 0 ? `-(${parts.join(" + ")}) AS rank` : "0 AS rank";
 }
 
 interface Aggregate {
@@ -819,7 +1019,11 @@ function computeHits(
   return hitRows.map((row) => {
     const hit: DredgeHit = {};
     columns.forEach((name, index) => {
-      hit[name] = row[index] as string | number | boolean | null;
+      const value = row[index] as string | number | boolean | null;
+      hit[name] =
+        typeof value === "string" && schema.fields.get(name)?.type === "json"
+          ? (JSON.parse(value) as DredgeJsonValue)
+          : value;
     });
     hit.score = usesRank ? Number(row[columns.length]) : 0;
     // 0 is both "matched the reader's own words" and "no banding ran" — the same
@@ -833,6 +1037,20 @@ function computeHits(
     }
     return hit;
   });
+}
+
+function resolvedFields(
+  plan: MatchPlan | null,
+): Pick<DredgeSearchResponse, "terms" | "phrases" | "unverifiedPhrases"> {
+  if (!plan) {
+    return { terms: [], phrases: [] };
+  }
+  const { terms, phrases, unverifiedPhrases } = plan.resolved;
+  return {
+    terms,
+    phrases,
+    ...(unverifiedPhrases.length > 0 ? { unverifiedPhrases } : {}),
+  };
 }
 
 // Stateless single-pass search: materialize the match, read total/hits/facets,
@@ -857,12 +1075,12 @@ export function search(
     // directly from the documents table as before.
     const { total, facets } = computeAggregate(exec, schema, request, false);
     const hits = computeHits(exec, schema, request, false, []);
-    return { total, hits, facets, elapsedMs: performance.now() - started };
+    return { total, hits, facets, ...resolvedFields(null), elapsedMs: performance.now() - started };
   }
 
   // Single-pass: evaluate the FTS match exactly once into a temp table, then
   // read the count, hits page, and all facet counts from it.
-  createMatchTable(exec, schema, plan.matchExpr, !request.sort, plan.exactExpr, plan.variantExpr);
+  createMatchTable(exec, schema, plan, !request.sort);
   try {
     const { total, facets } = computeAggregate(exec, schema, request, true);
     const hits = computeHits(exec, schema, request, true, plan.markForms);
@@ -871,6 +1089,7 @@ export function search(
       hits,
       facets,
       ...(plan.corrections.length > 0 ? { corrections: plan.corrections } : {}),
+      ...resolvedFields(plan),
       elapsedMs: performance.now() - started,
     };
   } finally {
@@ -1264,6 +1483,7 @@ export class SearchSession {
     rank: boolean;
     exactExpr: string;
     variantExpr: string | null;
+    rankUnits: string;
   } | null = null;
   private readonly aggregateCache = new Lru<Aggregate>(AGGREGATE_CACHE_SIZE);
   private readonly responseCache = new Lru<DredgeSearchResponse>(RESPONSE_CACHE_SIZE);
@@ -1309,17 +1529,22 @@ export class SearchSession {
       l: Math.max(0, request.limit ?? 20),
       o: Math.max(0, request.offset ?? 0),
       s: canonicalSort(request.sort),
+      ...(plan?.rankUnits.length ? { r: plan.rankUnits } : {}),
     });
+    // Two inputs can emit the same expressions yet resolve differently (a
+    // quoted phrase and a `near()` without positions), so the resolved query is
+    // taken from this request's plan rather than from the cache.
+    const resolved = resolvedFields(plan);
     const cached = this.responseCache.get(responseKey);
     if (cached) {
       // Exact repeat: no SQLite touched. Every field is the cached response's;
       // only elapsedMs reflects this (serving) request.
-      return { ...cached, elapsedMs: performance.now() - started };
+      return { ...cached, ...resolved, elapsedMs: performance.now() - started };
     }
 
     const usesFts = plan !== null;
     if (plan) {
-      this.ensureMatchTable(plan.matchExpr, !request.sort, plan.exactExpr, plan.variantExpr);
+      this.ensureMatchTable(plan, !request.sort);
     }
 
     let aggregate: Aggregate;
@@ -1345,6 +1570,7 @@ export class SearchSession {
       hits,
       facets: aggregate.facets,
       ...(plan && plan.corrections.length > 0 ? { corrections: plan.corrections } : {}),
+      ...resolved,
       elapsedMs: performance.now() - started,
     };
     this.responseCache.set(responseKey, response);
@@ -1434,23 +1660,21 @@ export class SearchSession {
     }
   }
 
-  private ensureMatchTable(
-    matchExpr: string,
-    rank: boolean,
-    exactExpr: string,
-    variantExpr: string | null,
-  ): void {
+  private ensureMatchTable(plan: MatchPlan, rank: boolean): void {
+    const { matchExpr, exactExpr, variantExpr } = plan;
+    const rankUnits = plan.rankUnits.join("\0");
     if (
       this.matchState &&
       this.matchState.matchExpr === matchExpr &&
       this.matchState.rank === rank &&
       this.matchState.exactExpr === exactExpr &&
-      this.matchState.variantExpr === variantExpr
+      this.matchState.variantExpr === variantExpr &&
+      this.matchState.rankUnits === rankUnits
     ) {
       return;
     }
-    createMatchTable(this.exec, this.schema, matchExpr, rank, exactExpr, variantExpr);
-    this.matchState = { matchExpr, rank, exactExpr, variantExpr };
+    createMatchTable(this.exec, this.schema, plan, rank);
+    this.matchState = { matchExpr, rank, exactExpr, variantExpr, rankUnits };
   }
 }
 

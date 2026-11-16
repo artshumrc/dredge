@@ -15,7 +15,9 @@
     "src/query.ts",
     "src/search-worker.ts",
     "src/search.ts",
+    "src/tokenize.ts",
+    "src/unicode61.ts",
     "src/worker.ts"
   ],
-  "hash": "8ad6174344bc8390d37fbfcdd220e9bf4e7d17aea1d3a249dc1cf67859b5626f"
+  "hash": "9135bb012d6c9b75df55f9c08aa846e4a14318ba81668e90e302409b16a48bde"
 }

@@ -16,11 +16,16 @@ import type {
   DredgeSuggestResponse,
 } from "./search";
 
+export { normalize, stemVariant, tokenize } from "./tokenize";
+export type { DredgeToken } from "./tokenize";
+
 export type {
   DredgeFilters,
   DredgeFilterValue,
   DredgeRange,
   DredgeHit,
+  DredgeJsonValue,
+  DredgeResolvedTerm,
   DredgeCorrection,
   DredgeFacetBucket,
   DredgeSearchRequest,
@@ -57,6 +62,7 @@ type WorkerResponse =
   | { type: "ready"; id: number }
   | { type: "searchResult"; id: number; response: DredgeSearchResponse }
   | { type: "suggestResult"; id: number; response: DredgeSuggestResponse }
+  | { type: "cachedResult"; id: number; cached: boolean }
   | { type: "error"; id?: number; error: DredgeError };
 
 export class DredgeClientError extends Error {
@@ -71,9 +77,13 @@ export class DredgeClientError extends Error {
 }
 
 export interface DredgeClientOptions {
-  /** URL of the bundled Dredge worker script. Defaults to /search/dredge-worker.js */
+  /**
+   * URL of the bundled Dredge worker script. Defaults to /search/dredge-worker.js.
+   * The worker loads its WASM from beside itself, so serving the compiled
+   * directory under any base path needs only this and `manifestUrl`.
+   */
   workerUrl?: string | URL;
-  /** URL of the search manifest JSON. Defaults to /search/search-manifest.json */
+  /** URL of the search manifest JSON, relative to the page. Defaults to /search/search-manifest.json */
   manifestUrl?: string;
   /** Force re-download/import of the database even if cached in OPFS. */
   reset?: boolean;
@@ -93,7 +103,14 @@ type Pending =
       suggestKind: DredgeSuggestKind;
       resolve: (response: DredgeSuggestResponse) => void;
       reject: (error: DredgeClientError) => void;
-    };
+    }
+  | { kind: "cached"; resolve: (cached: boolean) => void; reject: (error: DredgeClientError) => void };
+
+// The worker resolves URLs against its own location, so a page-relative
+// manifest URL is made absolute before it crosses over.
+function pageUrl(url: string): string {
+  return typeof location === "undefined" ? url : new URL(url, location.href).toString();
+}
 
 /**
  * Headless Dredge search client.
@@ -120,7 +137,7 @@ export class DredgeSearchClient {
 
   constructor(options: DredgeClientOptions = {}) {
     this.workerUrl = options.workerUrl ?? DEFAULT_WORKER_URL;
-    this.manifestUrl = options.manifestUrl ?? DEFAULT_MANIFEST_URL;
+    this.manifestUrl = pageUrl(options.manifestUrl ?? DEFAULT_MANIFEST_URL);
     this.reset = options.reset ?? false;
     this.workerFactory = options.workerFactory;
   }
@@ -195,6 +212,22 @@ export class DredgeSearchClient {
     });
   }
 
+  /**
+   * Whether a usable database is already in OPFS (or open in another tab), so
+   * that searching would not download it. Downloads nothing itself.
+   */
+  isCached(): Promise<boolean> {
+    if (this.statusValue === "ready") {
+      return Promise.resolve(true);
+    }
+    const worker = this.ensureWorker();
+    const id = this.nextId++;
+    return new Promise<boolean>((resolve, reject) => {
+      this.pending.set(id, { kind: "cached", resolve, reject });
+      worker.postMessage({ type: "isCached", id, manifestUrl: this.manifestUrl });
+    });
+  }
+
   /** Tear down the worker and reject all pending work. */
   destroy(): void {
     if (this.worker) {
@@ -253,6 +286,14 @@ export class DredgeSearchClient {
       if (pending?.kind === "suggest") {
         this.pending.delete(message.id);
         pending.resolve(message.response);
+      }
+      return;
+    }
+    if (message.type === "cachedResult") {
+      const pending = this.pending.get(message.id);
+      if (pending?.kind === "cached") {
+        this.pending.delete(message.id);
+        pending.resolve(message.cached);
       }
       return;
     }

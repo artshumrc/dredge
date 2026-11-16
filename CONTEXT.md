@@ -15,8 +15,14 @@ _Avoid_: result-only facet, display field
 **Field**:
 The umbrella for facets and store fields. All fields share one namespace; a name collision between `facets` and `store_fields` is a config error.
 
+**Sort Field**:
+A field a Record carries only to be ordered by: indexed for sorting, never filtered, counted, or searched.
+
 **Field Role**:
-Whether a field is a `facet` or a `store` field, recorded in the shipped database's `dredge_fields` table so the runtime enforces it.
+Whether a field is a `facet`, `store` or `sort` field, recorded in the shipped database's `dredge_fields` table so the runtime enforces it.
+
+**Record**:
+One line of a `jsonl` source: a document already split into Search Column text, Facets, Sort Fields and Store Fields, compiled without HTML extraction.
 
 **Database Artifact**:
 The single SQLite database Dredge ships (body FTS included). A cold visitor downloads, verifies, and persists it to OPFS; a warm visitor reopens the OPFS copy directly. When OPFS is unavailable or over quota it opens in WASM memory for that session instead.
@@ -43,7 +49,7 @@ A multiplier a site declares over one of its scalar Facets, applied to the relev
 _Avoid_: score, ranking factor — a boost changes order, not what a hit reports as its `score`.
 
 **Term Variant**:
-A compiled equivalence between two surface forms in the corpus, so that a query for one matches the other. A **Variant Group** is the full set a term belongs to. Groups are derived at build time from the index's own terms and written to `dredge_term_variants`, keyed on the surface form so no stemmer ships to the browser.
+A compiled equivalence between two surface forms in the corpus, so that a query for one matches the other. A **Variant Group** is the full set a term belongs to. Groups are derived at build time from the index's own terms and written to `dredge_term_variants`, keyed on the surface form so search never stems in the browser. The client exports `stemVariant` only for pages matching text themselves.
 _Avoid_: stem, synonym, correction — the first two are *sources* of term variants, and a correction is a query-time guess at a word the index does not hold at all.
 
 **Query AST**:

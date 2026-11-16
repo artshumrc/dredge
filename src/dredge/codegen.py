@@ -112,6 +112,7 @@ def _sort_field_union(config: DredgeConfig) -> str:
     fields = _unique(
         ("id", "url", "title", "description")
         + tuple(facet.name for facet in config.scalar_facets)
+        + tuple(field.name for field in config.sort_fields)
     )
     return "\n".join(f"  | {json.dumps(field)}" for field in fields)
 
@@ -163,6 +164,8 @@ def _result_field_type(config: DredgeConfig, field: str) -> tuple[bool, str]:
         return True, "boolean"
     if facet.type == "string_array":
         return True, "string[]"
+    if facet.type == "json":
+        return True, "unknown"
     raise BuildError("CONFIG_INVALID", f"unsupported result field for codegen: {field}")
 
 

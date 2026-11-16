@@ -6,6 +6,9 @@ All notable changes to Dredge are documented here. This project adheres to
 
 ## Unreleased
 
+- The Compiler reads structured JSONL records (`source.type: "jsonl"`), with `sort_fields` and a `json` Store Field type; `index.positions: false` builds a far smaller index whose phrases come back in `unverifiedPhrases`.
+- Responses carry the resolved `terms` and `phrases`, and the client exports `tokenize`, `normalize`, `stemVariant` and `isCached()`; artifacts are schema version 4, so recompile.
+
 ## 0.4.0 — 2026-09-04
 
 ### A misspelled word finds the pages that hold the right one

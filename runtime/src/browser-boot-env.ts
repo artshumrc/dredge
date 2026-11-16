@@ -3,11 +3,46 @@
 import sqlite3InitModule from "@sqlite.org/sqlite-wasm";
 
 import type { BootEnv, PoolLike } from "./db";
+import { lockName } from "./coordination";
 import type { BroadcastChannelLike, CoordinationEnv, LockManagerLike } from "./coordination";
 
 // Name of the OPFS SAH pool VFS. Files imported into the pool live under this
 // namespace inside OPFS.
 const VFS_NAME = "dredge-sahpool";
+
+// Where the SAH pool keeps its files, and how long the path header at the start
+// of each one is. Both are the pool's persistent on-disk format.
+const POOL_FILES = [`.${VFS_NAME}`, ".opaque"];
+const POOL_PATH_BYTES = 512;
+
+// Read the pool's file headers directly rather than installing the pool, which
+// would take every file's exclusive access handle away from the tab that leads.
+async function poolHolds(path: string): Promise<boolean> {
+  let directory = await navigator.storage.getDirectory();
+  try {
+    for (const name of POOL_FILES) {
+      directory = await directory.getDirectoryHandle(name);
+    }
+  } catch {
+    return false;
+  }
+  const expected = new TextEncoder().encode(path);
+  for await (const handle of (directory as any).values() as AsyncIterable<FileSystemHandle>) {
+    if (handle.kind !== "file") {
+      continue;
+    }
+    try {
+      const file = await (handle as FileSystemFileHandle).getFile();
+      const header = new Uint8Array(await file.slice(0, POOL_PATH_BYTES).arrayBuffer());
+      if (header[expected.length] === 0 && expected.every((byte, index) => header[index] === byte)) {
+        return true;
+      }
+    } catch {
+      // A file another context holds open cannot be read; it is not ours.
+    }
+  }
+  return false;
+}
 
 function canUseSyncAccessHandles(): boolean {
   // The persistent OPFS path requires synchronous access handles inside a
@@ -45,6 +80,19 @@ export const browserBootEnv: BootEnv = {
       return navigator.storage.estimate();
     }
     return Promise.resolve(undefined);
+  },
+  async hasPersisted(path, sha256) {
+    // A leader for this database means another tab already serves it, so a
+    // search here relays to it and downloads nothing.
+    const locks = (navigator as unknown as { locks?: LockManager }).locks;
+    const held = await locks?.query().catch(() => undefined);
+    if (held?.held?.some((lock) => lock.name === lockName(sha256))) {
+      return true;
+    }
+    if (!canUseSyncAccessHandles()) {
+      return false;
+    }
+    return poolHolds(path);
   },
 };
 

@@ -3,7 +3,7 @@
 import type { BootTimings, DredgeError, DredgeManifest, DredgeStatus } from "./protocol";
 
 const MANIFEST_VERSION = 1;
-const DB_SCHEMA_VERSION = 3;
+const DB_SCHEMA_VERSION = 4;
 
 export type StatusFn = (status: DredgeStatus, detail?: string) => void;
 
@@ -41,6 +41,10 @@ export interface BootEnv {
   // resolves without a numeric `quota`, the preflight is skipped and the OPFS
   // import proceeds as before.
   estimateStorage?(): Promise<StorageEstimateLike | undefined>;
+  // Whether a usable copy of the database is already at `path` in OPFS, or held
+  // open by another tab, decided without installing the pool. Optional: absent,
+  // nothing is ever reported cached.
+  hasPersisted?(path: string, sha256: string): Promise<boolean>;
 }
 
 export class WorkerError extends Error {
@@ -242,6 +246,23 @@ export async function loadValidatedManifest(
   const manifest = await fetchManifest(env, manifestUrl);
   validateManifest(manifest);
   return manifest;
+}
+
+// Whether booting would open a cached database rather than download one. Never
+// downloads the database or installs the pool, so it is safe to ask before
+// deciding to search at all. A manifest that cannot be fetched or opened by this
+// Runtime answers false.
+export async function isDatabaseCached(env: BootEnv, manifestUrl: string): Promise<boolean> {
+  let manifest: DredgeManifest;
+  try {
+    manifest = await loadValidatedManifest(env, manifestUrl);
+  } catch {
+    return false;
+  }
+  if (opened?.manifest.db_sha256 === manifest.db_sha256) {
+    return true;
+  }
+  return (await env.hasPersisted?.(dbPathFor(manifest), manifest.db_sha256)) ?? false;
 }
 
 function dbPathFor(manifest: DredgeManifest): string {
