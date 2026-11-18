@@ -6,6 +6,8 @@ All notable changes to Dredge are documented here. This project adheres to
 
 ## Unreleased
 
+## 0.6.0 — 2026-11-18
+
 - Within a band, pages holding a query's bare words as typed rank first, then those holding them within a short run, reported as `hit.proximity`.
 - `search` takes `fuzzy: true` to widen every term to the index terms within Elasticsearch's `AUTO` edit distance, landing those pages in band 2.
 - Pages reachable without a correction or fuzzy form are ranked by bm25 over the narrower expression, so a rare guessed form no longer lifts them.
