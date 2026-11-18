@@ -72,6 +72,7 @@ def generate_client_source(config: DredgeConfig) -> str:
         f"{result_fields}\n"
         "  score: number;\n"
         "  band: number;\n"
+        "  proximity: number;\n"
         "  marks?: DredgeMarks;\n"
         "}",
     )

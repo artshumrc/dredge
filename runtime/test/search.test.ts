@@ -1079,7 +1079,7 @@ describe("out-of-vocabulary correction", () => {
       // outside the planner: both probes are dropped, leaving the SQL an
       // unwidened query emitted before corrections existed.
       expect(matchSql).toContain("0 AS band");
-      expect(matchSql).not.toContain("documents_fts MATCH ?) THEN");
+      expect(matchSql).not.toContain("END AS band");
       expect(response.hits.map((hit) => hit.band)).toEqual(response.hits.map(() => 0));
     } finally {
       db.close();
@@ -1249,6 +1249,152 @@ describe("out-of-vocabulary correction", () => {
     } finally {
       db.close();
     }
+  });
+});
+
+// `gilded barque harbour` is on three pages: as typed, in a short run out of
+// order, and scattered across title and body on the boosted page bm25 prefers.
+describe("proximity ordering", () => {
+  const responseFor = (
+    query: string,
+    request: Partial<DredgeSearchRequest> = {},
+  ): DredgeSearchResponse => {
+    let response!: DredgeSearchResponse;
+    withFixture((exec, schema) => {
+      response = search(exec, schema, { query, limit: 1000, ...request });
+    });
+    return response;
+  };
+
+  const ordered = (response: DredgeSearchResponse) =>
+    response.hits.map((hit) => [String(hit.title), hit.proximity]);
+
+  it("puts the reader's words as typed first, then near one another, then apart", () => {
+    const response = responseFor("gilded barque harbour");
+
+    expect(ordered(response)).toEqual([
+      ["Mooring Log Kestrel", 0],
+      ["Mooring Log Heron", 1],
+      ["Gilded Barque", 2],
+    ]);
+    // bm25 alone would lead with the scattered page, so proximity is what moved it.
+    const best = Math.min(...response.hits.map((hit) => Number(hit.score)));
+    expect(response.hits[2].score).toBe(best);
+  });
+
+  it("reads the word still being typed as a prefix", () => {
+    expect(ordered(responseFor("gilded barque harb"))).toEqual(
+      ordered(responseFor("gilded barque harbour")),
+    );
+  });
+
+  it("orders only, leaving the total and facet counts alone", () => {
+    const relevance = responseFor("gilded barque harbour", { includeFacets: true });
+    const sorted = responseFor("gilded barque harbour", {
+      includeFacets: true,
+      sort: { field: "title" },
+    });
+
+    expect(relevance.total).toBe(3);
+    expect(sorted.total).toBe(3);
+    expect(sorted.facets).toEqual(relevance.facets);
+    expect(sorted.hits.map((hit) => hit.proximity)).toEqual([0, 0, 0]);
+  });
+
+  it("measures nothing for a single word or a quoted phrase", () => {
+    for (const query of ["barque", '"gilded barque" harbour']) {
+      const response = responseFor(query);
+      expect(response.hits.map((hit) => hit.proximity)).toEqual(response.hits.map(() => 0));
+    }
+  });
+
+  it("keys a session's caches on the proximity probes", () => {
+    const db = new DatabaseSync(fixtureDbPath());
+    try {
+      const exec = makeNodeSqliteExec(db);
+      const session = createSearchSession(exec, introspectSchema(exec));
+      // A one-word phrase emits the same match expression as the bare word, so
+      // only the proximity probes tell these two apart.
+      const bare = session.search({ query: "gilded barque", limit: 10 });
+      const quoted = session.search({ query: '"gilded" barque', limit: 10 });
+
+      expect(quoted.total).toBe(bare.total);
+      expect(bare.hits.map((hit) => hit.proximity)).toContain(1);
+      expect(quoted.hits.map((hit) => hit.proximity)).toEqual(quoted.hits.map(() => 0));
+    } finally {
+      db.close();
+    }
+  });
+});
+
+// `colonnade` and `ivory` are each on one page, beside the corpus's own
+// misreadings of them: `colonnadc` and `ivorv` one edit away, `ivqrv` two,
+// and `cnlonnade` one edit away in its second letter.
+describe("fuzzy widening", () => {
+  const responseFor = (
+    query: string,
+    request: Partial<DredgeSearchRequest> = {},
+  ): DredgeSearchResponse => {
+    let response!: DredgeSearchResponse;
+    withFixture((exec, schema) => {
+      response = search(exec, schema, { query, limit: 1000, ...request });
+    });
+    return response;
+  };
+
+  const banded = (response: DredgeSearchResponse) =>
+    response.hits.map((hit) => [String(hit.title), hit.band]);
+
+  it("widens a word the index holds to its misreadings, behind the word itself", () => {
+    const response = responseFor("colonnade", { fuzzy: true });
+
+    expect(banded(response).sort()).toEqual([
+      ["Court Misread", 2],
+      ["Court Plan", 0],
+      ["Court Twice", 0],
+    ]);
+    expect(response.hits.at(-1)?.title).toBe("Court Misread");
+    expect(response.terms).toEqual([
+      { term: "colonnade", forms: ["colonnade", "colonnadc"], prefix: true },
+    ]);
+    expect(response).not.toHaveProperty("corrections");
+  });
+
+  it("is off unless asked for", () => {
+    expect(banded(responseFor("colonnade")).sort()).toEqual([
+      ["Court Plan", 0],
+      ["Court Twice", 0],
+    ]);
+  });
+
+  it("ranks a page holding the reader's word as if nothing were widened", () => {
+    // bm25 over the widened expression would add `colonnadc`'s own idf to the
+    // page holding both.
+    const scores = (request: Partial<DredgeSearchRequest>) =>
+      responseFor("colonnade", request)
+        .hits.filter((hit) => hit.band === 0)
+        .map((hit) => [String(hit.title), hit.score]);
+
+    expect(scores({ fuzzy: true })).toEqual(scores({}));
+  });
+
+  it("allows one edit up to five letters and two beyond", () => {
+    expect(banded(responseFor("ivory", { fuzzy: true }))).toEqual([
+      ["Comb Kept", 0],
+      ["Comb Misread", 2],
+    ]);
+    expect(responseFor("ivqrvx", { fuzzy: true }).hits.map((hit) => String(hit.title))).toContain(
+      "Comb Garbled",
+    );
+  });
+
+  it("never widens a quoted phrase or an excluded term", () => {
+    expect(banded(responseFor('"colonnade fronts"', { fuzzy: true }))).toEqual([["Court Plan", 0]]);
+    expect(
+      responseFor("eastern court -colonnade", { fuzzy: true }).hits.map((hit) =>
+        String(hit.title),
+      ),
+    ).toContain("Court Misread");
   });
 });
 

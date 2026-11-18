@@ -127,6 +127,47 @@ const BOOST_PAGES = [
   },
 ];
 
+// Pages the proximity tests order for `gilded barque harbour`. bm25 and the
+// category boost both favour the page holding the words furthest apart, its
+// title carrying two of them, so proximity alone can put the reader's phrase
+// first and the words in a short run, out of order, second.
+const PROXIMITY_PAGES = [
+  {
+    slug: "barque-phrase",
+    title: "Mooring Log Kestrel",
+    body:
+      "Among the moorings lay a gilded barque harbour pilots towed past the ferry " +
+      "landing at dawn while porters counted bales of linen and jars of oil.",
+  },
+  {
+    slug: "barque-near",
+    title: "Mooring Log Heron",
+    body: "The harbour sheltered one barque that a guild later gilded.",
+  },
+  {
+    slug: "barque-apart",
+    category: "collection",
+    title: "Gilded Barque",
+    // The body repeats the title, so the run of words keeps them from `harbour`.
+    body:
+      "It remained moored for many long seasons beside the old brick quay while " +
+      "the river rose and fell before it reached a harbour.",
+  },
+];
+
+// Pages the fuzzy tests widen to: an in-vocabulary word beside the corpus's own
+// misreadings of it, one edit away, two edits away, and one edit away in a
+// leading character fuzzy widening keeps fixed.
+const FUZZY_PAGES = [
+  { slug: "colonnade-plan", title: "Court Plan", body: "The colonnade fronts the eastern court." },
+  { slug: "colonnade-misread", title: "Court Misread", body: "The colonnadc fronts the eastern court." },
+  { slug: "colonnade-smudged", title: "Court Smudged", body: "The cnlonnade fronts the eastern court." },
+  { slug: "colonnade-twice", title: "Court Twice", body: "The colonnade, a colonnadc, fronts the court." },
+  { slug: "ivory-comb", title: "Comb Kept", body: "An ivory comb." },
+  { slug: "ivory-misread", title: "Comb Misread", body: "An ivorv comb." },
+  { slug: "ivory-garbled", title: "Comb Garbled", body: "An ivqrv comb." },
+];
+
 // Pages the highlighting tests mark. The diacritic is the point: the index folds
 // it away, so a mark computed on the folded text has to be reported back in the
 // offsets of the title as returned.
@@ -185,6 +226,8 @@ async function addFixturePages() {
     ["highlight", HIGHLIGHT_PAGES],
     ["search-columns", SEARCH_COLUMN_PAGES],
     ["boosts", BOOST_PAGES],
+    ["proximity", PROXIMITY_PAGES],
+    ["fuzzy", FUZZY_PAGES],
   ]) {
     const pageDir = resolve(fixtureRoot, "site", dir);
     await mkdir(pageDir, { recursive: true });

@@ -691,6 +691,34 @@ export function emitMatchExpression(node: QueryNode, options: EmitOptions = {}):
   return emitNode(node, options);
 }
 
+const PROXIMITY_WINDOW = 10;
+
+// The reader's bare words as a phrase, and within one run of words in any
+// order. Quoted phrases, scopes, `near()` groups and identifiers are left out,
+// as the reader has already said where those words sit.
+export function emitProximity(node: QueryNode): { phraseExpr: string; nearExpr: string } | null {
+  let root = node;
+  while (root.kind === "not") {
+    root = root.left;
+  }
+  if (root.kind !== "and") {
+    return null;
+  }
+  const terms = root.children.filter((child) => child.kind === "term");
+  if (terms.length < 2) {
+    return null;
+  }
+  const operands = terms.map((term) =>
+    term.prefix ? ftsPrefixTerm(term.value) : ftsExactTerm(term.value),
+  );
+  // FTS5's NEAR distance counts the words between the first and last operand.
+  const window = Math.max(PROXIMITY_WINDOW, 2 * terms.length);
+  return {
+    phraseExpr: operands.join(" + "),
+    nearExpr: `NEAR(${operands.join(" ")}, ${window - 2})`,
+  };
+}
+
 export function buildMatchExpression(
   query: string,
   widen?: VariantLookup,

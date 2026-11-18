@@ -56,6 +56,7 @@ export interface DredgeResult {
   image?: string;
   score: number;
   band: number;
+  proximity: number;
   marks?: DredgeMarks;
 }
 
@@ -77,6 +78,9 @@ export interface DredgeSearchRequest {
   // Defaults to true. Set false to own the "did you mean" through `suggest`
   // instead; compiled Term Variants are unaffected either way.
   correct?: boolean;
+  // Whether every term is also widened to the index terms within a couple of
+  // edits of it, whether or not the index holds the term. Defaults to false.
+  fuzzy?: boolean;
 }
 
 // One word the reader typed that the index does not hold, and the dictionary
@@ -92,7 +96,8 @@ export interface DredgeCorrection {
 // Groups and corrections were applied, all folded the index's way.
 export interface DredgeResolvedTerm {
   term: string;
-  // The reader's own term first, then its Variant Group, then its corrections.
+  // The reader's own term first, then its Variant Group, then its corrections
+  // and fuzzy forms.
   forms: string[];
   // Whether every form also matched as a prefix: the word still being typed.
   prefix: boolean;

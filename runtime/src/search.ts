@@ -8,7 +8,7 @@ import type {
   QueryNode,
   VariantLookup,
 } from "./query";
-import { emitMatchExpression, ftsExactTerm, parseQuery } from "./query";
+import { emitMatchExpression, emitProximity, ftsExactTerm, parseQuery } from "./query";
 import { normalize } from "./tokenize";
 
 export { buildMatchExpression, emitMatchExpression, parseQuery } from "./query";
@@ -52,6 +52,10 @@ export interface DredgeSearchRequest {
   // Variant Groups, which are compiled and not affected by this — as the whole
   // query, leaving a site free to own its own "did you mean" through `suggest`.
   correct?: boolean;
+  // Whether every term is also widened to the index terms within a couple of
+  // edits of it, whether or not the index holds the term itself. Defaults to
+  // false.
+  fuzzy?: boolean;
 }
 
 export interface DredgeFacetBucket {
@@ -91,7 +95,8 @@ export interface DredgeCorrection {
 // matching text itself (`tokenize`) can then agree with the match set.
 export interface DredgeResolvedTerm {
   term: string;
-  // The reader's own term first, then its Variant Group, then its corrections.
+  // The reader's own term first, then its Variant Group, then its corrections
+  // and fuzzy forms.
   forms: string[];
   // Whether every form also matched as a prefix: the word still being typed.
   prefix: boolean;
@@ -572,6 +577,67 @@ function collectCorrectable(node: QueryNode, out: Map<string, boolean>): void {
   }
 }
 
+// Elasticsearch's `fuzziness: AUTO` with `prefix_length: 2` and its default
+// `max_expansions`.
+const FUZZY_PREFIX_LENGTH = 2;
+const MAX_FUZZY_EXPANSIONS = 50;
+
+function fuzzyDistance(length: number): number {
+  return length <= 2 ? 0 : length <= 5 ? 1 : 2;
+}
+
+// Unlike corrections, unfiltered by document frequency, so the corpus's own
+// misreadings of a word are reached.
+function fuzzyForms(exec: Exec, term: string): string[] {
+  const typed = Array.from(term);
+  const max = fuzzyDistance(typed.length);
+  if (max === 0) {
+    return [];
+  }
+  const prefix = typed.slice(0, FUZZY_PREFIX_LENGTH).join("");
+  const rows = exec(
+    `SELECT term, doc FROM temp.${VOCAB_TABLE} ` +
+      `WHERE term >= ? AND term < ? AND substr(term, 1, ?) = ? ` +
+      `AND length(term) BETWEEN ? AND ?`,
+    [
+      prefix,
+      prefixUpperBound(prefix),
+      FUZZY_PREFIX_LENGTH,
+      prefix,
+      typed.length - max,
+      typed.length + max,
+    ],
+  );
+  const scored: Array<{ term: string; doc: number; distance: number }> = [];
+  for (const row of rows) {
+    const candidate = String(row[0]);
+    const distance = candidate === term ? 0 : editDistance(typed, Array.from(candidate), max);
+    if (distance > 0 && distance <= max) {
+      scored.push({ term: candidate, doc: Number(row[1]), distance });
+    }
+  }
+  scored.sort(
+    (a, b) =>
+      a.distance - b.distance ||
+      b.doc - a.doc ||
+      (a.term < b.term ? -1 : a.term > b.term ? 1 : 0),
+  );
+  return scored.slice(0, MAX_FUZZY_EXPANSIONS).map((candidate) => candidate.term);
+}
+
+function planFuzzy(exec: Exec, node: QueryNode): Map<string, string[]> {
+  const fuzzable = new Map<string, boolean>();
+  collectCorrectable(node, fuzzable);
+  const planned = new Map<string, string[]>();
+  for (const term of fuzzable.keys()) {
+    const forms = fuzzyForms(exec, term);
+    if (forms.length > 0) {
+      planned.set(term, forms);
+    }
+  }
+  return planned;
+}
+
 // The corrections a query's terms widen to, keyed by folded term. Only terms the
 // vocabulary knows nothing of are scanned, so a correctly spelled query costs
 // one indexed probe per term and nothing else.
@@ -601,6 +667,7 @@ interface MatchPlan {
   exactExpr: string;
   variantExpr: string | null;
   matchExpr: string;
+  proximity: { phraseExpr: string; nearExpr: string } | null;
   corrections: DredgeCorrection[];
   // The surface forms to mark on each hit — the reader's own terms plus whatever
   // widening added, so the marking cannot contradict the match set.
@@ -724,6 +791,7 @@ function rankUnits(node: QueryNode, options: EmitOptions, scope = ""): string[] 
 interface PlanMatchOptions extends ParseQueryOptions {
   // Whether out-of-vocabulary words are widened to their nearest terms.
   correct?: boolean;
+  fuzzy?: boolean;
 }
 
 // Correction reads the FTS index's own vocabulary, which every artifact has, so
@@ -755,6 +823,12 @@ function planMatch(
   // the corpus is both, and its alternation carries its variants then its
   // corrections — so a variant page still bands ahead of a corrected one.
   const byTerm = new Map(planned.map((correction) => [correction.term, correction.to]));
+  // Fuzzy forms join corrections in band 2, behind them in the alternation.
+  if (options.fuzzy) {
+    for (const [term, forms] of planFuzzy(exec, node)) {
+      byTerm.set(term, [...new Set([...(byTerm.get(term) ?? []), ...forms])]);
+    }
+  }
   const correct: CorrectionLookup | undefined =
     byTerm.size > 0 ? (term) => byTerm.get(foldTerm(term)) : undefined;
   const full: EmitOptions = { widen, correct, positions };
@@ -762,6 +836,7 @@ function planMatch(
     exactExpr,
     variantExpr: variantExpr === exactExpr ? null : variantExpr,
     matchExpr: correct ? emitMatchExpression(node, full) : variantExpr,
+    proximity: positions ? emitProximity(node) : null,
     corrections: planned,
     markForms: markForms(node, widen, correct),
     rankUnits: positions ? [] : [...new Set(rankUnits(node, full))],
@@ -812,6 +887,17 @@ function bandExpression(
   return `CASE ${branches.join(" ")} ELSE ${corrected ? 2 : 1} END AS band`;
 }
 
+// Ordering only, within a band: 0 the reader's words as typed, 1 all within one
+// run of words, 2 apart.
+function proximityExpression(proximity: MatchPlan["proximity"], bind: unknown[]): string {
+  if (proximity === null) {
+    return "0 AS proximity";
+  }
+  const probe = "f.rowid IN (SELECT rowid FROM documents_fts WHERE documents_fts MATCH ?)";
+  bind.push(proximity.phraseExpr, proximity.nearExpr);
+  return `CASE WHEN ${probe} THEN 0 WHEN ${probe} THEN 1 ELSE 2 END AS proximity`;
+}
+
 // Materialize the FTS match into the fixed temp table: one row per matching
 // document, its scalar facet columns joined once, and — only when `rank` is set
 // (a keyword query with no explicit sort will read relevance ordering) — its
@@ -820,20 +906,32 @@ function bandExpression(
 function createMatchTable(
   exec: Exec,
   schema: SchemaInfo,
-  plan: Pick<MatchPlan, "matchExpr" | "exactExpr" | "variantExpr" | "rankUnits">,
+  plan: Pick<MatchPlan, "matchExpr" | "exactExpr" | "variantExpr" | "proximity" | "rankUnits">,
   rank: boolean,
 ): void {
   const { matchExpr, exactExpr, variantExpr } = plan;
   const rankColumns: string[] = [];
   const bind: unknown[] = [];
+  const weights = schema.searchColumns.map((column) => column.weight).join(", ");
+  // bm25 scores every form of a widened term at its own idf, so a rare guessed
+  // form would outrank the reader's own words; rows reachable without a guess
+  // are ranked over the narrower expression instead, filled in afterwards.
+  const narrowExpr = variantExpr ?? exactExpr;
+  const rankNarrow = rank && schema.positions && matchExpr !== narrowExpr;
   if (rank) {
-    if (schema.positions) {
-      const weights = schema.searchColumns.map((column) => column.weight).join(", ");
+    if (rankNarrow) {
+      rankColumns.push(
+        "CASE WHEN f.rowid IN (SELECT rowid FROM documents_fts WHERE documents_fts MATCH ?) " +
+          `THEN NULL ELSE bm25(documents_fts, ${weights}) END AS rank`,
+      );
+      bind.push(narrowExpr);
+    } else if (schema.positions) {
       rankColumns.push(`bm25(documents_fts, ${weights}) AS rank`);
     } else {
       rankColumns.push(positionlessRank(exec, schema, plan.rankUnits, bind));
     }
     rankColumns.push(bandExpression(matchExpr, exactExpr, variantExpr, bind));
+    rankColumns.push(proximityExpression(plan.proximity, bind));
   }
   const scalarColumns = schema.scalarColumns.map((name) => `d.${quoteIdentifier(name)}`);
   const matchColumns = ["f.rowid AS id", ...rankColumns, ...scalarColumns];
@@ -845,6 +943,16 @@ function createMatchTable(
       `WHERE documents_fts MATCH ?`,
     bind,
   );
+  if (rankNarrow) {
+    // FTS5 refuses bm25() in a statement joining a second full-text cursor, and
+    // unmaterialized, SQLite would scan the match table once per full-text row.
+    exec(
+      `WITH nw AS MATERIALIZED (SELECT rowid AS id, bm25(documents_fts, ${weights}) AS rank ` +
+        `FROM documents_fts WHERE documents_fts MATCH ?) ` +
+        `UPDATE ${MATCH_TABLE} SET rank = nw.rank FROM nw WHERE nw.id = ${MATCH_TABLE}.id`,
+      [narrowExpr],
+    );
+  }
 }
 
 // FTS5's bm25() reads term frequencies by re-tokenizing a row's text, which a
@@ -989,19 +1097,21 @@ function computeHits(
     // then joins `documents` for only that page's display columns instead of
     // probing it for every match. The outer ORDER BY re-asserts page order
     // after the join, which is why the boosted ordering is materialized as its
-    // own column: only `mm` is in scope by then. Band leads the ordering, so a
-    // boost reorders within a band and can never lift a variant-only or
-    // correction-only match above an exact one; `score` stays the raw bm25
-    // rank, because boosting is ordering and not scoring.
+    // own column: only `mm` is in scope by then. Band then proximity lead the
+    // ordering, so a boost reorders within them and can never lift a
+    // variant-only or correction-only match above an exact one, nor scattered
+    // words above the reader's phrase; `score` stays the raw bm25 rank,
+    // because boosting is ordering and not scoring.
     const countFilter = buildFilterClauses(schema, filters, MATCH_TABLE);
     const pageWhere = countFilter.sql.length ? `WHERE ${countFilter.sql.join(" AND ")}` : "";
     const boost = boostFactor(schema, MATCH_TABLE);
     const ordering = boost ? `rank * ${boost.sql}` : "rank";
     hitSql =
-      `SELECT ${select}, mm.rank AS score, mm.band AS band ` +
-      `FROM (SELECT id, rank, band, ${ordering} AS ordering FROM ${MATCH_TABLE} ${pageWhere} ` +
-      `ORDER BY band, ordering, id LIMIT ? OFFSET ?) mm ` +
-      `JOIN documents d ON d.id = mm.id ORDER BY mm.band, mm.ordering, d.id`;
+      `SELECT ${select}, mm.rank AS score, mm.band AS band, mm.proximity AS proximity ` +
+      `FROM (SELECT id, rank, band, proximity, ${ordering} AS ordering ` +
+      `FROM ${MATCH_TABLE} ${pageWhere} ` +
+      `ORDER BY band, proximity, ordering, id LIMIT ? OFFSET ?) mm ` +
+      `JOIN documents d ON d.id = mm.id ORDER BY mm.band, mm.proximity, mm.ordering, d.id`;
     hitBind = [...(boost?.bind ?? []), ...countFilter.bind, limit, offset];
   } else {
     // Explicit-sort keyword pages sort on a `documents` column, so the join must
@@ -1029,6 +1139,7 @@ function computeHits(
     // 0 is both "matched the reader's own words" and "no banding ran" — the same
     // convention `score` already uses for a page that was never ranked.
     hit.band = usesRank ? Number(row[columns.length + 1]) : 0;
+    hit.proximity = usesRank ? Number(row[columns.length + 2]) : 0;
     // Marking is independent of ranking: an explicitly sorted page carries the
     // same marks as a relevance-ordered one.
     const marks = markFields(hit, forms);
@@ -1068,6 +1179,7 @@ export function search(
   ensureVocabTable(exec);
   const plan = planMatch(exec, schema, (request.query ?? "").trim(), {
     correct: request.correct,
+    fuzzy: request.fuzzy,
   });
 
   if (plan === null) {
@@ -1469,8 +1581,9 @@ function canonicalSort(sort: DredgeSort | undefined): { field: string; direction
 // that key equality matches semantic equality:
 //   1. Match-table reuse — the FTS match temp table survives between requests,
 //      keyed by (match expression, rank materialized, the two narrower
-//      expressions the banding probes evaluate). A same-key request reuses it; a
-//      different key rebuilds; reset/close drops it.
+//      expressions the banding probes evaluate, the proximity probes). A
+//      same-key request reuses it; a different key rebuilds; reset/close drops
+//      it.
 //   2. Aggregate cache — {total, facets} keyed by (match, filters, facet names),
 //      so paginating a query re-runs only the hits page.
 //   3. Response cache — whole responses keyed by the canonical request, so exact
@@ -1483,6 +1596,7 @@ export class SearchSession {
     rank: boolean;
     exactExpr: string;
     variantExpr: string | null;
+    proximity: string;
     rankUnits: string;
   } | null = null;
   private readonly aggregateCache = new Lru<Aggregate>(AGGREGATE_CACHE_SIZE);
@@ -1510,6 +1624,7 @@ export class SearchSession {
     this.ensureVocab();
     const plan = planMatch(this.exec, this.schema, (request.query ?? "").trim(), {
       correct: request.correct,
+      fuzzy: request.fuzzy,
     });
     const matchExpr = plan?.matchExpr ?? null;
     const facetNames = [
@@ -1519,11 +1634,12 @@ export class SearchSession {
 
     const responseKey = JSON.stringify({
       m: matchExpr,
-      // The banding probes are part of what a page of hits is ordered by, so two
-      // reader inputs that widen to the same expression from different words
-      // still get their own response.
+      // The banding and proximity probes are part of what a page of hits is
+      // ordered by, so two reader inputs that widen to the same expression from
+      // different words still get their own response.
       x: plan?.exactExpr ?? null,
       v: plan?.variantExpr ?? null,
+      p: plan?.proximity ?? null,
       f: filters,
       fn: facetNames,
       l: Math.max(0, request.limit ?? 20),
@@ -1663,18 +1779,20 @@ export class SearchSession {
   private ensureMatchTable(plan: MatchPlan, rank: boolean): void {
     const { matchExpr, exactExpr, variantExpr } = plan;
     const rankUnits = plan.rankUnits.join("\0");
+    const proximity = JSON.stringify(plan.proximity);
     if (
       this.matchState &&
       this.matchState.matchExpr === matchExpr &&
       this.matchState.rank === rank &&
       this.matchState.exactExpr === exactExpr &&
       this.matchState.variantExpr === variantExpr &&
+      this.matchState.proximity === proximity &&
       this.matchState.rankUnits === rankUnits
     ) {
       return;
     }
     createMatchTable(this.exec, this.schema, plan, rank);
-    this.matchState = { matchExpr, rank, exactExpr, variantExpr, rankUnits };
+    this.matchState = { matchExpr, rank, exactExpr, variantExpr, proximity, rankUnits };
   }
 }
 

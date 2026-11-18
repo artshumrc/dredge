@@ -6,6 +6,10 @@ All notable changes to Dredge are documented here. This project adheres to
 
 ## Unreleased
 
+- Within a band, pages holding a query's bare words as typed rank first, then those holding them within a short run, reported as `hit.proximity`.
+- `search` takes `fuzzy: true` to widen every term to the index terms within Elasticsearch's `AUTO` edit distance, landing those pages in band 2.
+- Pages reachable without a correction or fuzzy form are ranked by bm25 over the narrower expression, so a rare guessed form no longer lifts them.
+
 ## 0.5.0 — 2026-11-16
 
 - The Compiler reads structured JSONL records (`source.type: "jsonl"`), with `sort_fields` and a `json` Store Field type; `index.positions: false` builds a far smaller index whose phrases come back in `unverifiedPhrases`.

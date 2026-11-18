@@ -60,5 +60,13 @@ _Avoid_: match expression, query string — the first is what the AST emits, the
 A term the index holds, within the correction edit-distance bound of a word the reader typed that the index does not hold, appearing in at least two documents, and not outnumbered by more than a hundred to one by the commonest candidate for the same word. Distance is Damerau-Levenshtein, so two letters in the wrong order are one edit. Corrections are computed at query time from the vocabulary view; nothing about them ships in the artifact, and `correct: false` on a search turns them off. A document reached only through one lands in band 2.
 _Avoid_: fuzzy match, typo fix
 
+**Fuzzy Form**:
+A term the index holds within Elasticsearch's `AUTO` edit distance of any wideable term the reader typed, sharing its first two code points, whether or not the index holds the typed term. Opt-in per search with `fuzzy: true`, unfiltered by document frequency so a corpus's own misreadings of a word are reached, and never reported as a Correction. A document reached only through one lands in band 2.
+_Avoid_: correction — a correction guesses at a word the index lacks; a fuzzy form widens one it may hold.
+
+**Proximity**:
+How close a query's bare words sit on a page, ordering hits within a band: 0 adjacent and in the order typed, 1 all within one run of words, 2 otherwise. Ordering only, like banding.
+_Avoid_: phrase boost, slop
+
 **Suggestion Context**:
 The rest of a reader's query, and their filters, supplied with a `suggest` request so that every suggestion returned is verified to co-occur with it.

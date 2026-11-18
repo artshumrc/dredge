@@ -223,6 +223,20 @@ variant-only, 2 correction-only — so a consumer can reproduce the ordering. Ba
 only, leaving the total and every Facet count untouched, and an explicit `sort` replaces
 relevance ordering and the banding with it.
 
+Within a band, a query of two or more bare words ranks pages by how close those words sit, in
+an index with positions: `hit.proximity` is 0 where they appear exactly as typed, adjacent and
+in order; 1 where all of them fall within one run of ten words (or twice the query's length,
+if longer), in any order; 2 otherwise. Quoted phrases, `field:` scopes, `near()` groups and
+identifiers are left out of the measure, and a query with fewer than two bare words leaves
+every hit at 0. Like banding, proximity is ordering only, ahead of bm25 and boosts.
+
+A site whose text was transcribed from scans can also pass `fuzzy: true`, which widens every
+term, not only a misspelled one, to the index terms within Elasticsearch's `AUTO` distance: no
+edits up to two characters, one up to five, two beyond, with the first two characters fixed
+and at most fifty terms per word. Pages reached only that way land in band 2 beside
+corrections and are not reported in `corrections`; the same terms are exempt as from
+correction.
+
 Where a word was corrected, the response says so rather than substituting silently: a
 `corrections` array names each corrected word and the terms it became — at most three per
 word, in the order they were ranked — so a page can tell the reader "showing results for
@@ -374,4 +388,4 @@ pnpm run vendor
 
 ## Vocabulary
 
-Project vocabulary is defined in `CONTEXT.md`. Use those terms when discussing Dredge internals: Facet, Store Field, Sort Field, Field, Field Role, Record, Database Artifact, Boot, Manifest, Runtime, Compiler, Search Column, Boost, Term Variant (and Variant Group), Query AST, Correction, and Suggestion Context.
+Project vocabulary is defined in `CONTEXT.md`. Use those terms when discussing Dredge internals: Facet, Store Field, Sort Field, Field, Field Role, Record, Database Artifact, Boot, Manifest, Runtime, Compiler, Search Column, Boost, Term Variant (and Variant Group), Query AST, Correction, Fuzzy Form, Proximity, and Suggestion Context.
