@@ -6,6 +6,8 @@ All notable changes to Dredge are documented here. This project adheres to
 
 ## Unreleased
 
+- Proximity's top tier takes the reader's last word in full and counts the words of an identifier such as `of 1954`, so an exact phrase no longer ties with or falls behind near-misses.
+
 ## 0.6.0 — 2026-11-18
 
 - Within a band, pages holding a query's bare words as typed rank first, then those holding them within a short run, reported as `hit.proximity`.

@@ -65,7 +65,7 @@ A term the index holds within Elasticsearch's `AUTO` edit distance of any wideab
 _Avoid_: correction — a correction guesses at a word the index lacks; a fuzzy form widens one it may hold.
 
 **Proximity**:
-How close a query's bare words sit on a page, ordering hits within a band: 0 adjacent and in the order typed, 1 all within one run of words, 2 otherwise. Ordering only, like banding.
+How close a query's bare words sit on a page, ordering hits within a band: 0 adjacent and in the order typed with the last word in full, 1 all within one run of words, 2 otherwise. Ordering only, like banding.
 _Avoid_: phrase boost, slop
 
 **Suggestion Context**:

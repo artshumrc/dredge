@@ -225,10 +225,11 @@ relevance ordering and the banding with it.
 
 Within a band, a query of two or more bare words ranks pages by how close those words sit, in
 an index with positions: `hit.proximity` is 0 where they appear exactly as typed, adjacent and
-in order; 1 where all of them fall within one run of ten words (or twice the query's length,
-if longer), in any order; 2 otherwise. Quoted phrases, `field:` scopes, `near()` groups and
-identifiers are left out of the measure, and a query with fewer than two bare words leaves
-every hit at 0. Like banding, proximity is ordering only, ahead of bm25 and boosts.
+in order, the last word in full; 1 where all of them fall within one run of ten words (or twice
+the query's length, if longer), in any order, the last word as a prefix; 2 otherwise. The words
+of a catalogue identifier count among them; quoted phrases, `field:` scopes and `near()` groups
+are left out of the measure, and a query with fewer than two such words leaves every hit at 0.
+Like banding, proximity is ordering only, ahead of bm25 and boosts.
 
 A site whose text was transcribed from scans can also pass `fuzzy: true`, which widens every
 term, not only a misspelled one, to the index terms within Elasticsearch's `AUTO` distance: no

@@ -153,6 +153,32 @@ const PROXIMITY_PAGES = [
       "It remained moored for many long seasons beside the old brick quay while " +
       "the river rose and fell before it reached a harbour.",
   },
+  // `copper kiln vent` as typed, and with its last word extended; bm25 favours
+  // the extended one, whose title holds it.
+  {
+    slug: "vent-exact",
+    title: "Firing Record",
+    body:
+      "Behind the yard a copper kiln vent was fired through a long account of " +
+      "repairs and their many delays.",
+  },
+  {
+    slug: "vent-extended",
+    title: "Copper Kiln Vents",
+    body: "Three were fired.",
+  },
+  // `crews of 1954 regatta`, whose `of 1954` reads as a catalogue identifier, as
+  // typed and scattered across the title bm25 favours.
+  {
+    slug: "regatta-exact",
+    title: "Rowing Record",
+    body: "Rowing crews of 1954 regatta fame trained beside the boathouse each morning.",
+  },
+  {
+    slug: "regatta-scattered",
+    title: "Regatta Crews",
+    body: "Of 1954 there is little to tell about the boathouse or the oars.",
+  },
 ];
 
 // Pages the fuzzy tests widen to: an in-vocabulary word beside the corpus's own

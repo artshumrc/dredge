@@ -1282,10 +1282,23 @@ describe("proximity ordering", () => {
     expect(response.hits[2].score).toBe(best);
   });
 
-  it("reads the word still being typed as a prefix", () => {
-    expect(ordered(responseFor("gilded barque harb"))).toEqual(
-      ordered(responseFor("gilded barque harbour")),
-    );
+  it("puts the reader's last word in full ahead of it extended", () => {
+    expect(ordered(responseFor("copper kiln vent"))).toEqual([
+      ["Firing Record", 0],
+      ["Copper Kiln Vents", 1],
+    ]);
+  });
+
+  it("keeps the words of an identifier in the phrase", () => {
+    expect(ordered(responseFor("crews of 1954 regatta"))[0]).toEqual(["Rowing Record", 0]);
+  });
+
+  it("reads the word still being typed as a prefix of a nearby word", () => {
+    expect(ordered(responseFor("gilded barque harb")).sort()).toEqual([
+      ["Gilded Barque", 2],
+      ["Mooring Log Heron", 1],
+      ["Mooring Log Kestrel", 1],
+    ]);
   });
 
   it("orders only, leaving the total and facet counts alone", () => {
